@@ -62,7 +62,7 @@ Waiting → Processing → Completed
 - `status == "Waiting"` 等待执行
 - 实时告警需检查静默状态
 
-### 3.2 告警触发处理流程 (`handlers.rs:346-1220`)
+### 3.2 告警触发处理主流程 (`handlers.rs:346-1220`)
 
 ```
 1. 加载告警配置
@@ -83,10 +83,14 @@ Waiting → Processing → Completed
 4. 调用 alert.evaluate() 执行评估
    └─ 见 3.3 节
 
-5. 后处理
-   ├─ 分组检查（企业版）
-   ├─ 去重检查（企业版）
-   ├─ 事件关联（企业版）
+5. 后处理（含关键分叉逻辑）
+   ├─ 【分叉A】分组检查（企业版）→ 入批后直接 return
+   │      ├─ 批次已满 → 立即同步发送分组通知
+   │      └─ 批次未满 → 等待超时或后续告警
+   ├─ 【分叉B】去重检查（企业版）→ 失败降级继续
+   │      ├─ 去重成功 → 过滤重复行
+   │      └─ 去重失败 → 返回原始 data，继续流程
+   ├─ 事件关联（企业版）→ 失败降级继续
    └─ 调用 send_notification() 发送通知
 
 6. 调度下一次执行
@@ -150,50 +154,95 @@ ConditionList
 
 ---
 
-## 四、抑制与去重机制（企业版）
+## 四、后处理关键分叉逻辑（企业版）
 
-### 4.1 分组聚合 (`grouping.rs`)
+### 4.1 分组开启后入批并提前返回 (`handlers.rs:851-965`)
 
-**设计意图**：短时间内多条相同指纹的告警合并为一条通知，减少告警风暴。
+**执行顺序**：分组检查在去重检查之前，且分组开启后直接返回，跳过后续所有流程。
 
 ```
-相同指纹告警 → PENDING_BATCHES (内存缓存)
+trigger_results.data.is_some() && !data.is_empty()
      ↓
-  等待条件满足：
-  ├─ 批次达到 max_group_size
-  └─ 等待超时 group_wait_seconds
+检查 grouping_enabled = alert.deduplication.grouping.enabled
+     ├─ 未开启 → 继续执行后续去重逻辑
+     └─ 已开启 → 执行入批逻辑
+           ↓
+     计算指纹（优先使用 dedup_config 的 fingerprint_fields，否则使用告警唯一键）
+           ↓
+     调用 add_to_batch() 加入批次
+           ↓
+     【关键分支】
+     ├─ 批次已满（batch_ready = true）
+     │    ├─ get_ready_batch() 获取批次
+     │    └─ send_grouped_notification_sync() 同步发送分组通知
+     └─ 批次未满（batch_ready = false）
+          └─ 仅记录日志，等待后台超时检测或后续告警填满
+           ↓
+     【统一提前返回】
+     ├─ 更新 trigger_data_stream 标记 grouped=true
+     ├─ 更新触发器到数据库
+     └─ return Ok(())  →  跳过去重、事件关联、直接通知
+```
+
+**入批核心实现** (`grouping.rs:106-181`)：
+- 使用 `DashMap` 并发安全的内存缓存 `PENDING_BATCHES`
+- `add_to_batch()` 返回值：
+  - `true` = 批次已满，需要立即发送
+  - `false` = 批次未满，等待中
+- 新批次创建时启动计时器 `timer_started_at`
+- 后台定期通过 `get_expired_batches()` 扫描超时批次并发送
+
+**批次内存结构**：
+```rust
+pub struct PendingBatch {
+    fingerprint: String,           // 分组键
+    org_id: String,                // 组织ID
+    alerts: Vec<BatchedAlert>,     // 已入批的告警列表
+    timer_started_at: i64,         // 批次创建时间（微秒）
+    group_wait_seconds: i64,       // 最大等待秒数
+    max_group_size: usize,         // 最大批次大小
+}
+```
+
+### 4.2 去重报错后降级继续通知 (`handlers.rs:968-1019`)
+
+**设计原则**：**Fail Open（宁可重复，不可漏报）**
+
+```
+调用 apply_deduplication(db, &alert, data.clone()).await
      ↓
-  批量发送通知
+ 【match 匹配结果】
+  ├─ Ok((deduplicated_data, deduplicated))
+  │    ├─ data 为空且被去重 → return Ok(()) 跳过通知
+  │    └─ 否则 → 使用 deduplicated_data 继续后续流程
+  │
+  └─ Err(e)  →  【降级路径】
+       ├─ log::error! 记录错误
+       └─ 返回原始 data（不做过滤），继续后续流程
 ```
 
-**关键参数**：
-- `group_wait_seconds`：等待窗口（秒）
-- `max_group_size`：最大批次大小
+**降级触发场景**：
+1. **ORM 客户端不可用** (`ORM_CLIENT.get() == None`) → 记录 warn，返回原始 data
+2. **去重逻辑执行异常**（如数据库查询失败、指纹计算错误）→ 记录 error，返回原始 data
+3. **去重状态表操作失败**（如 `alert_dedup_state` 读写异常）→ 返回原始 data
 
-### 4.2 去重抑制 (`deduplication.rs`)
-
-**设计意图**：在时间窗口内抑制重复告警，避免重复通知。
-
+**去重成功路径**：
 ```
-每条结果行 → calculate_fingerprint()
+对每条结果行计算 fingerprint
      ↓
-  查询 alert_dedup_state 表
-     ├─ 存在且在窗口内 → 抑制，更新 occurrence_count
-     └─ 不存在或超窗口 → 发送，保存新状态
+查询 alert_dedup_state 表
+     ├─ 存在且在窗口内 → 跳过该行，更新 occurrence_count
+     └─ 不存在或超窗口 → 保留该行，插入新状态
+           ↓
+返回过滤后的 deduplicated_data
 ```
 
-**指纹计算**：
-- 基于 `fingerprint_fields` 配置的字段值哈希
-- 支持语义分组（semantic_groups）跨字段关联
-- 支持跨告警去重（cross_alert_dedup）
+### 4.3 事件关联失败降级 (`handlers.rs:1051-1095`)
 
-**状态存储** (`alert_dedup_state` 表)：
-- `fingerprint`：指纹主键
-- `first_seen_at` / `last_seen_at`：时间边界
-- `occurrence_count`：发生次数
-- `notification_sent`：是否已发送
-
-**清理策略**：每小时清理超过24小时的旧记录
+与去重逻辑一致，事件关联也采用 **Fail Open** 策略：
+- `correlate_alert_to_incident()` 返回 `Err(e)` 时
+- 记录错误日志，但 `incident_handled_notification = false`
+- 继续执行后续的 `send_notification()` 直接通知
 
 ---
 
@@ -259,34 +308,37 @@ Alert.send_notification(rows, ...)
 ## 六、模块协作关系图
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Alert Manager 节点                           │
-│  ┌───────────────┐    ┌──────────────────┐    ┌─────────────────┐  │
-│  │ JobPuller     │───▶│ SchedulerWorker  │───▶│ handle_alert_   │  │
-│  │ (pull jobs)   │    │ Pool (N workers) │    │ triggers        │  │
-│  └───────────────┘    └──────────────────┘    └────────┬────────┘  │
-│                                                         │           │
-│  ┌───────────────┐    ┌──────────────────┐              │           │
-│  │ Watch Timeout │    │ Dedup Cleanup    │              ▼           │
-│  │ (监控超时)    │    │ (清理旧状态)     │    ┌─────────────────┐  │
-│  └───────────────┘    └──────────────────┘    │ alert.evaluate()│  │
-│                                              └────────┬────────┘  │
-│                                                       │           │
-│                          ┌───────────┬───────────────┘           │
-│                          ▼           ▼                           │
-│                ┌─────────────┐  ┌─────────────┐                 │
-│                │ grouping.rs │  │ dedup.rs    │                 │
-│                │ (批量分组)  │  │ (去重抑制)  │                 │
-│                └──────┬──────┘  └──────┬──────┘                 │
-│                       ▼                ▼                        │
-│                ┌──────────────────────────────┐                  │
-│                │    send_notification()       │                  │
-│                │  ┌─────┐  ┌─────┐  ┌─────┐  │                  │
-│                │  │HTTP │  │Email│  │ SNS │  │                  │
-│                │  └─────┘  └─────┘  └─────┘  │                  │
-│                └──────────────────────────────┘                  │
-└─────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│                       Alert Manager 节点                          │
+│                                                                   │
+│  ┌───────────────┐    ┌──────────────────┐                        │
+│  │ JobPuller     │───▶│ SchedulerWorker  │──┐                     │
+│  │ (pull jobs)   │    │ Pool (N workers) │  │                     │
+│  └───────────────┘    └──────────────────┘  │                     │
+│                                             ▼                     │
+│                                   handle_alert_triggers           │
+│                                         │                         │
+│                      ┌──────────────────┼──────────────────┐      │
+│                      │                  │                  │      │
+│                      ▼                  ▼                  ▼      │
+│              alert.evaluate()     grouping check     dedup check  │
+│                      │                  │  return        │  fail  │
+│                      │                  │                ▼        │
+│                      │                  │            original data │
+│                      │                  └───────────┐    │        │
+│                      ▼                              ▼    ▼        │
+│                TriggerEvalResults           send_notification()   │
+│                                                     │             │
+│                                         ┌───────────┼───────────┐ │
+│                                         ▼           ▼           ▼ │
+│                                       HTTP         Email        SNS│
+└────────────────────────────────────────────────────────────────────┘
 ```
+
+**分叉逻辑标注**：
+- 🔴 分组开启 → 调用 `add_to_batch()` 后 **直接 return**，跳过后续流程
+- 🟡 去重失败 → **降级返回原始 data**，继续通知流程
+- 🟠 事件关联失败 → **降级返回 false**，继续直接通知
 
 ---
 
@@ -304,12 +356,25 @@ QueryRequest → Search Engine
 Vec<Map<String, Value>>  (匹配行)
     ↓ 阈值判断
 TriggerEvalResults { data: Some(rows) }
-    ↓ 分组/去重过滤
-FinalRows
-    ↓ 模板渲染
-Notification Payload
-    ↓ 通道发送
-Destination Response
+    ↓ 【分叉点1: 分组检查】
+    ├─ 分组开启 → add_to_batch() → return ✂️
+    └─ 分组关闭 → 继续
+          ↓ 【分叉点2: 去重检查】
+          ├─ 去重成功 → filtered_rows
+          └─ 去重失败 → original_rows（降级）
+                ↓ 【分叉点3: 事件关联】
+                ├─ 关联成功 → 内部处理通知 → return ✂️
+                └─ 关联失败 → 继续
+                      ↓
+                FinalRows
+                      ↓
+                模板渲染
+                      ↓
+                Notification Payload
+                      ↓
+                通道发送
+                      ↓
+                Destination Response
 ```
 
 ### 7.2 触发器数据字段
@@ -329,19 +394,26 @@ Destination Response
 
 ## 八、错误处理与重试机制
 
-1. **告警评估失败**：
-   - 重试次数 < 最大重试次数 → `retries + 1`，状态重置为 Waiting
-   - 达到最大重试次数 → 计算下次 `next_run_at`，重置重试计数
-   - 配置 `pause_alerts_on_retries=true` 时，达到最大重试后自动禁用告警
+### 8.1 告警评估失败
+- 重试次数 < 最大重试次数 → `retries + 1`，状态重置为 Waiting
+- 达到最大重试次数 → 计算下次 `next_run_at`，重置重试计数
+- 配置 `pause_alerts_on_retries=true` 时，达到最大重试后自动禁用告警
 
-2. **通知发送失败**：
-   - 部分成功 / 部分失败 → 记录错误，不重试
-   - 全部失败且未达最大重试 → 重试
-   - 全部失败且达最大重试 → 跳过，调度下次
+### 8.2 通知发送失败
+- 部分成功 / 部分失败 → 记录错误，不重试
+- 全部失败且未达最大重试 → 重试
+- 全部失败且达最大重试 → 跳过，调度下次
 
-3. **保活与超时**：
-   - Job处理期间持续发送心跳
-   - `watch_timeout` 监控任务执行时间，超时后重置为 Waiting
+### 8.3 保活与超时
+- Job处理期间持续发送心跳
+- `watch_timeout` 监控任务执行时间，超时后重置为 Waiting
+
+### 8.4 后处理降级策略（企业版）
+| 模块 | 失败处理 | 影响 |
+|------|---------|------|
+| 分组（grouping）| 批次发送失败仅记录日志 | 可能丢失分组通知，但不影响告警触发 |
+| 去重（deduplication）| 返回原始数据，继续流程 | 可能收到重复告警，但不会漏报 |
+| 事件关联（incidents）| 标记为未处理，执行直接通知 | 不关联事件，但正常发送通知 |
 
 ---
 
@@ -355,3 +427,5 @@ Destination Response
 | `alert_considerable_delay` | 20 | 可容忍延迟百分比（超过则跳过） |
 | `scheduler_max_retries` | 0 | 最大重试次数（0为无限） |
 | `pause_alerts_on_retries` | false | 达最大重试后是否禁用告警 |
+| `group_wait_seconds` | 配置项 | 分组等待窗口（秒） |
+| `max_group_size` | 配置项 | 最大批次大小 |
