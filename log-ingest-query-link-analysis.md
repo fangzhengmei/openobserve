@@ -1,8 +1,8 @@
-# OpenObserve 日志数据全链路概念报告
+# OpenObserve 日志数据全链路概念级分析报告
 
 ## 1. 概述
 
-本报告梳理 OpenObserve 中日志数据从接收端写入、列式落盘到查询索引可见的完整链路，重点分析批量缓冲、压缩策略与查询路径的衔接关系。
+本报告梳理 OpenObserve 中日志数据从接收端写入、列式落盘到查询索引可见的完整链路，重点分析批量缓冲、压缩策略与查询路径的衔接关系。所有参数默认值均来自代码实际配置。
 
 ```
 ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
@@ -49,25 +49,25 @@ HTTP/gRPC 请求
 
 ### 2.3 批量缓冲机制
 
-**入队缓冲** (`writer.rs:310`)
-- 队列大小：`ZO_WAL_WRITE_QUEUE_SIZE`（默认 1024）
+**入队缓冲** (`config.rs:1541, 3089-3091`)
+- 队列大小：`ZO_WAL_WRITE_QUEUE_SIZE`（默认 **10000**）
 - 两种模式：
   - 队列满时阻塞（默认）
   - 队列满时拒绝（`ZO_WAL_WRITE_QUEUE_FULL_REJECT=true`）
 
 **内存缓冲**
-- Memtable 阈值：`ZO_MAX_FILE_SIZE_IN_MEMORY`（默认 256MB）
-- WAL 阈值：`ZO_MAX_FILE_SIZE_ON_DISK`（默认 256MB）
-- 时间阈值：`ZO_MAX_FILE_RETENTION_TIME`（默认 300 秒）
+- Memtable 阈值：`ZO_MAX_FILE_SIZE_IN_MEMORY`（默认 **256MB**）
+- WAL 阈值：`ZO_MAX_FILE_SIZE_ON_DISK`（默认 **256MB**）
+- 时间阈值：`ZO_MAX_FILE_RETENTION_TIME`（默认 **600 秒/10 分钟**）
 
 ### 2.4 旋转（Rotate）机制
 
-当满足以下任一条件时触发旋转：
+当满足以下任一条件时触发旋转 (`writer.rs:600-760`)：
 1. WAL 压缩后大小 + 新数据 > 磁盘阈值
 2. WAL 原始大小 + 新数据 > 磁盘阈值
 3. Memtable JSON 大小 + 新数据 > 内存阈值
 4. Memtable Arrow 大小 + 新数据 > 内存阈值
-5. 文件存活时间超过最大保留时间
+5. 文件存活时间超过最大保留时间（默认 600 秒）
 
 旋转操作：
 1. 同步当前 WAL 到磁盘
@@ -96,7 +96,7 @@ Immutable（不可变内存表）
 Partition 分区处理
      ├─ 按小时分区
      ├─ Schema 合并演进
-     └─ 分块写入（PARQUET_FILE_CHUNK_SIZE）
+     └─ 分块写入（PARQUET_FILE_CHUNK_SIZE = 100k 行）
      │
      ▼
 Parquet 写入（.par 临时文件）
@@ -113,7 +113,7 @@ Parquet 写入（.par 临时文件）
 
 ### 3.2 Parquet 格式设计
 
-**列式存储结构**
+**列式存储结构** (`parquet.rs:46-96`)
 - 按列组织数据，相同类型数据连续存储
 - 支持谓词下推和列裁剪
 - 行组（Row Group）作为读取单位
@@ -129,7 +129,7 @@ KeyValue::new("original_size", ...)  // 原始大小
 
 ### 3.3 压缩策略
 
-**全局压缩配置** (`config.rs:972`)
+**全局压缩配置** (`config.rs:971-972`)
 - 配置项：`ZO_PARQUET_COMPRESSION`
 - 默认值：`zstd`
 
@@ -151,6 +151,7 @@ KeyValue::new("original_size", ...)  // 原始大小
 .set_column_encoding("_timestamp", Encoding::DELTA_BINARY_PACKED)
 
 // 可配置禁用时间戳压缩（加速点查）
+// ZO_TIMESTAMP_COMPRESSION_DISABLED
 .set_column_compression("_timestamp", Compression::UNCOMPRESSED)
 ```
 
@@ -161,14 +162,22 @@ KeyValue::new("original_size", ...)  // 原始大小
 ### 3.4 布隆过滤器
 
 **启用条件** (`parquet.rs:92-102`)
-- 全局开关：`ZO_BLOOM_FILTER_ENABLED`（默认 true）
+- 全局开关：`ZO_BLOOM_FILTER_ENABLED`（默认 **true**）
 - 默认字段：`log_file`, `service_name`, `trace_id`, `span_id`
 - 可配置字段：流设置中的 `bloom_filter_fields`
 
 **参数配置**
 - NDV（唯一值数）估算：`min(records, PARQUET_MAX_ROW_GROUP_SIZE) / NDV_RATIO`
-- 假阳性率：`DEFAULT_BLOOM_FILTER_FPP`（默认 0.01）
+- 假阳性率：`DEFAULT_BLOOM_FILTER_FPP`（默认 **0.01**）
 - 按行组存储，减少内存占用
+
+### 3.5 行组大小
+
+**配置** (`config.rs:70`)
+```rust
+pub const PARQUET_MAX_ROW_GROUP_SIZE: usize = 1024 * 1024;  // 1,048,576 行
+```
+- 注释明确说明：this can't be change, it will cause segment matching error
 
 ---
 
@@ -207,10 +216,14 @@ DataFusion 执行合并查询
 删除本地小文件（或加入待删队列）
 ```
 
+**文件推送间隔** (`config.rs:2650-2651`)
+- 配置项：`ZO_FILE_PUSH_INTERVAL`
+- 默认值：**10 秒**（embedded 模式下的默认值）
+
 ### 4.2 倒排索引生成
 
 **触发时机** (`job/files/parquet.rs:902-919`)
-- 全局开关：`ZO_INVERTED_INDEX_ENABLED`
+- 全局开关：`ZO_ENABLE_INVERTED_INDEX`（默认 **true**）
 - 流类型支持：日志、指标、追踪（需 `support_index()`）
 - 有配置的全文搜索字段或索引字段
 
@@ -240,7 +253,7 @@ DataFusion 执行合并查询
 ┌─────────────────┐ ┌────────────────────────────┐
 │ Memtable（热）  │ │ Immutable（温）            │
 │  最近写入数据   │ │  已旋转但未持久化的内存表  │
-│  < 300s         │ │  < 数分钟                 │
+│  < 600s         │ │  < 数分钟                 │
 └─────────────────┘ └────────────────────────────┘
           │                 │
           └─────────────────┬─────────────────────┘
@@ -361,29 +374,33 @@ IndexCondition 生成
 
 ### 6.4 行组大小与查询性能
 
-**配置**：`PARQUET_MAX_ROW_GROUP_SIZE`（默认 100,000 行）
+**配置**：`PARQUET_MAX_ROW_GROUP_SIZE` = **1,048,576 行**（1024 * 1024）
 
 **设计权衡**
 - 大行组：压缩比更高，但扫描单组成本高
 - 小行组：谓词下推更精确，但元数据开销大
 - 布隆过滤器按行组存储，行组大小影响过滤器精度
+- 代码注释明确说明该值不可修改，否则会导致 segment matching error
 
 ---
 
-## 7. 关键参数汇总
+## 7. 关键参数汇总（全部经过代码核对）
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `ZO_PARQUET_COMPRESSION` | `zstd` | Parquet 压缩算法 |
-| `ZO_MAX_FILE_SIZE_ON_DISK` | `256MB` | WAL/Parquet 文件大小阈值 |
-| `ZO_MAX_FILE_SIZE_IN_MEMORY` | `256MB` | Memtable 大小阈值 |
-| `ZO_MAX_FILE_RETENTION_TIME` | `300s` | 文件最大保留时间 |
-| `ZO_BLOOM_FILTER_ENABLED` | `true` | 布隆过滤器开关 |
-| `ZO_INVERTED_INDEX_ENABLED` | `true` | 倒排索引开关 |
-| `ZO_TIMESTAMP_COMPRESSION_DISABLED` | `false` | 禁用时间戳压缩 |
-| `ZO_WAL_WRITE_QUEUE_SIZE` | `1024` | 写入队列大小 |
-| `PARQUET_MAX_ROW_GROUP_SIZE` | `100000` | Parquet 行组大小 |
-| `ZO_FILE_PUSH_INTERVAL` | `60s` | 本地文件上传间隔 |
+| 参数 | 默认值 | 说明 | 代码位置 |
+|------|--------|------|----------|
+| `ZO_WAL_WRITE_QUEUE_SIZE` | `10000` | 写入队列大小 | config.rs:3090 |
+| `ZO_MAX_FILE_SIZE_ON_DISK` | `256` (MB) | WAL/Parquet 文件大小阈值 | config.rs:1500 |
+| `ZO_MAX_FILE_SIZE_IN_MEMORY` | `256` (MB) | Memtable 大小阈值 | config.rs:1503 |
+| `ZO_MAX_FILE_RETENTION_TIME` | `600` (秒) | 文件最大保留时间 | config.rs:1497 |
+| `ZO_PARQUET_COMPRESSION` | `zstd` | Parquet 压缩算法 | config.rs:971 |
+| `PARQUET_MAX_ROW_GROUP_SIZE` | `1048576` (行) | Parquet 行组大小 | config.rs:70 |
+| `PARQUET_FILE_CHUNK_SIZE` | `102400` (行) | 分块写入大小 | config.rs:71 |
+| `ZO_BLOOM_FILTER_ENABLED` | `true` | 布隆过滤器开关 | config.rs:1089 |
+| `DEFAULT_BLOOM_FILTER_FPP` | `0.01` | 布隆过滤器假阳性率 | config.rs:72 |
+| `ZO_ENABLE_INVERTED_INDEX` | `true` | 倒排索引开关 | config.rs:1258 |
+| `ZO_TIMESTAMP_COMPRESSION_DISABLED` | `false` | 禁用时间戳压缩 | config.rs:974 |
+| `ZO_FILE_PUSH_INTERVAL` | `10` (秒) | 本地文件上传间隔 | config.rs:2651 |
+| `ZO_WAL_WRITE_QUEUE_FULL_REJECT` | `false` | 队列满时拒绝 | config.rs:1116 |
 
 ---
 
@@ -403,6 +420,7 @@ IndexCondition 生成
 - 查询瓶颈在 Parquet 解压和网络传输
 - 索引能显著减少扫描数据量，但增加写入开销
 - 时间戳列的特殊优化对范围查询性能至关重要
+- 行组大小为 1,048,576 行，代码明确注释不可修改
 
 ### 8.3 可观测性
 
