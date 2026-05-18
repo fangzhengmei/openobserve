@@ -227,14 +227,38 @@ DataFusion 执行合并查询
 - 流类型支持：日志、指标、追踪（需 `support_index()`）
 - 有配置的全文搜索字段或索引字段
 
+**Parquet → .ttv 文件映射规则** (`inverted_index.rs:25-59`)
+
+Tantivy 索引文件与 Parquet 文件并非同目录同名，而是采用独立的目录结构：
+
+```
+Parquet 路径:
+files/{org_id}/{stream_type}/{stream_name}/{date}/{hour}/{file_id}.parquet
+         ↓
+TTV 路径:
+files/{org_id}/index/{stream_name}_{stream_type}/{date}/{hour}/{file_id}.ttv
+```
+
+**映射规则详解**：
+1. **目录重定位**：`{stream_type}/`（如 `logs/`）→ `index/`
+2. **流名重命名**：`{stream_name}/` → `{stream_name}_{stream_type}/`（如 `quickstart1/` → `quickstart1_logs/`）
+3. **后缀替换**：`.parquet` → `.ttv`
+
+**示例**：
+```
+Parquet: files/default/logs/quickstart1/2024/02/16/16/7164299619311026293.parquet
+TTV:     files/default/index/quickstart1_logs/2024/02/16/16/7164299619311026293.ttv
+```
+
 **索引结构**
 - 引擎：Tantivy 全文检索库
-- 存储格式：Puffin（Parquet 附属文件格式）
-- 与 Parquet 文件一一对应：`file.parquet` → `file.tantivy`
+- 存储格式：Puffin（Parquet 附属文件格式，支持多 blob 存储）
+- 索引文件仅包含一个 segment（代码强制检查：`searchable_segment_metas()?.len() > 1` 时报错）
 
 **索引字段类型**
-1. **全文搜索字段（FTS）**：支持 `match_all()`, `str_match()`
-2. **索引字段**：支持精确匹配 `=`, `IN`, 范围查询
+1. **全文搜索字段（FTS）**：支持 `match_all()`, `str_match()`, `fuzzy_match_all()`
+2. **索引字段**：支持精确匹配 `=`, `!=`, `IN`, `NOT IN`
+3. **不支持**：范围查询（>、<、>=、<=）、函数计算、LIKE 模式匹配（除 str_match 外）
 
 ---
 
