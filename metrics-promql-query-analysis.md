@@ -593,3 +593,365 @@ handler::http::request::promql::query_range()
    - 细粒度指标级权限控制
    - 超集群跨区域查询
    - 工作组与节点槽位准入控制
+
+---
+
+## 附录：标签条件传递链路深度分析
+
+本章节详细分析 PromQL 查询中标签匹配条件（Label Matchers）从查询入口到索引过滤、再到数据过滤的完整传递链路，包括条件在各阶段的形态变化、被消费的节点，以及这个衔接对查询结果和性能的影响。
+
+### A.1 条件形态演变总览
+
+以查询 `http_requests_total{job="api", status=~"5.."}` 为例，标签条件在各阶段的形态变化如下：
+
+```
+用户输入 PromQL 字符串
+    ↓ 解析
+promql_parser::label::Matchers {
+    matchers: [
+        Matcher { name: "__name__", op: Equal, value: "http_requests_total" },
+        Matcher { name: "job", op: Equal, value: "api" },
+        Matcher { name: "status", op: Re, value: "5.." },
+    ]
+}
+    ↓ 索引适配 (convert_matchers_to_index_condition)
+IndexCondition {
+    conditions: [
+        Condition::Equal("job", "api"),
+        Condition::Regex("status", "5.."),
+    ]
+    // 注意: __name__ 不参与索引过滤，用于确定 stream_name
+}
+    ↓ Tantivy 查询构建
+BooleanQuery {
+    clauses: [
+        (Must, TermQuery("job:api")),
+        (Must, RegexQuery("status:5..")),
+        (Must, RangeQuery("_timestamp:[start, end)")),
+    ]
+}
+    ↓ 索引查询结果
+TantivyResult::RowIdsBitVec(num_rows, BitVec)
+    ↓ DataFusion 谓词下推 (apply_matchers)
+DataFusion Expr:
+    col("job").eq(lit("api"))
+    AND regexp_match(col("status"), "^5..$")
+    AND col("_timestamp").between(start, end)
+```
+
+### A.2 关键节点与协作细节
+
+#### A.2.1 Matcher 到 IndexCondition 的转换
+
+**文件**: `src/service/promql/search/grpc/storage.rs:302-330`
+
+`convert_matchers_to_index_condition()` 是第一个关键转换点：
+
+```rust
+fn convert_matchers_to_index_condition(
+    matchers: &Matchers,
+    schema: &Arc<Schema>,
+    index_fields: &HashSet<String>,
+) -> Result<(IndexCondition, bool)> {
+    let mut index_condition = IndexCondition::default();
+    let mut is_full_convert = true;
+    for mat in matchers.matchers.iter() {
+        // 过滤条件: 非时间/值字段 + 是索引字段 + schema 中存在
+        if mat.name == TIMESTAMP_COL_NAME
+            || mat.name == VALUE_LABEL
+            || !index_fields.contains(&mat.name)
+            || schema.field_with_name(&mat.name).is_err()
+        {
+            is_full_convert = false;
+            continue;
+        }
+        // 支持的操作类型: Equal / NotEqual / Regex
+        let condition = match &mat.op {
+            MatchOp::Equal => Condition::Equal(mat.name.clone(), mat.value.clone()),
+            MatchOp::NotEqual => Condition::NotEqual(mat.name.clone(), mat.value.clone()),
+            MatchOp::Re(regex) => Condition::Regex(mat.name.clone(), regex.to_string()),
+            _ => {
+                is_full_convert = false;
+                continue;
+            }
+        };
+        index_condition.add_condition(condition);
+    }
+    Ok((index_condition, is_full_convert))
+}
+```
+
+**关键输出**:
+- `IndexCondition`: 可下推到索引的条件集合
+- `is_full_convert`: 标记是否所有 matcher 都成功转换
+
+**对结果的影响**:
+- 如果某个 matcher 无法转换（如字段未建索引），`is_full_convert = false`，该条件会被保留到 DataFusion 层二次过滤
+- 这确保了查询结果的正确性，但可能影响性能（索引过滤不彻底）
+
+#### A.2.2 IndexCondition 到 Tantivy Query 的转换
+
+**文件**: `src/service/search/index.rs:135-163`
+
+`IndexCondition::to_tantivy_query()` 构建 Tantivy 可执行查询：
+
+```rust
+pub fn to_tantivy_query(
+    &self,
+    trace_id: &str,
+    schema: Schema,
+    default_field: Option<Field>,
+) -> anyhow::Result<(Box<dyn Query>, bool)> {
+    let mut has_skipped = false;
+    let mut queries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(self.conditions.len());
+    for condition in &self.conditions {
+        match condition.to_tantivy_query(&schema, default_field) {
+            Ok(query) => {
+                queries.push((Occur::Must, query));
+            }
+            Err(e) => {
+                log::info!("... skipping condition due to error: {e}");
+                has_skipped = true;  // 标记有条件被跳过
+            }
+        }
+    }
+    Ok((Box::new(BooleanQuery::from(queries)), has_skipped))
+}
+```
+
+**关键输出**:
+- `Box<dyn Query>`: Tantivy 查询对象
+- `has_skipped`: 是否有条件在索引层被跳过
+
+**触发 has_skipped = true 的场景**:
+1. 新添加的索引字段在旧数据中不存在（schema 演化问题）
+2. 索引文件损坏或格式不兼容
+3. Regex 表达式语法错误
+
+#### A.2.3 Tantivy 索引查询执行
+
+**文件**: `src/service/search/grpc/storage.rs:724-900`
+
+`search_tantivy_index()` 执行实际的索引查询：
+
+```rust
+async fn search_tantivy_index(
+    trace_id: &str,
+    time_range: (i64, i64),
+    index_condition: Option<IndexCondition>,
+    idx_optimize_rule: Option<IndexOptimizeMode>,
+    parquet_file: &FileKey,
+) -> anyhow::Result<(String, TantivyResult, bool)> {
+    // ... 缓存检查、索引打开 ...
+
+    // 1. 构建 Tantivy 查询
+    let condition: IndexCondition = index_condition.ok_or(...)?;
+    let (mut query, has_skipped_conditions) =
+        condition.to_tantivy_query(trace_id, tantivy_schema.clone(), fts_field)?;
+
+    // 2. 添加时间范围过滤（如果文件不完全在查询时间范围内）
+    if !file_in_range && let Ok(ts_field) = tantivy_schema.get_field(TIMESTAMP_COL_NAME) {
+        query = Box::new(BooleanQuery::new(vec![
+            (Occur::Must, query),
+            (Occur::Must, Box::new(ts_range)),
+        ]));
+    }
+
+    // 3. 执行查询，返回匹配的行号位图
+    let res = tokio::task::spawn_blocking(move || {
+        TantivyResult::handle_matched_docs(&searcher, query)
+    }).await??;
+
+    Ok((parquet_file.key.to_string(), res, has_skipped_conditions))
+}
+```
+
+**TantivyResult 类型**:
+| 结果类型 | 说明 |
+|---------|------|
+| `RowIdsBitVec(num_rows, bitvec)` | 匹配行的位图，用于后续 Parquet 行组过滤 |
+| `Count(count)` | 仅统计匹配行数 |
+| `Histogram(histogram)` | 下推的直方图统计 |
+| `TopN(top_n)` | 下推的 TopN 结果 |
+| `Distinct(distinct)` | 下推的去重结果 |
+
+**性能影响**:
+- 索引过滤返回 `RowIdsBitVec` 时，Parquet 扫描时可以跳过不匹配的行组
+- 当 `num_rows == 0` 时，整个 Parquet 文件被跳过，无需扫描
+- 当匹配行数过多（超过 `tantivy_max_row_ids` 阈值），索引查询会被短路，直接回退到 DataFusion 过滤
+
+#### A.2.4 is_add_filter_back 标志传递
+
+**文件**: `src/service/search/grpc/storage.rs:420-703`
+
+`tantivy_search()` 聚合所有文件的索引查询结果，管理 `is_add_filter_back` 标志：
+
+```rust
+pub async fn tantivy_search(
+    query: Arc<super::QueryParams>,
+    file_list: &mut Vec<FileKey>,
+    index_condition: Option<IndexCondition>,
+    idx_optimize_mode: Option<IndexOptimizeMode>,
+) -> Result<(usize, bool, TantivyMultiResult), Error> {
+    // 初始值: 如果有文件没有索引，需要回溯过滤
+    let mut is_add_filter_back = file_list_map.len() != index_file_names.len();
+
+    // 对每个文件执行索引查询
+    while let Some(result) = tasks.try_next().await {
+        match result {
+            Ok((file_name, result, has_skipped_conditions)) => {
+                // 任何文件有条件被跳过，都需要回溯过滤
+                if has_skipped_conditions {
+                    is_add_filter_back = true;
+                }
+                // 其他需要回溯的场景:
+                // - 文件没有索引 (file_name.is_empty())
+                // - 索引查询错误
+                // - 匹配行数过多，索引查询被短路
+            }
+        }
+    }
+
+    Ok((took, is_add_filter_back, tantivy_result))
+}
+```
+
+#### A.2.5 回溯过滤：DataFusion 层 apply_matchers
+
+**文件**: `src/service/promql/utils.rs:127-155`
+
+当 `is_add_filter_back = true` 或 `is_full_convert = false` 时，`apply_matchers()` 在 DataFusion 层添加过滤条件：
+
+```rust
+pub fn apply_matchers(df: DataFrame, schema: &Schema, matchers: &Matchers) -> Result<DataFrame> {
+    let mut df = df;
+    for mat in matchers.matchers.iter() {
+        // 跳过时间和值字段，以及 schema 中不存在的字段
+        if mat.name == TIMESTAMP_COL_NAME
+            || mat.name == VALUE_LABEL
+            || schema.field_with_name(&mat.name).is_err()
+        {
+            continue;
+        }
+        // 转换为 DataFusion 表达式
+        match &mat.op {
+            MatchOp::Equal => df = df.filter(col(mat.name.clone()).eq(lit(mat.value.clone())))?,
+            MatchOp::NotEqual => df = df.filter(col(mat.name.clone()).not_eq(lit(mat.value.clone())))?,
+            MatchOp::Re(regex) => {
+                let regex = format!("^{}$", regex.as_str());
+                df = df.filter(REGEX_MATCH_UDF.call(vec![col(mat.name.clone()), lit(regex)]))?
+            }
+            MatchOp::NotRe(regex) => {
+                let regex = format!("^{}$", regex.as_str());
+                df = df.filter(REGEX_NOT_MATCH_UDF.call(vec![col(mat.name.clone()), lit(regex)]))?
+            }
+        }
+    }
+    Ok(df)
+}
+```
+
+**执行位置**: `src/service/promql/engine.rs:1350-1360` 的 `selector_load_data_from_datafusion()` 中调用。
+
+### A.3 条件消费决策树
+
+```
+Matchers (原始条件集合)
+    │
+    ├─ __name__ → 确定 stream_name（不参与过滤）
+    │
+    ├─ 其他 Matchers
+    │    │
+    │    ├─ 字段是索引字段？
+    │    │    ├─ 是 → 加入 IndexCondition
+    │    │    └─ 否 → is_full_convert = false，留到 DataFusion
+    │    │
+    │    └─ 操作符支持？(Equal/NotEqual/Regex)
+    │         ├─ 是 → 加入 IndexCondition
+    │         └─ 否 → is_full_convert = false，留到 DataFusion
+    │
+    └─ IndexCondition
+         │
+         ├─ 所有 Condition 都能转换为 Tantivy Query？
+         │    ├─ 是 → has_skipped = false
+         │    └─ 否 → has_skipped = true
+         │
+         ├─ Tantivy 索引查询
+         │    ├─ 匹配行数 = 0 → 跳过文件，无需后续处理
+         │    ├─ 匹配行数 < 阈值 → 返回 RowIdsBitVec，用于 Parquet 行过滤
+         │    └─ 匹配行数 > 阈值 → 短路，is_add_filter_back = true，回退到 DataFusion
+         │
+         └─ is_add_filter_back 标志
+              ├─ true → apply_matchers() 在 DataFusion 层重新应用所有过滤条件
+              └─ false → 索引过滤已精确，无需二次过滤
+```
+
+### A.4 对查询结果和性能的影响
+
+#### A.4.1 正确性保障
+
+**多级过滤的设计确保结果正确性**:
+1. 索引层快速过滤掉大部分不匹配的文件和行
+2. DataFusion 层作为"安全网"，重新应用所有过滤条件
+3. 即使索引查询出错或被短路，DataFusion 过滤仍能保证结果正确
+
+**潜在风险点**:
+- 索引和数据之间的一致性问题（罕见，通常在写入失败时发生）
+- Regex 表达式在 Tantivy 和 DataFusion 中的语义差异
+
+#### A.4.2 性能权衡
+
+| 场景 | is_add_filter_back | 性能特征 |
+|------|-------------------|---------|
+| 所有条件都可下推索引，且索引过滤精确 | false | **最佳性能**：索引过滤后只需扫描少量数据，无需二次过滤 |
+| 部分条件可下推索引 | true | **中等性能**：索引减少扫描范围，但 DataFusion 仍需过滤 |
+| 无索引或索引过滤被短路 | true | **最差性能**：全量扫描 DataFusion 过滤 |
+| 索引查询返回空结果 | - | **最优**：直接跳过文件，零扫描成本 |
+
+**性能优化关键点**:
+1. **索引覆盖率**: 为常用过滤标签建立索引，提高 `is_full_convert` 比率
+2. **索引选择性**: 高基数字段（如 `request_id`）的索引过滤效果最好
+3. **避免全扫描**: 当查询没有任何标签过滤时，会回退到全表扫描
+4. **索引结果缓存**: Tantivy 结果缓存（`tantivy_result_cache_enabled`）可以复用重复查询的索引过滤结果
+
+#### A.4.3 内存开销
+
+- **Tantivy 位图**: 每个文件的匹配行位图占用约 `num_rows / 8` 字节
+- **短路阈值**: 当匹配行数超过文件总行数的 70% 时，继续使用索引反而浪费资源，此时回退到全扫描更高效
+
+### A.5 特殊场景处理
+
+#### A.5.1 历史数据的索引兼容
+
+当新添加索引字段时，历史数据的索引文件中不存在该字段：
+1. `to_tantivy_query()` 会返回 `Err`，标记 `has_skipped = true`
+2. `is_add_filter_back = true`，DataFusion 层会应用该条件
+3. 结果正确，但性能回退到无索引状态
+
+#### A.5.2 WAL 热数据过滤
+
+**文件**: `src/service/promql/search/grpc/wal.rs`
+
+WAL 中的热数据尚未写入 Parquet，也没有建立索引：
+- 所有过滤条件都在 DataFusion 层通过 `apply_matchers()` 应用
+- WAL 数据量通常较小，全扫描开销可控
+- 合并结果时，WAL 数据和 Parquet 数据的过滤条件是一致的
+
+#### A.5.3 正则表达式性能
+
+Regex 匹配在索引层和 DataFusion 层的性能差异：
+- **Tantivy 层**: 基于倒排索引的快速匹配，适合前缀匹配和简单正则
+- **DataFusion 层**: 基于 Rust regex crate 的完整正则支持，性能较低
+- 优化建议：尽量使用 `=` 或 `IN` 操作符替代复杂正则
+
+### A.6 可观测性指标
+
+查询处理各阶段的指标可用于分析条件传递效果：
+
+| 指标 | 说明 | 目标值 |
+|------|------|--------|
+| `tantivy_search_calls_total` | 索引查询调用次数 | - |
+| `tantivy_search_hit_ratio` | 索引过滤命中率（过滤后行数/原始行数） | 越高越好，< 10% 最佳 |
+| `tantivy_search_skipped_files` | 被索引完全过滤掉的文件数 | 越多越好 |
+| `is_add_filter_back_ratio` | 需要二次过滤的查询比例 | 越低越好，< 20% 良好 |
+| `index_convert_ratio` | `is_full_convert = true` 的查询比例 | 越高越好，> 80% 良好 |
