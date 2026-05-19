@@ -96,26 +96,12 @@ PromQL 查询通过标准的 Prometheus HTTP API 端点暴露：
    };
    ```
 
-### 1.3 查询重写
+### 1.3 查询预处理与校验
 
-**文件**: `src/service/promql/rewrite.rs`
-
-`remove_filter_all()` 函数用于移除查询中的占位符过滤器：
-
-```rust
-pub fn remove_filter_all(vs: &mut VectorSelector) {
-    let placeholder = get_config().common.dashboard_placeholder.to_string();
-    vs.matchers.matchers.retain(|m| !match_placeholder(m, &placeholder));
-    vs.matchers.or_matchers.iter_mut().for_each(|vs| {
-        vs.retain(|m| !match_placeholder(m, &placeholder));
-    });
-}
-```
-
-**设计意图**：
-- 支持 Dashboard 模板变量的"全部选择"场景
-- 当用户选择"全部"时，后端移除该标签的过滤条件
-- 兼容 `=`, `!=`, `=~`, `!~` 四种匹配操作符
+**权限校验 (企业版)**：
+- 使用 `promql_parser::parser::parse()` 解析查询 AST
+- `MetricNameVisitor` 遍历 AST 提取所有指标名称
+- 对每个指标进行细粒度权限检查
 
 ---
 
@@ -248,7 +234,36 @@ fn extract_columns_from_modifier(&mut self, modifier: &Option<LabelModifier>, op
 | `NumberLiteral` | 直接返回 `Value::Float` |
 | `ParenExpr` / `UnaryExpr` / `Subquery` | 递归处理内部表达式 |
 
-#### 2.3.3 向量选择器求值
+#### 2.3.3 查询重写：remove_filter_all
+
+**文件**: `src/service/promql/engine.rs:331,346`
+
+`remove_filter_all()` 是在引擎执行阶段调用的，处理每个向量选择器时执行：
+
+```rust
+PromExpr::VectorSelector(vs) => {
+    let mut vs = vs.clone();
+    remove_filter_all(&mut vs);  // 移除 Dashboard 占位符过滤器
+    if !vs.matchers.or_matchers.is_empty() {
+        return Err(DataFusionError::Plan(...));
+    }
+    // ... 后续求值
+}
+
+PromExpr::MatrixSelector(MatrixSelector { vs, range }) => {
+    let mut vs = vs.clone();
+    remove_filter_all(&mut vs);  // 移除 Dashboard 占位符过滤器
+    // ... 后续求值
+}
+```
+
+**设计意图**：
+- 支持 Dashboard 模板变量的"全部选择"场景
+- 当用户选择"全部"时，后端移除该标签的过滤条件
+- 兼容 `=`, `!=`, `=~`, `!~` 四种匹配操作符
+- **调用时机**：在表达式递归求值过程中，每个 VectorSelector/MatrixSelector 求值前执行
+
+#### 2.3.4 向量选择器求值
 
 **即时向量选择** (`eval_vector_selector()`，第 372 行)：
 1. 调用 `selector_load_data_owned()` 加载数据
@@ -368,7 +383,17 @@ if !index_condition.conditions.is_empty() && cfg.common.inverted_index_enabled {
 let ctx = register_metrics_table(&session, schema.clone(), stream_name, files).await?;
 ```
 
-返回值 `(ctx, schema, scan_stats, keep_filters)` 中 `keep_filters` 决定是否需要在 DataFusion 层保留过滤条件。
+返回值 `(ctx, schema, scan_stats, keep_filters)` 中 `keep_filters` 决定是否需要在 DataFusion 层保留过滤条件：
+
+```rust
+is_add_filter_back
+    || !is_full_convert
+    || !cfg.common.feature_query_remove_filter_with_index
+```
+
+- `is_add_filter_back`: 索引层是否有条件被跳过或短路
+- `is_full_convert`: 是否所有 matcher 都成功转换为索引条件
+- `feature_query_remove_filter_with_index`: 全局配置项，控制是否允许索引过滤替代 DataFusion 过滤（默认 true）
 
 ### 3.4 DataFusion 数据加载
 
@@ -556,6 +581,7 @@ handler::http::request::promql::query_range()
       │       ├─ Engine::exec()
       │       │   ├─ extract_columns_from_prom_expr() 列裁剪
       │       │   └─ exec_expr() 递归求值
+      │       │       ├─ remove_filter_all() 移除 Dashboard 占位符过滤器
       │       │       └─ eval_vector_selector() / eval_matrix_selector()
       │       │           └─ selector_load_data_from_datafusion()
       │       │               ├─ DataFusion 查询计划
@@ -779,6 +805,7 @@ async fn search_tantivy_index(
 - 索引过滤返回 `RowIdsBitVec` 时，Parquet 扫描时可以跳过不匹配的行组
 - 当 `num_rows == 0` 时，整个 Parquet 文件被跳过，无需扫描
 - 当匹配行数比例超过 `inverted_index_skip_threshold` 配置项（默认 35%），索引查询会被短路，直接回退到 DataFusion 过滤
+- **位图内存分配**：`BitVec::repeat(false, parquet_file.meta.records as usize)`，大小为 `parquet_file.meta.records / 8` 字节
 
 #### A.2.4 is_add_filter_back 标志传递
 
@@ -853,6 +880,14 @@ pub fn apply_matchers(df: DataFrame, schema: &Schema, matchers: &Matchers) -> Re
 
 **执行位置**: `src/service/promql/engine.rs:1350-1360` 的 `selector_load_data_from_datafusion()` 中调用。
 
+**feature_query_remove_filter_with_index 的影响**:
+
+该配置项（默认 `true`）是全局开关，控制是否信任索引过滤结果：
+- `true`：只有当 `is_add_filter_back = true` 或 `is_full_convert = false` 时才进行二次过滤
+- `false`：**所有查询都强制进行 DataFusion 二次过滤**，即使索引过滤完全成功
+- 配置位置：`src/config/src/config.rs:1006`，环境变量 `ZO_FEATURE_QUERY_REMOVE_FILTER_WITH_INDEX`
+- 用途：用于索引功能不稳定时的降级开关，确保查询结果正确性
+
 ### A.3 条件消费决策树
 
 ```
@@ -881,7 +916,8 @@ Matchers (原始条件集合)
          │    ├─ 匹配比例 < inverted_index_skip_threshold → 返回 RowIdsBitVec，用于 Parquet 行过滤
          │    └─ 匹配比例 > inverted_index_skip_threshold → 短路，is_add_filter_back = true，回退到 DataFusion
          │
-         └─ is_add_filter_back 标志
+         └─ keep_filters 最终判断
+              ├─ 条件: is_add_filter_back || !is_full_convert || !feature_query_remove_filter_with_index
               ├─ true → apply_matchers() 在 DataFusion 层重新应用所有过滤条件
               └─ false → 索引过滤已精确，无需二次过滤
 ```
@@ -916,7 +952,10 @@ Matchers (原始条件集合)
 
 #### A.4.3 内存开销
 
-- **Tantivy 位图**: 每个文件的匹配行位图占用约 `num_rows / 8` 字节
+- **Tantivy 位图**: 每个文件的匹配行位图基于 Parquet 文件总记录数分配：`BitVec::repeat(false, parquet_file.meta.records as usize)`，占用 `parquet_file.meta.records / 8` 字节
+- **缓存格式选择**: 索引结果缓存时，根据匹配比例选择存储格式：
+  - 匹配比例 < 1%：使用 RoaringBitmap 压缩存储
+  - 匹配比例 ≥ 1%：使用 BitVec 直接存储
 - **短路阈值**: 由配置项 `inverted_index_skip_threshold` 控制（默认 35%），当匹配行数比例超过该阈值时，继续使用索引反而浪费资源，此时回退到全扫描更高效
 - **配置位置**: `src/config/src/config.rs:1814`，环境变量 `ZO_INVERTED_INDEX_SKIP_THRESHOLD`
 
