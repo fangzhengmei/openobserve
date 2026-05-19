@@ -778,7 +778,7 @@ async fn search_tantivy_index(
 **性能影响**:
 - 索引过滤返回 `RowIdsBitVec` 时，Parquet 扫描时可以跳过不匹配的行组
 - 当 `num_rows == 0` 时，整个 Parquet 文件被跳过，无需扫描
-- 当匹配行数过多（超过 `tantivy_max_row_ids` 阈值），索引查询会被短路，直接回退到 DataFusion 过滤
+- 当匹配行数比例超过 `inverted_index_skip_threshold` 配置项（默认 35%），索引查询会被短路，直接回退到 DataFusion 过滤
 
 #### A.2.4 is_add_filter_back 标志传递
 
@@ -878,8 +878,8 @@ Matchers (原始条件集合)
          │
          ├─ Tantivy 索引查询
          │    ├─ 匹配行数 = 0 → 跳过文件，无需后续处理
-         │    ├─ 匹配行数 < 阈值 → 返回 RowIdsBitVec，用于 Parquet 行过滤
-         │    └─ 匹配行数 > 阈值 → 短路，is_add_filter_back = true，回退到 DataFusion
+         │    ├─ 匹配比例 < inverted_index_skip_threshold → 返回 RowIdsBitVec，用于 Parquet 行过滤
+         │    └─ 匹配比例 > inverted_index_skip_threshold → 短路，is_add_filter_back = true，回退到 DataFusion
          │
          └─ is_add_filter_back 标志
               ├─ true → apply_matchers() 在 DataFusion 层重新应用所有过滤条件
@@ -917,7 +917,8 @@ Matchers (原始条件集合)
 #### A.4.3 内存开销
 
 - **Tantivy 位图**: 每个文件的匹配行位图占用约 `num_rows / 8` 字节
-- **短路阈值**: 当匹配行数超过文件总行数的 70% 时，继续使用索引反而浪费资源，此时回退到全扫描更高效
+- **短路阈值**: 由配置项 `inverted_index_skip_threshold` 控制（默认 35%），当匹配行数比例超过该阈值时，继续使用索引反而浪费资源，此时回退到全扫描更高效
+- **配置位置**: `src/config/src/config.rs:1814`，环境变量 `ZO_INVERTED_INDEX_SKIP_THRESHOLD`
 
 ### A.5 特殊场景处理
 
@@ -946,12 +947,45 @@ Regex 匹配在索引层和 DataFusion 层的性能差异：
 
 ### A.6 可观测性指标
 
-查询处理各阶段的指标可用于分析条件传递效果：
+以下是代码中实际定义的与索引查询和缓存相关的 Prometheus 指标：
 
-| 指标 | 说明 | 目标值 |
-|------|------|--------|
-| `tantivy_search_calls_total` | 索引查询调用次数 | - |
-| `tantivy_search_hit_ratio` | 索引过滤命中率（过滤后行数/原始行数） | 越高越好，< 10% 最佳 |
-| `tantivy_search_skipped_files` | 被索引完全过滤掉的文件数 | 越多越好 |
-| `is_add_filter_back_ratio` | 需要二次过滤的查询比例 | 越低越好，< 20% 良好 |
-| `index_convert_ratio` | `is_full_convert = true` 的查询比例 | 越高越好，> 80% 良好 |
+#### A.6.1 Tantivy 索引结果缓存指标
+
+**文件**: `src/config/src/metrics.rs:1250-1292`
+
+| 指标名称 | 类型 | 说明 |
+|----------|------|------|
+| `tantivy_result_cache_memory_usage` | Gauge | 索引结果缓存内存使用量（字节） |
+| `tantivy_result_cache_gc_total` | Counter | 索引结果缓存 GC 总次数 |
+| `tantivy_result_cache_requests_total` | Counter | 索引结果缓存请求总次数 |
+| `tantivy_result_cache_hits_total` | Counter | 索引结果缓存命中次数 |
+
+#### A.6.2 查询磁盘缓存指标
+
+**文件**: `src/config/src/metrics.rs:363-1115`
+
+| 指标名称 | 类型 | 说明 |
+|----------|------|------|
+| `query_disk_cache_limit_bytes` | Gauge | 磁盘缓存限制大小（字节） |
+| `query_disk_cache_used_bytes` | Gauge | 磁盘缓存已使用大小（字节） |
+| `query_disk_cache_files` | Gauge | 磁盘缓存中的文件数量 |
+| `query_disk_cache_hit_count` | Counter | 磁盘缓存命中次数 |
+| `query_disk_cache_miss_count` | Counter | 磁盘缓存未命中次数 |
+
+#### A.6.3 Parquet 缓存比率指标
+
+**文件**: `src/config/src/metrics.rs:427-441`
+
+| 指标名称 | 类型 | 说明 |
+|----------|------|------|
+| `query_parquet_cache_ratio` | Histogram | Parquet 文件缓存比率分布 |
+| `query_parquet_cache_ratio_node` | Histogram | 节点级 Parquet 缓存比率分布 |
+
+#### A.6.4 日志可观测性
+
+除了 metrics 指标外，关键信息也通过日志输出：
+
+- **索引短路日志**: `search->tantivy: file: ..., result percent ...% is too large, back to datafusion`
+- **索引结果日志**: `search->tantivy: total hits for index_condition: ... found ..., is_add_filter_back: ..., file_num: ..., took: ... ms`
+- **索引加载日志**: `search->tantivy: stream ..., load tantivy index files ..., index size: ..., memory cached ..., disk cached ...`
+- **条件跳过日志**: `to_tantivy_query: skipping condition due to error: ...`
