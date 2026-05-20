@@ -513,7 +513,8 @@ let deduped_hits: Vec<_> = agg_res
 let partition_total = deduped_hits.len() as i64;
 hits_seen += partition_total;
 
-// 按 start_time 降序排序
+// ⚠️  强制按 trace_start_time 降序排序
+// 注意：这里覆盖了 Q1 SQL 中的 ORDER BY 子句结果
 let mut sorted_hits = deduped_hits;
 sorted_hits.sort_by(|a, b| {
     let a_t = json::get_int_value(a.get("trace_start_time").unwrap_or_default());
@@ -544,6 +545,7 @@ let skip_in_partition = (hits_to_skip - hits_seen_before)
 let need = (hits_to_deliver - hits_delivered) as usize;
 
 // 仅提取本分区中需要交付的 trace
+// ⚠️  skip/take 是基于 trace_start_time 排序后的结果执行的
 let deliverable_q1: Vec<_> = sorted_hits
     .into_iter()
     .skip(skip_in_partition as usize)
@@ -614,7 +616,143 @@ let deliverable_q1: Vec<_> = sorted_hits
 - 如果一个 trace 满足过滤条件，它的所有跨分区 span 都会被正确去重
 - `total_across_partitions` 统计的是去重后的总数，用于 UI 显示 "N of M"
 
-### 5.5 latest_stream 与 latest 的对比
+### 5.5 非时间排序场景下的结果正确性分析
+
+#### 5.5.1 问题背景
+
+当 `sort_by` 为非时间字段（如 `duration`）时，代码执行流程存在排序不一致的问题：
+
+```
+用户请求: sort_by=duration, sort_order=DESC, from=20, size=10
+
+1. Q1 SQL 构建（mod.rs:1212
+   └─ SELECT ... GROUP BY trace_id ORDER BY zo_sql_duration DESC
+
+2. Q1 返回结果：按 duration 降序排列的 trace 列表
+
+3. ⚠️  强制重排（mod.rs:1410-1415）
+   └─ 代码强制将 Q1 结果按 trace_start_time 降序重排
+   └─ 注释声称 "Q1 returns traces ordered by zo_sql_timestamp DESC"，但这只在 sort_by=start_time 时成立
+
+4. skip/take 分页（mod.rs:1436-1440）
+   └─ 基于 trace_start_time 排序后的结果执行 skip(20).take(10)
+
+5. Q2a/Q2b 查询详情
+
+6. 最终排序（mod.rs:1751-1766）
+   └─ 按用户指定的 duration 降序重新排序
+   └─ 返回给客户端
+```
+
+#### 5.5.2 正确性问题
+
+**问题根源**：skip/take 分页是在**按 trace_start_time 排序后**执行的，而不是在**按用户指定的 duration 排序后**执行的。
+
+**示例**：
+假设 Q1 返回 30 条 trace，按 duration 降序排列：
+
+```
+Q1 返回（按 duration 排序）: [T1(dur=1000), T2(dur=900), ..., T20(dur=500), ..., T30(dur=100)
+
+强制重排为按 start_time 排序: [T20(start=最新), T5(start=次新), ..., T1(start=最早)
+
+skip(20).take(10) → 取按 start_time 排序的第 21-30 条
+  ↓
+这些 trace 按 duration 重排后返回给用户
+```
+
+**结果**：用户请求按 duration 排序取第 21-30 条，但实际返回的是**按 start_time 排序的第 21-30 条，再按 duration 排序**的结果。这与用户期望的"按 duration 排序的第 21-30 条"不一致。
+
+#### 5.5.3 单分区降级机制
+
+**代码位置**：`src/handler/http/request/traces/mod.rs:1304-1313`
+
+```rust
+} else {
+    // order by other fields can't be multiple partitions
+    log::info!(
+        "[TRACES_STREAM trace_id {trace_id}] sort_by non-timestamp ({sql_order_expr}), \
+        forcing single partition [{}, {}]",
+        partition_req.start_time,
+        partition_req.end_time,
+    );
+    vec![[partition_req.start_time, partition_req.end_time]]
+};
+```
+
+当 sort_by 不是时间字段时，代码强制合并为**单个分区**查询。这是因为：
+- 跨分区排序无法保证全局正确性
+- 单分区下，虽然排序和分页在同一数据集上执行
+- 但单分区仍存在上述的排序不一致问题
+
+#### 5.5.4 影响范围
+
+| 排序字段 | 多分区支持 | 排序正确性 | 分页正确性 |
+|---------|-----------|-----------|-----------|
+| start_time / _timestamp | ✅ 是 | ✅ 正确 | ✅ 正确 |
+| duration | ❌ 否（强制单分区） | ⚠️  部分正确（存在排序不一致问题） | ⚠️  不正确（分页基于 start_time 排序） |
+
+### 5.6 from 分页稳定性边界
+
+#### 5.6.1 稳定性问题背景
+
+**代码注释**：`src/handler/http/request/traces/mod.rs:1315-1321`
+
+```rust
+// `from` is a global offset: skip the first `from` hits across all partitions,
+// then deliver `size` hits. We track how many we've seen and delivered so far.
+//
+// NOTE: partition boundaries come from search_partition() which is sensitive to querier
+// node count. Boundaries can shift between requests, so `from`-based pagination may
+// produce overlapping or missing results if cluster topology changes between page requests.
+// For stable pagination, callers should use time-based cursors (end_time of last seen trace).
+```
+
+#### 5.6.2 分区边界计算
+
+`search_partition()` 返回的分区边界对 querier 节点数量敏感：
+- 分区算法可能根据 querier 数量动态调整分区大小和数量
+- 当 querier 节点增加/减少时，分区边界会重新计算
+
+#### 5.6.3 稳定性边界
+
+| 场景 | 稳定性 | 说明 |
+|------|--------|------|
+| 同一请求内 | ✅ 稳定 | 分区列表只获取一次，from 分页在同一请求内是稳定的 |
+| 跨请求分页（集群拓扑不变） | ⚠️  基本稳定 | 如果 querier 数量不变，分区边界不变 |
+| 跨请求分页（集群拓扑变化） | ❌ 不稳定 | querier 数量变化导致分区边界移动 |
+
+#### 5.6.4 失败模式
+
+当 querier 拓扑变化时的失败模式：
+
+**失败模式 1：结果重叠
+```
+请求 1（querier=3 个节点）: 分区 [10:00-11:00, 11:00-12:00, 12:00-13:00
+  └─ 返回 trace_A 在分区 11:00-12:00
+请求 2（querier=2 个节点）: 分区 [10:00-11:30, 11:30-13:00
+  └─ trace_A 现在在分区 10:00-11:30
+  └─ 如果 trace_A 落在请求 2 的分页范围内，会重复返回
+```
+
+**失败模式 2：结果遗漏**
+```
+请求 1: 分区 [10:00-11:00, 11:00-12:00
+  └─ trace_B 在分区 11:00-12:00（在请求 1 的第二页
+请求 2: 分区 [10:00-11:30, 11:30-13:00
+  └─ trace_B 现在在分区 10:00-11:30
+  └─ 如果 trace_B 落在请求 2 的第一页，但用户请求第二页时会遗漏
+```
+
+#### 5.6.5 推荐方案
+
+使用**基于时间的游标**（Time-based Cursor）：
+- 不要依赖 `from` 参数进行分页
+- 使用最后一条返回结果的 `end_time` 作为下一页的 `start_time`
+- 配合 `seen_trace_ids` 去重机制避免重复
+- 示例：`end_time = last_trace.end_time
+
+### 5.7 latest_stream 与 latest 的对比
 
 | 对比项 | latest | latest_stream |
 |--------|--------|---------------|
@@ -626,9 +764,98 @@ let deliverable_q1: Vec<_> = sorted_hits
 | 内存占用 | 高（全量结果在内存） | 低（仅单分区结果 + seen_trace_ids） |
 | 适用场景 | 小时间范围、精确查询 | 大时间范围、探索性查询 |
 | 分页实现 | SQL LIMIT/OFFSET | 服务端 hits_seen/hits_delivered 计数 |
-| 非时间排序支持 | 支持 | 强制单分区查询（无法跨分区排序） |
+| 时间排序支持 | ✅ 完全支持 | ✅ 完全支持 |
+| 非时间排序支持 | ✅ 支持 | ❌ 强制单分区 + 排序不一致问题 |
+| 分页稳定性（同请求） | ✅ 稳定 | ✅ 稳定 |
+| 分页稳定性（跨请求） | ⚠️  依赖底层存储 | ❌ 受 querier 拓扑变化影响 |
 | Q1/Q2a/Q2b 逻辑 | 完全相同 | 完全相同（仅缩小到单个分区） |
 | 结果完整性 | 完整去重 | 完整去重（服务端 seen_trace_ids 保证） |
+
+### 5.8 latest_stream 统一结论：去重、排序、分页的协同机制
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  latest_stream 统一执行模型                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  输入: sort_by, from, size, start_time, end_time                          │
+│    │                                                                      │
+│    ├─ [优化] 从 trace_id 提取时间戳缩小范围                               │
+│    │                                                                      │
+│    ├─ 分区边界获取（search_partition）                                      │
+│    │   └─ ⚠️  分区边界对 querier 节点数量敏感                                │
+│    │                                                                      │
+│    ├─ 排序方向决定分区遍历顺序                                              │
+│    │   ├─ start_time DESC: 按分区默认顺序（新→旧）                         │
+│    │   ├─ start_time ASC:  反转分区顺序（旧→新）                           │
+│    │   └─ 非时间排序:      强制单分区（无法跨分区排序）                    │
+│    │                                                                      │
+│    ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                    分区循环（按顺序遍历）                               │  │
+│  │                                                                       │  │
+│  │  Q1: 分区内 GROUP BY trace_id 聚合（带 ORDER BY {sort_expr}）          │  │
+│  │    │                                                                  │  │
+│  │    ├─ 去重过滤: seen_trace_ids 过滤已见过的 trace                       │  │
+│  │    │   └─ partition_total = 去重后数量                                 │  │
+│  │    │                                                                  │  │
+│  │    ├─ ⚠️  强制重排: 按 trace_start_time 降序重排（覆盖 Q1 的 ORDER BY） │  │
+│  │    │   └─ 这是排序不一致问题的根源                                      │  │
+│  │    │                                                                  │  │
+│  │    ├─ 注册所有 trace_id 到 seen_trace_ids（包括被跳过的）              │  │
+│  │    │   └─ 防止后续分区重复                                              │  │
+│  │    │                                                                  │  │
+│  │    ├─ 应用全局 offset: skip/take（基于 start_time 排序结果）           │  │
+│  │    │   └─ ⚠️  非时间排序场景下分页结果不正确                              │  │
+│  │    │                                                                  │  │
+│  │    ├─ Q2a: span 统计（仅 deliverable_q1 的 trace_id）                │  │
+│  │    ├─ Q2b: 多服务详情（可选）                                           │  │
+│  │    │                                                                  │  │
+│  │    ├─ 最终排序: 按用户指定的 sort_by 重新排序                           │  │
+│  │    └─ SSE 发送结果                                                     │  │
+│  │                                                                       │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+│  输出: 流式 trace 列表 + 进度事件 + Done 事件                              │
+│                                                                           │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.8.1 核心机制协同关系
+
+| 机制 | 作用 | 与其他机制的交互 |
+|------|------|-----------------|
+| **seen_trace_ids 去重** | 跨分区去重，避免重复结果 | 在 Q1 后过滤，影响 hits_seen 计数，进而影响分页 |
+| **start_time 强制重排** | 统一排序基准，保证分区遍历顺序正确 | 覆盖 Q1 的 ORDER BY，是 skip/take 分页的基础，但导致非时间排序不一致 |
+| **全局 offset 计数** | 实现跨分区的 from/size 分页 | 依赖去重后的 hits_seen 计数，基于 start_time 排序结果执行 |
+| **分区边界** | 决定数据分片方式 | 对 querier 拓扑敏感，影响跨请求分页稳定性 |
+
+#### 5.8.2 已知问题与边界
+
+1. **非时间排序一致性问题**
+   - 原因：skip/take 基于 start_time 排序执行，而非用户指定的排序字段
+   - 影响：非时间排序的分页结果与用户期望不一致
+   - 缓解：强制单分区查询，但仍存在排序不一致
+
+2. **跨请求分页稳定性问题**
+   - 原因：分区边界对 querier 节点数量敏感
+   - 影响：集群拓扑变化时，分页结果可能重叠或遗漏
+   - 缓解：使用基于时间的游标（end_time of last seen trace）
+
+3. **fetch_size 限制**
+   - 原因：Q1 的 fetch_size 被限制为 `query_default_limit`（默认 1000）
+   - 影响：如果单个分区内去重后的 trace 数量超过 fetch_size，会导致结果截断
+   - 边界：`remaining_to_skip + remaining_needed` 超过 1000 时可能漏数
+
+#### 5.8.3 最佳实践
+
+| 场景 | 推荐做法 |
+|------|---------|
+| 时间排序分页 | ✅ 使用 start_time 排序，from/size 分页基本稳定 |
+| 非时间排序 | ⚠️  优先使用 latest 接口，或接受单分区限制 |
+| 大时间范围 | ✅ 使用 latest_stream 流式接口 |
+| 跨请求分页 | ⚠️  避免 from 分页，使用时间游标（end_time 作为下一页 start_time） |
+| 精确查询 | ✅ 使用 trace_id 精确查询 |
 
 ## 六、查询过滤与优化机制
 
@@ -716,10 +943,19 @@ f.trim().to_string()
 5. **Trace ID Sanitization**：防止 SQL 注入，只允许十六进制字符和连字符
 6. **服务端全局去重**：latest_stream 通过 `seen_trace_ids` HashSet 实现跨分区去重，客户端无需处理
 7. **提前注册去重**：即使被 offset 跳过的 trace_id 也注册到 `seen_trace_ids`，保证后续分区不重复
-8. **非时间排序降级**：按 duration 等非时间字段排序时，强制合并为单个分区查询，保证排序正确性
+8. **非时间排序降级**：按 duration 等非时间字段排序时，强制合并为单个分区查询（但仍存在排序不一致问题）
 9. **动态 fetch_size**：根据 `remaining_to_skip + remaining_needed` 动态调整 Q1 查询大小，避免过度扫描
 
-### 7.3 关于 TraceListIndex 的说明
+### 7.3 已知设计权衡与边界
+
+| 设计决策 | 收益 | 代价 | 适用场景 |
+|---------|------|------|---------|
+| **start_time 强制重排** | 统一排序基准，简化跨分区分页逻辑 | 非时间排序场景下分页结果不正确 | 时间排序为主的场景 |
+| **seen_trace_ids  HashSet 去重** | 服务端全局去重，客户端无需处理 | 内存占用随去重 trace 数量增长 | 跨分区 trace 较多的场景 |
+| **非时间排序强制单分区** | 避免跨分区排序的复杂性 | 大时间范围查询性能下降，且仍存在排序不一致 | 非时间排序需求较少的场景 |
+| **from 基于计数分页** | 接口简单，与 latest 保持一致 | 跨请求时受 querier 拓扑变化影响 | 单次查询或集群稳定的场景 |
+
+### 7.4 关于 TraceListIndex 的说明
 - 当前版本：仅写入侧可选元数据，查询路径未使用
 - 布隆过滤器：虽已配置，但查询链路未调用
 - 未来可能：预留作为 trace 列表快速查询的优化点
