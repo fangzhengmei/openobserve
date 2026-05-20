@@ -2,9 +2,11 @@
 
 ## 一、核心架构概述
 
-OpenObserve 的 Trace 检索系统采用"**列式存储直接查询 + 三阶段 SQL 聚合 + 按时间分区流式处理**"的架构设计，解决大数据量下 trace 和 span 的高效检索问题。
+OpenObserve 的 Trace 检索系统采用"**列式存储直接查询 + 三阶段 SQL 聚合 + 按时间分区流式处理 + 服务端全局去重**"的架构设计，解决大数据量下 trace 和 span 的高效检索问题。
 
-> **重要更正**：`trace_list_index` 仅作为**写入侧可选元数据表**，**不参与查询路径**。latest 和 latest_stream 查询均直接对 trace 主数据表执行 SQL 查询。
+> **重要更正**：
+> 1. `trace_list_index` 仅作为**写入侧可选元数据表**，**不参与查询路径**。latest 和 latest_stream 查询均直接对 trace 主数据表执行 SQL 查询。
+> 2. `latest_stream` 通过服务端 `seen_trace_ids` HashSet 实现**全局去重**，**客户端无需负责去重**。
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -23,6 +25,18 @@ OpenObserve 的 Trace 检索系统采用"**列式存储直接查询 + 三阶段 
 │  Q1: 主表 GROUP BY trace_id 聚合 → Q2a: 主表 span 统计           │
 │                                            ↓                      │
 │                                      Q2b: 多服务详情              │
+└─────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  Trace 查询链路（latest_stream）                  │
+├─────────────────────────────────────────────────────────────────┤
+│  按时间分区循环:                                              │
+│    ├─ Q1: 分区内 GROUP BY trace_id 聚合                          │
+│    ├─ 去重: seen_trace_ids HashSet 过滤                          │
+│    ├─ Q2a: 分区内 span 统计（仅可交付 trace）               │
+│    ├─ Q2b: 分区内多服务详情（可选）                         │
+│    └─ SSE 流式返回客户端                                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -397,63 +411,224 @@ if multi_service_tids.is_empty() {
     └─ 结果组装，返回给客户端
 ```
 
-## 五、latest_stream 查询：按时间分区流式处理
+## 五、latest_stream 查询：按时间分区流式处理 + 服务端去重
 
 **API**：`GET /api/{org_id}/{stream_name}/traces/latest_stream`
 
-**文件**：`src/handler/http/request/traces/mod.rs` (函数 `get_latest_traces_stream`)
+**文件**：`src/handler/http/request/traces/mod.rs` (函数 `get_latest_traces_stream` 和 `process_latest_traces_stream`)
 
 ### 5.1 核心设计思想
 
-针对大时间范围查询，采用**"按时间分区 + 分区内三阶段查询 + SSE 流式返回"**策略，解决：
+针对大时间范围查询，采用**"按时间分区 + 服务端全局去重 + 分区内三阶段查询 + SSE 流式返回"**策略，解决：
 1. 大时间范围查询超时问题
 2. 首屏加载慢问题
 3. 内存占用过高问题
+4. 跨分区 trace 重复问题（通过服务端 `seen_trace_ids` 去重）
 
-### 5.2 执行流程
+> **关键修正**：服务端通过 `seen_trace_ids` HashSet 实现全局去重，**客户端无需负责去重**。
+
+### 5.2 核心状态变量
+
+**代码位置**：`src/handler/http/request/traces/mod.rs:1322-1330`
+
+```rust
+// 分页相关
+let mut hits_seen: i64 = 0;        // 已处理的去重后 trace 总数
+let hits_to_skip = from;            // 全局跳过数量（from 参数）
+let hits_to_deliver = size;         // 需要返回的数量（size 参数）
+let mut hits_delivered: i64 = 0;    // 已发送给客户端的数量
+
+// 去重相关
+let mut seen_trace_ids: std::collections::HashSet<String> = HashSet::new();
+```
+
+### 5.3 执行流程详解
 
 #### 步骤 1：获取时间分区列表
+
 ```rust
-// 按时间从新到旧排序
+// 代码位置：src/handler/http/request/traces/mod.rs:1263-1313
 let partitions = SearchService::search_partition(...).await?;
-// 分区按 start_time 降序排列（最新的在前）
-partitions.sort_by(|a, b| b.start_time.cmp(&a.start_time));
-```
 
-#### 步骤 2：对每个分区独立执行三阶段查询
-```
-for partition in partitions:
-    ├─ Q1: 分区内 GROUP BY trace_id 聚合
-    ├─ Q2a: 分区内 span 统计
-    ├─ Q2b: 分区内多服务详情（可选）
-    └─ 通过 SSE 发送该分区的结果给客户端
-```
-
-#### 步骤 3：Q1 SQL 构建（与 latest 完全相同）
-```rust
-// 代码位置：src/handler/http/request/traces/mod.rs:1174-1215
-// 与 latest 的 Q1 SQL 构建逻辑完全一致
-let query_sql_base = if is_llm_stream && has_gen_ai_fields {
-    format!("SELECT trace_id, ... FROM \"{stream_name}\"")
+// 根据排序方向调整分区顺序
+let partitions_desc = if sql_order_expr == "zo_sql_timestamp DESC" {
+    partitions  // 已默认按时间降序
+} else if sql_order_expr == "zo_sql_timestamp ASC" {
+    partitions.into_iter().rev().collect()  // 反转按时间升序
 } else {
-    format!("SELECT trace_id, ... FROM \"{stream_name}\"")
+    // 非时间排序（如 duration）：强制合并为单个分区
+    // 因为跨分区排序无法保证正确性
+    vec![[partition_req.start_time, partition_req.end_time]]
 };
 ```
 
-#### 步骤 4：结果合并与去重
-由于 trace 可能跨多个时间分区，客户端需要负责合并和去重。服务端仅按分区流式返回。
+#### 步骤 2：分区循环处理
 
-### 5.3 latest_stream 与 latest 的对比
+```
+for partition in partitions_desc:
+    ├─ 计算本分区 fetch_size
+    │   └─ fetch_size = (remaining_to_skip + remaining_needed).min(query_default_limit)
+    │
+    ├─ Q1: 分区内 GROUP BY trace_id 聚合
+    │
+    ├─ 去重过滤（seen_trace_ids）
+    │   ├─ 过滤掉已见过的 trace_id
+    │   ├─ partition_total = 去重后的数量
+    │   └─ hits_seen += partition_total
+    │
+    ├─ 按 start_time 排序
+    │
+    ├─ 注册所有 trace_id 到 seen_trace_ids（即使被跳过的）
+    │   └─ 防止后续分区重复出现
+    │
+    ├─ 应用全局 offset，提取可交付的 trace
+    │   ├─ skip_in_partition = max(0, hits_to_skip - hits_seen_before)
+    │   └─ deliverable_q1 = sorted_hits.skip(skip).take(need)
+    │
+    ├─ Q2a: 仅对 deliverable_q1 的 trace_id 查询 span 统计
+    ├─ Q2b: 仅对多服务 trace 查询服务详情
+    │
+    ├─ 组装结果，通过 SSE 发送
+    │   └─ hits_delivered += deliverable.len()
+    │
+    └─ 如果 hits_delivered >= hits_to_deliver，提前终止循环
+```
+
+#### 步骤 3：Q1 与去重逻辑
+
+**代码位置**：`src/handler/http/request/traces/mod.rs:1380-1427`
+
+```rust
+// 去重：过滤已见过的 trace_id
+let deduped_hits: Vec<_> = agg_res
+    .hits
+    .into_iter()
+    .filter(|item| {
+        let tid = item.get("trace_id").and_then(|v| v.as_str()).unwrap_or_default();
+        !tid.is_empty() && !seen_trace_ids.contains(tid)
+    })
+    .collect();
+
+// 使用去重后的数量进行分页统计
+let partition_total = deduped_hits.len() as i64;
+hits_seen += partition_total;
+
+// 按 start_time 降序排序
+let mut sorted_hits = deduped_hits;
+sorted_hits.sort_by(|a, b| {
+    let a_t = json::get_int_value(a.get("trace_start_time").unwrap_or_default());
+    let b_t = json::get_int_value(b.get("trace_start_time").unwrap_or_default());
+    b_t.cmp(&a_t)
+});
+
+// 关键：注册所有 trace_id 到 seen_trace_ids（包括被跳过的）
+// 防止跨分区重复
+for item in &sorted_hits {
+    if let Some(tid) = item.get("trace_id").and_then(|v| v.as_str())
+        && !tid.is_empty()
+    {
+        seen_trace_ids.insert(tid.to_string());
+    }
+}
+```
+
+#### 步骤 4：全局 offset 应用
+
+**代码位置**：`src/handler/http/request/traces/mod.rs:1429-1448`
+
+```rust
+let hits_seen_before = hits_seen - partition_total;
+let skip_in_partition = (hits_to_skip - hits_seen_before)
+    .max(0)
+    .min(sorted_hits.len() as i64);
+let need = (hits_to_deliver - hits_delivered) as usize;
+
+// 仅提取本分区中需要交付的 trace
+let deliverable_q1: Vec<_> = sorted_hits
+    .into_iter()
+    .skip(skip_in_partition as usize)
+    .take(need)
+    .collect();
+```
+
+#### 步骤 5：Q2a/Q2b 与结果发送
+
+与 latest 逻辑类似，但：
+- Q2a/Q2b 仅查询 `deliverable_q1` 中的 trace_id
+- 时间窗口可能扩展以覆盖 trace 的实际 span 时间范围
+- 结果通过 SSE 流式发送给客户端
+
+### 5.4 seen_trace_ids 去重机制详解
+
+#### 5.4.1 为什么需要去重
+
+当一个 trace 的 span 分布在多个时间分区时，每个分区的 Q1 `GROUP BY trace_id` 都会返回该 trace，导致重复。
+
+```
+时间分区 1: [10:00, 11:00) ──┐
+                              ├─ trace_A (span1 在分区1, span2 在分区2)
+时间分区 2: [11:00, 12:00) ──┘
+```
+
+如果不去重，trace_A 会在两个分区的结果中各出现一次。
+
+#### 5.4.2 去重时机
+
+**时机 1：Q1 结果过滤**（`mod.rs:1383-1393`）
+- 过滤掉已经在 `seen_trace_ids` 中的 trace
+- 使用去重后的数量更新 `hits_seen`，避免重复计数影响分页
+
+**时机 2：提前注册所有 trace_id**（`mod.rs:1421-1427`）
+- **即使被 offset 跳过的 trace 也要注册**
+- 防止后续分区重复返回同一个 trace
+- 保证全局去重的正确性
+
+#### 5.4.3 对分页的影响
+
+```
+用户请求: from=20, size=10
+
+分区 1 Q1 返回 15 条 → 去重后 12 条
+  ├─ 注册 12 个 trace_id 到 seen_trace_ids
+  ├─ skip_in_partition = min(20, 12) = 12
+  ├─ deliverable_q1 = 0（全部跳过）
+  └─ hits_seen = 12, hits_delivered = 0
+
+分区 2 Q1 返回 15 条 → 去重后 10 条（2 条已在分区1见过）
+  ├─ 注册 10 个 trace_id 到 seen_trace_ids
+  ├─ skip_in_partition = max(0, 20 - 12) = 8
+  ├─ deliverable_q1 = 10.skip(8).take(10) = 2 条
+  └─ hits_seen = 22, hits_delivered = 2
+
+分区 3 Q1 返回 15 条 → 去重后 11 条（4 条已见过）
+  ├─ 注册 11 个 trace_id 到 seen_trace_ids
+  ├─ skip_in_partition = max(0, 20 - 22) = 0
+  ├─ deliverable_q1 = 11.skip(0).take(8) = 8 条
+  └─ hits_seen = 33, hits_delivered = 10（达到 size，终止）
+```
+
+#### 5.4.4 对过滤结果的影响
+
+- `filter` 参数在 Q1 的 WHERE 子句中应用
+- 去重发生在 Q1 结果返回后，不影响过滤条件的执行
+- 如果一个 trace 满足过滤条件，它的所有跨分区 span 都会被正确去重
+- `total_across_partitions` 统计的是去重后的总数，用于 UI 显示 "N of M"
+
+### 5.5 latest_stream 与 latest 的对比
 
 | 对比项 | latest | latest_stream |
 |--------|--------|---------------|
 | 查询范围 | 全时间范围一次性查询 | 按时间分区逐个查询 |
 | 返回方式 | 完整结果一次性返回 | SSE 流式增量返回 |
+| 去重方式 | 全局 GROUP BY 自然去重 | 服务端 seen_trace_ids HashSet 去重 |
+| 客户端去重责任 | 无 | 无（服务端已去重） |
 | 首屏时间 | 较慢（需等待全量查询） | 快（第一个分区返回即可显示） |
-| 内存占用 | 高（全量结果在内存） | 低（仅单分区结果） |
+| 内存占用 | 高（全量结果在内存） | 低（仅单分区结果 + seen_trace_ids） |
 | 适用场景 | 小时间范围、精确查询 | 大时间范围、探索性查询 |
-| 结果完整性 | 完整去重 | 可能有重复（跨分区 trace） |
+| 分页实现 | SQL LIMIT/OFFSET | 服务端 hits_seen/hits_delivered 计数 |
+| 非时间排序支持 | 支持 | 强制单分区查询（无法跨分区排序） |
 | Q1/Q2a/Q2b 逻辑 | 完全相同 | 完全相同（仅缩小到单个分区） |
+| 结果完整性 | 完整去重 | 完整去重（服务端 seen_trace_ids 保证） |
 
 ## 六、查询过滤与优化机制
 
@@ -539,6 +714,10 @@ f.trim().to_string()
 3. **列式投影**：只读取需要的列（Parquet 谓词下推）
 4. **分区处理**：大时间范围按时间分区处理，增量返回
 5. **Trace ID Sanitization**：防止 SQL 注入，只允许十六进制字符和连字符
+6. **服务端全局去重**：latest_stream 通过 `seen_trace_ids` HashSet 实现跨分区去重，客户端无需处理
+7. **提前注册去重**：即使被 offset 跳过的 trace_id 也注册到 `seen_trace_ids`，保证后续分区不重复
+8. **非时间排序降级**：按 duration 等非时间字段排序时，强制合并为单个分区查询，保证排序正确性
+9. **动态 fetch_size**：根据 `remaining_to_skip + remaining_needed` 动态调整 Q1 查询大小，避免过度扫描
 
 ### 7.3 关于 TraceListIndex 的说明
 - 当前版本：仅写入侧可选元数据，查询路径未使用
