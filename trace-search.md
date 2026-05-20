@@ -722,35 +722,47 @@ skip(20).take(10) → 取按 start_time 排序的第 21-30 条
 | 跨请求分页（集群拓扑不变） | ⚠️  基本稳定 | 如果 querier 数量不变，分区边界不变 |
 | 跨请求分页（集群拓扑变化） | ❌ 不稳定 | querier 数量变化导致分区边界移动 |
 
-#### 5.6.4 失败模式
+#### 5.6.4 关键澄清：seen_trace_ids 的作用范围
+
+> **重要事实**：`seen_trace_ids` 是 `process_latest_traces_stream` 函数内的**局部变量**（`mod.rs:1330`）。
+>
+> - ✅ **单个请求内有效**：每个请求创建新的 HashSet实例，在该请求的分区循环中去重
+> - ❌ **跨请求无效**：请求结束后 HashSet 被销毁，绝对无法用于跨请求去重
+> - ❌ **不能配合时间游标跨请求去重**：这是一个常见的误解
+
+#### 5.6.5 失败模式
 
 当 querier 拓扑变化时的失败模式：
 
-**失败模式 1：结果重叠
+**失败模式 1：结果重叠**
 ```
-请求 1（querier=3 个节点）: 分区 [10:00-11:00, 11:00-12:00, 12:00-13:00
+请求 1（querier=3 个节点）: 分区 [10:00-11:00, 11:00-12:00, 12:00-13:00]
   └─ 返回 trace_A 在分区 11:00-12:00
-请求 2（querier=2 个节点）: 分区 [10:00-11:30, 11:30-13:00
+
+请求 2（querier=2 个节点）: 分区 [10:00-11:30, 11:30-13:00]
   └─ trace_A 现在在分区 10:00-11:30
   └─ 如果 trace_A 落在请求 2 的分页范围内，会重复返回
+  └─ ⚠️  无法通过 seen_trace_ids 去重（跨请求）
 ```
 
 **失败模式 2：结果遗漏**
 ```
-请求 1: 分区 [10:00-11:00, 11:00-12:00
-  └─ trace_B 在分区 11:00-12:00（在请求 1 的第二页
-请求 2: 分区 [10:00-11:30, 11:30-13:00
+请求 1: 分区 [10:00-11:00, 11:00-12:00]
+  └─ trace_B 在分区 11:00-12:00（在请求 1 的第二页）
+
+请求 2: 分区 [10:00-11:30, 11:30-13:00]
   └─ trace_B 现在在分区 10:00-11:30
   └─ 如果 trace_B 落在请求 2 的第一页，但用户请求第二页时会遗漏
 ```
 
-#### 5.6.5 推荐方案
+#### 5.6.6 推荐方案
 
 使用**基于时间的游标**（Time-based Cursor）：
 - 不要依赖 `from` 参数进行分页
 - 使用最后一条返回结果的 `end_time` 作为下一页的 `start_time`
-- 配合 `seen_trace_ids` 去重机制避免重复
-- 示例：`end_time = last_trace.end_time
+- 时间窗口向前推进，从源头减少重复概率
+- 客户端层面做最终去重（如果需要绝对精确）
+- 示例：下一页的 `start_time = last_trace.end_time`
 
 ### 5.7 latest_stream 与 latest 的对比
 
@@ -758,18 +770,19 @@ skip(20).take(10) → 取按 start_time 排序的第 21-30 条
 |--------|--------|---------------|
 | 查询范围 | 全时间范围一次性查询 | 按时间分区逐个查询 |
 | 返回方式 | 完整结果一次性返回 | SSE 流式增量返回 |
-| 去重方式 | 全局 GROUP BY 自然去重 | 服务端 seen_trace_ids HashSet 去重 |
-| 客户端去重责任 | 无 | 无（服务端已去重） |
+| 去重方式 | 全局 GROUP BY 自然去重 | 单请求内 seen_trace_ids HashSet 去重 |
+| 客户端去重责任 | 无 | 同请求内无，跨请求需自行处理 |
+| seen_trace_ids 作用范围 | 不适用 | 仅单个请求生命周期内有效 |
 | 首屏时间 | 较慢（需等待全量查询） | 快（第一个分区返回即可显示） |
 | 内存占用 | 高（全量结果在内存） | 低（仅单分区结果 + seen_trace_ids） |
 | 适用场景 | 小时间范围、精确查询 | 大时间范围、探索性查询 |
 | 分页实现 | SQL LIMIT/OFFSET | 服务端 hits_seen/hits_delivered 计数 |
 | 时间排序支持 | ✅ 完全支持 | ✅ 完全支持 |
 | 非时间排序支持 | ✅ 支持 | ❌ 强制单分区 + 排序不一致问题 |
-| 分页稳定性（同请求） | ✅ 稳定 | ✅ 稳定 |
+| 分页稳定性（同请求） | ✅ 稳定 | ⚠️  基本稳定（受 fetch_size 截断影响） |
 | 分页稳定性（跨请求） | ⚠️  依赖底层存储 | ❌ 受 querier 拓扑变化影响 |
 | Q1/Q2a/Q2b 逻辑 | 完全相同 | 完全相同（仅缩小到单个分区） |
-| 结果完整性 | 完整去重 | 完整去重（服务端 seen_trace_ids 保证） |
+| 结果完整性 | 完整去重 | 单请求内完整去重 |
 
 ### 5.8 latest_stream 统一结论：去重、排序、分页的协同机制
 
@@ -825,10 +838,11 @@ skip(20).take(10) → 取按 start_time 排序的第 21-30 条
 
 | 机制 | 作用 | 与其他机制的交互 |
 |------|------|-----------------|
-| **seen_trace_ids 去重** | 跨分区去重，避免重复结果 | 在 Q1 后过滤，影响 hits_seen 计数，进而影响分页 |
+| **seen_trace_ids 去重** | 单请求内跨分区去重，避免重复结果 | 在 Q1 后过滤，影响 hits_seen 计数，进而影响分页；**仅在当前请求生命周期内有效** |
 | **start_time 强制重排** | 统一排序基准，保证分区遍历顺序正确 | 覆盖 Q1 的 ORDER BY，是 skip/take 分页的基础，但导致非时间排序不一致 |
-| **全局 offset 计数** | 实现跨分区的 from/size 分页 | 依赖去重后的 hits_seen 计数，基于 start_time 排序结果执行 |
+| **全局 offset 计数** | 实现跨分区的 from/size 分页 | 依赖去重后的 hits_seen 计数，基于 start_time 排序结果执行；受 fetch_size 截断影响 |
 | **分区边界** | 决定数据分片方式 | 对 querier 拓扑敏感，影响跨请求分页稳定性 |
+| **fetch_size 截断** | 防止 Q1 查询过大 | 当 `remaining_to_skip + remaining_needed` 超过 `query_default_limit` 时截断，可能导致同请求内分页漏数 |
 
 #### 5.8.2 已知问题与边界
 
@@ -838,24 +852,62 @@ skip(20).take(10) → 取按 start_time 排序的第 21-30 条
    - 缓解：强制单分区查询，但仍存在排序不一致
 
 2. **跨请求分页稳定性问题**
-   - 原因：分区边界对 querier 节点数量敏感
+   - 原因：分区边界对 querier 节点数量敏感；`seen_trace_ids` 仅单请求内有效
    - 影响：集群拓扑变化时，分页结果可能重叠或遗漏
-   - 缓解：使用基于时间的游标（end_time of last seen trace）
+   - 缓解：使用基于时间的游标（end_time of last seen trace），客户端层面去重
 
-3. **fetch_size 限制**
-   - 原因：Q1 的 fetch_size 被限制为 `query_default_limit`（默认 1000）
-   - 影响：如果单个分区内去重后的 trace 数量超过 fetch_size，会导致结果截断
-   - 边界：`remaining_to_skip + remaining_needed` 超过 1000 时可能漏数
+3. **fetch_size 截断与同请求分页稳定性矛盾**
+   - **代码位置**：`mod.rs:1343-1348`
+   ```rust
+   let remaining_to_skip = (hits_to_skip - hits_seen).max(0);
+   let remaining_needed = hits_to_deliver - hits_delivered;
+   let fetch_size =
+       (remaining_to_skip + remaining_needed).min(get_config().limit.query_default_limit);
+   ```
+   - **矛盾点**：
+     - 当 `remaining_to_skip + remaining_needed > query_default_limit`（默认 1000）时，Q1 只返回前 1000 条结果
+     - `partition_total` 只统计这 1000 条去重后的数量，导致 `hits_seen` 计数不完整
+     - 后续的 `remaining_to_skip` 计算基于不完整的 `hits_seen`，导致分页逻辑错误
+   - **影响**：即使在**同一请求内**，当分页深度较大（from + size > 1000）时，也可能出现漏数
+   - **边界条件**：`from + size <= query_default_limit` 时，同请求内分页基本稳定；超过则可能漏数
+   - **缓解**：增大 `query_default_limit` 配置，或避免深度分页
 
-#### 5.8.3 最佳实践
+#### 5.8.3 fetch_size 截断的具体影响
 
-| 场景 | 推荐做法 |
-|------|---------|
-| 时间排序分页 | ✅ 使用 start_time 排序，from/size 分页基本稳定 |
-| 非时间排序 | ⚠️  优先使用 latest 接口，或接受单分区限制 |
-| 大时间范围 | ✅ 使用 latest_stream 流式接口 |
-| 跨请求分页 | ⚠️  避免 from 分页，使用时间游标（end_time 作为下一页 start_time） |
-| 精确查询 | ✅ 使用 trace_id 精确查询 |
+**场景示例**：
+- 用户请求：`from=800, size=300`
+- `remaining_to_skip + remaining_needed = 800 + 300 = 1100`
+- `query_default_limit = 1000`
+- `fetch_size = min(1100, 1000) = 1000`
+
+```
+分区 1 Q1 返回 1000 条
+  ├─ 去重后 950 条
+  ├─ partition_total = 950
+  ├─ hits_seen = 950
+  ├─ skip_in_partition = min(800, 950) = 800
+  ├─ deliverable_q1 = 950.skip(800).take(300) = 150 条
+  └─ hits_delivered = 150
+
+分区 2:
+  ├─ remaining_to_skip = max(0, 800 - 950) = 0
+  ├─ remaining_needed = 300 - 150 = 150
+  ├─ fetch_size = min(0 + 150, 1000) = 150
+  └─ ⚠️  问题：分区 1 实际可能有 1200 条 trace，但只取了 1000 条
+     └─ 被截断的 200 条中可能包含应该在第 800-1100 位置的 trace
+     └─ 导致最终返回的结果不完整
+```
+
+#### 5.8.4 最佳实践
+
+| 场景 | 推荐做法 | 注意事项 |
+|------|---------|---------|
+| 时间排序分页（from + size <= 1000） | ✅ 使用 start_time 排序，from/size 分页 | 同请求内基本稳定 |
+| 时间排序分页（from + size > 1000） | ⚠️  增大 query_default_limit 或避免深度分页 | 可能因 fetch_size 截断漏数 |
+| 非时间排序 | ⚠️  优先使用 latest 接口，或接受单分区限制 | 存在排序不一致问题 |
+| 大时间范围 | ✅ 使用 latest_stream 流式接口 | 首屏加载快，内存占用低 |
+| 跨请求分页 | ⚠️  避免 from 分页，使用时间游标（end_time 作为下一页 start_time） | 客户端层面做最终去重 |
+| 精确查询 | ✅ 使用 trace_id 精确查询 | 时间窗口可精确收缩到 trace_id 前后 1 小时 |
 
 ## 六、查询过滤与优化机制
 
@@ -951,9 +1003,10 @@ f.trim().to_string()
 | 设计决策 | 收益 | 代价 | 适用场景 |
 |---------|------|------|---------|
 | **start_time 强制重排** | 统一排序基准，简化跨分区分页逻辑 | 非时间排序场景下分页结果不正确 | 时间排序为主的场景 |
-| **seen_trace_ids  HashSet 去重** | 服务端全局去重，客户端无需处理 | 内存占用随去重 trace 数量增长 | 跨分区 trace 较多的场景 |
+| **seen_trace_ids  HashSet 去重** | 单请求内跨分区去重，客户端无需处理 | 内存占用随去重 trace 数量增长；**仅单请求内有效，跨请求无效** | 单请求内跨分区 trace 较多的场景 |
 | **非时间排序强制单分区** | 避免跨分区排序的复杂性 | 大时间范围查询性能下降，且仍存在排序不一致 | 非时间排序需求较少的场景 |
-| **from 基于计数分页** | 接口简单，与 latest 保持一致 | 跨请求时受 querier 拓扑变化影响 | 单次查询或集群稳定的场景 |
+| **from 基于计数分页** | 接口简单，与 latest 保持一致 | 跨请求时受 querier 拓扑变化影响；深度分页时受 fetch_size 截断可能漏数 | 浅度分页（from + size <= 1000）或单次查询场景 |
+| **fetch_size 截断** | 防止 Q1 查询过大导致超时 | 深度分页时可能漏数 | 常规分页深度的场景 |
 
 ### 7.4 关于 TraceListIndex 的说明
 - 当前版本：仅写入侧可选元数据，查询路径未使用
