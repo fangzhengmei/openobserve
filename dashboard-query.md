@@ -427,6 +427,49 @@ for (idx, &[start_time, end_time]) in partitions.iter().enumerate() {
 3. **顺序保证**：分区按排序策略依次处理，结果自然有序
 4. **资源隔离**：避免多分区并行对存储层造成突发压力
 
+#### 3.5.2.1 分区串行调度 vs 分区内执行并发的边界
+
+必须明确区分两个层级的并发边界，避免混淆：
+
+| 层级 | 执行模式 | 代码位置 | 说明 |
+|------|---------|---------|------|
+| **分区间调度** | **串行** | `execution.rs:154-421` | `for` 循环 + `do_search().await?`，一个分区完整执行完毕才开始下一个 |
+| **分区内执行** | **可并行** | `do_search()` 内部 | 单个分区内的多文件/多批次处理可使用 rayon 并行 |
+
+**分区内并行的具体体现**：
+
+1. **文件组级并行** (`listing_adapter.rs:246`)：
+```rust
+// 单个分区内的多个文件组使用 rayon 并行处理
+let new_file_groups: Vec<_> = file_groups
+    .into_par_iter()        // rayon 并行迭代器
+    .map(|file_group| { /* 处理单个文件组 */ })
+    .collect();
+```
+
+2. **Record Batch 级并行** (`wal.rs:385`, `wal.rs:424`)：
+```rust
+// WAL 内存数据的多批次并行适配
+let record_batches = merge_groupes
+    .into_par_iter()        // rayon 并行迭代器
+    .map(|mut group| { /* 合并排序单个批次组 */ })
+    .collect();
+```
+
+3. **数据处理并行** (`enrichment_exec.rs:297`)：
+```rust
+// 富化表查询的数据块并行处理
+let result = chunks
+    .into_par_iter()        // rayon 并行迭代器
+    .map(|chunk| { /* 转换单个数据块 */ })
+    .collect();
+```
+
+**边界总结**：
+- 串行点在 **调度层**（控制分区执行顺序和结果返回顺序）
+- 并行点在 **数据层**（单个分区内的数据处理）
+- 优势：既保证了结果的有序性和内存可控，又在数据处理层充分利用多核 CPU
+
 #### 3.5.3 分区排序与发现
 
 完整执行流程 (`do_partitioned_search()`, L49-357)：
@@ -526,7 +569,7 @@ const payload = {
   type: "histogram" | "promql",
   traceId: "uuid",
   org_id: "org_identifier",
-  searchType: "dashboards",
+  searchType: "dashboards" | "ui" | "insights",  // 见下方不同场景说明
   pageType: "logs",  // 来自 fields.stream_type
   meta: {
     dashboard_id, panel_id, tab_id,
@@ -537,6 +580,17 @@ const payload = {
   clear_cache: boolean
 };
 ```
+
+**不同场景下 searchType 的实际取值**（代码校正）：
+
+| 场景 | 传递链路 | searchType 实际值 |
+|------|---------|------------------|
+| **标准看板页面** | `ViewDashboard.vue:550` → `route.query.searchtype` 或 `RenderDashboardCharts.vue` 透传 | `"dashboards"` |
+| **Logs→Visualize** | `VisualizeLogsQuery.vue:23` (`pageType="logs"`) → `PanelEditor.vue:997` (`case "logs": return "ui"`) | **`"ui"`** |
+| **Traces 分析** (logs 流) | `TracesAnalysisDashboard.vue:336` → `streamType === 'logs' ? 'insights' : 'dashboards'` | `"insights"` |
+| **Traces 指标** | `TracesMetricsDashboard.vue:33` → 硬编码 | `"dashboards"` |
+
+> 注意：`searchType` 不等于 `pageType`。`pageType` 描述页面来源，`searchType` 描述后端查询路由类型。
 
 ---
 
@@ -577,20 +631,27 @@ export const detectChunkingDirection = (
 
 **Logs→Visualize 场景下的修正逻辑**：
 
-当从 Logs 页面切换到 Visualize 视图时（`searchType = "logs"` 且 `is_ui_histogram = true`），后端会将原始查询自动转换为直方图查询，此时 `time_offset` 的判断需要特别修正：
+当从 Logs 页面切换到 Visualize 视图时，`searchType` 的实际取值传递链路为：
 
-1. **场景特征** (`usePanelSQLExecutor.ts:227`, `:164-178`)：
+1. **searchType 实际取值链**（代码校正）：
+   - `VisualizeLogsQuery.vue:23` 传入 `pageType="logs"` 给 `PanelEditor`
+   - `PanelEditor.vue:991-1004` 的 switch 映射：`case "logs": return "ui"`
+   - 最终 **`searchType = "ui"`**（而不是 "dashboards" 或 "logs"）
+   - `is_ui_histogram = true` 通过 props 传入
+
+2. **场景特征** (`usePanelSQLExecutor.ts:227`, `:164-178`)：
    - `pageType` 来自 `panelSchema.value.queries[0]?.fields?.stream_type`，通常为 `"logs"`
-   - `is_ui_histogram` 通过 props 传入，值为 `true`
+   - `searchType = "ui"`（由 PanelEditor 计算得到）
+   - `is_ui_histogram = true`（Logs→Visualize 场景标记）
    - 后端会自动将原始 SQL 包装为直方图聚合（`search_stream.rs:337-342`）
 
-2. **原始问题**：
+3. **原始问题**：
    后端自动转换后的直方图查询，第一个返回的分块 `time_offset` 可能与用户实际请求的时间范围存在偏差（例如直方图区间对齐导致），此时直接使用 `time_offset` 判断方向可能出错。
 
-3. **修正逻辑** (`usePanelSQLExecutor.ts:412-431`, `usePanelSearchHandlers.ts:138-162`)：
+4. **修正逻辑** (`usePanelSQLExecutor.ts:412-431`, `usePanelSearchHandlers.ts:138-162`)：
    - **第一优先级**：使用 `state.metadata.queries[queryIndex]` 中存储的**请求时的 startTime/endTime** 作为判断基准
    - **第二优先级**：如果 queryIndex 对应元数据不存在，降级使用 `queries[0]` 的时间范围
-   - **降级保护**：如果 `time_offset` 字段为 0 或不存在，返回 `null` 跳过方向检测，默认按追加方式处理
+   - **time_offset 缺失处理**：如果 `time_offset` 字段为 0 或不存在，`detectChunkingDirection` 返回 `null`，此时**不设置方向标记**，由后续默认逻辑处理
 
 ```typescript
 // usePanelSearchHandlers.ts:138-162 中的判断优先级
@@ -608,7 +669,8 @@ const direction = detectChunkingDirection(
 );
 ```
 
-**分块合并策略** (`chunkingDirection.ts:54-59`)：
+**分块合并策略** (`chunkingDirection.ts:54-59`，`usePanelSearchHandlers.ts:164-167`)：
+
 ```
  isLTR XOR orderAsc → shouldPrepend
 
@@ -623,6 +685,27 @@ const direction = detectChunkingDirection(
 
  布尔表达式: shouldPrepend = isLTR !== orderAsc
 ```
+
+**time_offset 缺失时的行为校正**（原描述"固定追加"错误）：
+
+当 `detectChunkingDirection` 返回 `null`（time_offset 为 0 或缺失），代码不会调用 `chunkingLeftToRight.set()`，此时：
+
+```typescript
+// usePanelSearchHandlers.ts:164 —— 注意默认值是 false (RTL)
+const isLTR = chunkingLeftToRight.get(queryIndex) ?? false;
+const orderAsc = searchRes?.content?.results?.order_by?.toLowerCase() === "asc";
+const shouldPrepend = shouldPrependChunk(isLTR, orderAsc);
+```
+
+实际合并行为由 `orderAsc` 决定：
+
+| time_offset 状态 | isLTR 默认值 | orderAsc | shouldPrepend | 合并行为 |
+|-----------------|-------------|----------|---------------|---------|
+| ✅ 正常返回 | true/false | true/false | 由 XOR 决定 | 正确方向 |
+| ❌ 缺失/为 0 | **false (RTL)** | **true** | `false !== true` → **true** | **prepend (头插)** |
+| ❌ 缺失/为 0 | **false (RTL)** | **false** | `false !== false` → **false** | **append (尾插)** |
+
+> 关键结论：time_offset 缺失时**不是固定追加**，而是**默认假设 RTL 方向**，最终合并行为由每个分块的 `order_by` 排序决定。
 
 #### 4.1.3 Hit 批处理优化
 
@@ -829,6 +912,8 @@ variablesDataUpdated()
 6. **Streaming Aggs**：聚合查询采用替换而非追加，减少内存拷贝
 7. **串行分区 + 提前终止**：时间排序场景下，累计足够结果即停止后续分区
 8. **Top-K 堆合并**：非时间排序场景内存固定为 O(K)，与数据总量无关
+9. **调度与数据分层并行**：分区间串行保证有序，分区内 rayon 并行利用多核
+10. **分块方向预判**：基于 time_offset 选择 prepend/append，避免全量排序
 
 ### 7.2 可靠性设计
 
@@ -847,31 +932,54 @@ variablesDataUpdated()
 4. **事件驱动**：流式响应通过事件类型分发，扩展性强
 5. **分层架构**：前端编排关注交互体验，后端关注执行效率
 6. **两阶段 Top-K**：分区局部 + 全局堆合并，兼顾效率与正确性
+7. **调度与数据分离**：分区间串行调度保证有序性，分区内数据并行提高吞吐量
+8. **默认值容错设计**：time_offset 缺失时使用 RTL 默认值 + orderAsc 决定合并方向，避免阻塞
 
 ---
 
 ## 八、前后文档差异对照
 
-| 章节 | 原文档 (v1) | 新文档 (v2) | 修正/补充说明 |
-|------|-------------|-------------|--------------|
-| **整体架构** | 三阶段概述 | 三阶段概述 + 关键细节标注 | 新增变量就绪判定、AST 改写链、串行分区、Top-K 合并、time_offset 修正的位置标注 |
-| **变量替换** | 仅描述变量分类和替换格式 | 补充 **3.2 变量就绪四步判定** 完整章节 | 新增四步判定逻辑、阻塞条件真值表、变量变更深度比较、防死锁设计说明 |
-| **后端执行** | 描述为「分区并行执行」 | 修正为 **分区串行执行** (3.5.2) | 关键错误修正：代码明确显示 `for` 循环 + `.await` 是串行，补充串行执行优势分析 |
-| **SQL 处理** | 仅描述元数据解析 | 补充 **3.5.1 SQL AST 改写链** 完整章节 | 新增 5 个改写器的职责、执行顺序、代码映射和 Visitor 模式设计说明 |
-| **Top-K 排序** | 仅提及"Top-K 堆排序" | 补充 **3.5.4 非时间排序 Top-K 全局合并** 完整章节 | 新增两阶段合并策略、堆操作代码映射、算法复杂度分析、独立时序图 |
-| **结果回填** | 基础分块方向描述 | 补充 **Logs→Visualize 场景 time_offset 修正** (4.1.2) | 新增场景特征、原始问题、判断优先级、修正逻辑和真值表 |
-| **分块合并策略** | 文字描述 | 补充 XOR 真值表和布尔表达式 | 更清晰展示 4 种组合的正确性 |
-| **代码索引** | 10 个模块 | 14 个模块 | 新增分块方向检测、Top-K 堆合并、5 个 AST 改写器的独立索引 |
-| **时序图** | 2 张时序图 | 3 张时序图 | 新增「非时间排序 Top-K 执行时序」 |
-| **设计亮点** | 6 性能 + 5 可靠 + 4 架构 | 8 性能 + 6 可靠 + 6 架构 | 补充串行分区提前终止、Top-K 内存效率、变量防死锁、访问者模式等 |
-| **差异对照** | 无 | 新增本章 | 提供明确的版本对比，便于快速定位更新点 |
+### v1 → v2 → v3 三级版本演进
 
-### 关键错误修正汇总
+| 章节 | v1 初始版 | v2 补充版 | v3 校正版 (本次) | 关键变化说明 |
+|------|----------|-----------|-----------------|-------------|
+| **整体架构** | 三阶段概述 | 三阶段概述 + 关键细节标注 | 同 v2 | v2 已完成 |
+| **变量替换** | 仅变量分类 | 补充 **3.2 变量就绪四步判定** | 同 v2 | v2 已完成 |
+| **后端执行** | 「分区并行执行」❌ | 修正为 **分区串行执行** | 补充 **3.5.2.1 分区间串行 vs 分区内并行** 边界 | v2 修正串行，v3 补充并发边界 |
+| **SQL 处理** | 仅元数据解析 | 补充 **3.5.1 SQL AST 改写链** | 同 v2 | v2 已完成 |
+| **Top-K 排序** | 仅文字提及 | 补充完整章节 | 同 v2 | v2 已完成 |
+| **searchType 取值** | 模糊描述为 `dashboards`/`logs` | 无修正 | 补充 **3.6 节不同场景取值表** + **4.1.2 节取值链** | Logs→Visualize 实际为 `"ui"` 而非 `"logs"` |
+| **结果回填** | 基础分块方向 | 补充 Logs→Visualize 修正 | **time_offset 缺失行为校正** | 原"固定追加"错误，实际由 `orderAsc` 决定 |
+| **分块合并策略** | 文字描述 | 补充 XOR 真值表 | 补充 **缺失时行为真值表** | 新增 `isLTR ?? false` 默认值分析 |
+| **代码索引** | 10 个模块 | 14 个模块 | 同 v2 | v2 已完成 |
+| **时序图** | 2 张 | 3 张 | 同 v2 | v2 已完成 |
+| **设计亮点** | 6+5+4 | 8+6+6 | 同 v2 | v2 已完成 |
+| **差异对照** | 无 | v1→v2 对照表 | 扩展为 v1→v2→v3 三级对照 | 本次新增 |
 
-| 原错误描述 | 修正后描述 | 影响程度 |
-|-----------|-----------|---------|
-| "分区并行执行" | "分区串行执行，可提前终止" | ⚠️ 高 |
-| 未提及变量就绪判定步骤 | 四步判定 + 阻塞条件真值表 | 🟡 中 |
-| 未提及 SQL AST 改写过程 | 5 个改写器按顺序执行的完整流水线 | 🟡 中 |
-| 未提及非时间排序合并策略 | 两阶段 Top-K + 最小堆全局合并 | 🟡 中 |
-| 未提及 Logs→Visualize 特殊处理 | time_offset 判断优先级修正 | 🟡 中 |
+### 关键错误修正汇总（累计）
+
+| 版本 | 原错误描述 | 修正后描述 | 影响程度 | 代码佐证 |
+|------|-----------|-----------|---------|---------|
+| v2 | "分区并行执行" | "分区间串行，分区内可并行" | ⚠️ 高 | `execution.rs:154` `for + .await` |
+| v2 | Logs→Visualize `searchType="logs"` | Logs→Visualize `searchType="ui"` | 🟡 中 | `PanelEditor.vue:997` `case "logs": return "ui"` |
+| v3 | time_offset 缺失时"固定追加" | 默认 `isLTR=false`，行为由 `orderAsc` 决定 | 🟡 中 | `usePanelSearchHandlers.ts:164` `?? false` |
+| v2 | 未提及变量就绪判定 | 四步判定 + 阻塞条件真值表 | 🟡 中 | `usePanelVariableSubstitution.ts:219-330` |
+| v2 | 未提及 SQL AST 改写过程 | 5 个改写器按顺序执行的完整流水线 | 🟡 中 | `search::sql::mod.rs:161-282` |
+| v2 | 未提及非时间排序合并策略 | 两阶段 Top-K + 最小堆全局合并 | 🟡 中 | `execution.rs:159-508` |
+| v3 | 未区分调度层与数据层并发 | 分区间串行（调度）/ 分区内并行（数据） | 🟢 低 | `listing_adapter.rs:246` `into_par_iter()` |
+| v2 | 未提及 Logs→Visualize 特殊处理 | time_offset 判断优先级修正 | 🟡 中 | `usePanelSearchHandlers.ts:152-157` |
+
+### v3 本次核心校正点
+
+1. **searchType 实际取值链校正**：
+   - `VisualizeLogsQuery.vue` → `pageType="logs"`
+   - `PanelEditor.vue:997` → `case "logs": return "ui"`
+   - 最终 `searchType = "ui"`
+
+2. **time_offset 缺失行为校正**：
+   - 原：默认按追加方式处理
+   - 现：`isLTR = get() ?? false`（默认 RTL），`shouldPrepend = false !== orderAsc`
+
+3. **并发边界澄清**：
+   - 调度层：分区间串行（`for + .await`）
+   - 数据层：分区内可并行（`rayon::into_par_iter`）
