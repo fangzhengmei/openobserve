@@ -269,17 +269,44 @@ pub async fn init() -> errors::Result<()> {
 
 `src/ingester/src/wal.rs:50` - `check_uncompleted_parquet_files()`
 
-根据 5 步持久化流程，处理各种中断场景：
+#### 两阶段恢复流程
 
-| 中断时机 | 发现的文件 | 恢复动作 |
-|---------|-----------|---------|
-| 步骤1后（.par 已写，无 .lock） | .par 文件，无 .lock，无 .wal | 删除 .par 文件 |
-| 步骤2后（.lock 已写） | .lock + .par + .wal | 删除 .wal，重命名 .par->.parquet，删除 .lock |
-| 步骤3后（.wal 已删） | .lock + .par | 重命名 .par->.parquet，删除 .lock |
-| 步骤4后（.parquet 已写） | .lock + .parquet | 删除 .lock |
+该函数采用**两阶段扫描**策略，严格按照代码执行顺序：
+
+```rust
+// 阶段1: 扫描并处理所有 .lock 文件（logs/ 目录下）
+let lock_files = wal_scan_files(wal_dir, "lock").await?;
+for lock_file in lock_files.iter() {
+    // 读取 .lock 文件中记录的 .par 文件列表
+    // 删除对应的 .wal 文件（如果存在）
+    // 重命名 .par -> .parquet
+    // 删除 .lock 文件
+}
+
+// 阶段2: 扫描并删除所有孤立的 .par 文件（files/ 目录下）
+let par_files = wal_scan_files(parquet_dir, "par").await?;
+for par_file in par_files.iter() {
+    // 直接删除！这些是没有 .lock 标记的临时文件
+    std::fs::remove_file(par_file)?;
+}
+```
+
+#### 各中断场景的真实恢复步骤
+
+根据代码实际执行路径，各中断场景的恢复逻辑如下：
+
+| 中断时机 | 磁盘文件状态 | 恢复执行路径 | 数据完整性 |
+|---------|-------------|-------------|-----------|
+| **场景1: 步骤1后、步骤2前**<br>.par 已写，.lock 未写 | `files/xxx.par` ✔️<br>`logs/xxx.lock` ❌<br>`logs/xxx.wal` ✔️ | 1. 阶段1：无 .lock，跳过<br>2. 阶段2：扫描到孤立 .par，直接删除<br>3. 后续重放：.wal 仍存在，被 `replay_wal_files` 重放 | ✅ 数据安全，通过 WAL 重放恢复 |
+| **场景2: 步骤2后、步骤3前**<br>.lock 已写，.wal 未删 | `files/xxx.par` ✔️<br>`logs/xxx.lock` ✔️<br>`logs/xxx.wal` ✔️ | 1. 阶段1：找到 .lock<br>   - 删除 .wal<br>   - 重命名 .par→.parquet<br>   - 删除 .lock<br>2. 阶段2：无孤立 .par，跳过 | ✅ 数据安全，从断点续传完成 |
+| **场景3: 步骤3后、步骤4前**<br>.wal 已删，.par 未改名 | `files/xxx.par` ✔️<br>`logs/xxx.lock` ✔️<br>`logs/xxx.wal` ❌ | 1. 阶段1：找到 .lock<br>   - .wal 已删，跳过删除<br>   - 重命名 .par→.parquet<br>   - 删除 .lock<br>2. 阶段2：无孤立 .par，跳过 | ✅ 数据安全，从断点续传完成 |
+| **场景4: 步骤4后、步骤5前**<br>.parquet 已写，.lock 未删 | `files/xxx.parquet` ✔️<br>`logs/xxx.lock` ✔️<br>`logs/xxx.wal` ❌ | 1. 阶段1：找到 .lock<br>   - .wal 已删，跳过删除<br>   - .par 已改名，跳过重命名<br>   - 删除 .lock<br>2. 阶段2：无孤立 .par，跳过 | ✅ 数据安全，仅需清理锁文件 |
+
+> **重要修正**：场景1中 `.wal` 文件**仍然存在**！这是之前理解的关键误区。.par 被删除是因为它没有锁标记，不能保证完整性，但原始数据在 WAL 中，会通过重放机制完整恢复，不会丢失。
 
 **关键代码位置**：
 - `src/ingester/src/wal.rs:50` - `check_uncompleted_parquet_files` 函数
+- `src/ingester/src/wal.rs:93-103` - 孤立 .par 文件删除逻辑
 
 ### 5.3 WAL 重放机制
 
@@ -441,6 +468,183 @@ if let Err(e) = ingester::init().await {
 
 ---
 
+### 6.4 重放进行中与压实调度的时序边界
+
+#### 启动顺序与任务初始化
+
+从 `src/main.rs:286-295` 可以看出严格的初始化顺序：
+
+```rust
+// 步骤1: 初始化 ingester（包含崩溃恢复）
+if let Err(e) = ingester::init().await {
+    panic!("ingester init failed: {e}");
+}
+
+// 步骤2: 初始化 job（包含上传和压实调度）
+if let Err(e) = job::init().await {
+    panic!("job init failed: {e}");
+}
+```
+
+`ingester::init()` 内部执行顺序 (`src/ingester/src/lib.rs:93-131`)：
+```rust
+pub async fn init() -> errors::Result<()> {
+    // 1. 同步执行：检查未完成的 parquet 文件
+    wal::check_uncompleted_parquet_files().await?;
+    
+    // 2. 异步启动：WAL 重放（不阻塞）
+    tokio::task::spawn(async move {
+        wal::replay_wal_files(wal_dir, wal_files).await;
+    });
+    
+    // 3. 同步启动：MemTable TTL 检查任务
+    tokio::task::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(max_file_retention_time)).await;
+            writer::check_ttl().await;
+        }
+    });
+    
+    // 4. 同步启动：Immutable 持久化任务
+    tokio::task::spawn(async move {
+        run().await; // 内部按 mem_persist_interval 循环
+    });
+    
+    Ok(()) // 返回，不等待重放完成
+}
+```
+
+`job::init()` 内部启动 (`src/job/mod.rs` → `src/job/files/mod.rs:33` → `src/job/compactor.rs:29`)：
+```rust
+// 文件上传任务启动（ingester 节点）
+tokio::task::spawn(parquet::run()); 
+// 内部循环：sleep(file_push_interval) → scan_wal_files → 上传
+
+// 压实调度任务启动（compactor 节点）
+spawn_pausable_job!("run_generate_job", compact.interval, { ... });
+spawn_pausable_job!("run_merge", compact.interval + 2, { ... });
+// 内部循环：sleep(compact.interval) → 生成/执行压实任务
+```
+
+#### 完整时间线分析（默认配置）
+
+假设配置：
+- `file_push_interval = 10s`（文件上传扫描周期）
+- `compact.interval = 60s`（压实调度周期）
+- `max_file_retention_time = 300s`（文件最大保留时间）
+- `mem_persist_interval = 10s`（Immutable 持久化周期）
+
+```
+时间轴 (T=服务启动时刻)
+
+T+0ms
+  ├─ ingester::init() 开始
+  │   ├─ check_uncompleted_parquet_files() 执行 (同步)
+  │   │   └─ 两阶段扫描：处理 .lock + 删除孤立 .par
+  │   ├─ 启动 WAL 重放任务 (后台异步)
+  │   ├─ 启动 MemTable TTL 检查任务 (后台，周期 300s)
+  │   └─ 启动 Immutable 持久化任务 (后台，周期 10s)
+  └─ ingester::init() 返回 ✓
+
+T+1ms ~ T+N (WAL 重放进行中)
+  ├─ 重放线程读取 WAL 文件，写入临时 MemTable
+  ├─ 每完成一个 WAL 文件 → immutable.persist() → 写入本地 .parquet
+  │   └─ 此时数据可通过本地 files/ 目录被查询 ✓
+  └─ 同时新的写入也在正常进行
+
+T+10s  (第1次文件上传扫描)
+  ├─ scan_wal_files() 扫描本地 .parquet 文件
+  ├─ 包括：
+  │   ├─ 重放已完成并持久化的文件 ✓ 可上传
+  │   └─ 新写入产生的文件 ✓ 可上传
+  └─ 满足阈值的文件被上传到对象存储
+      └─ 写入 file_list 元数据后，数据可从存储查询 ✓
+
+T+60s  (第1次压实调度)
+  ├─ run_generate_job() 生成本小时压实任务
+  └─ 时间窗口检查：3 * 300s = 900s
+      └─ T+60s < 900s → 跳过，不压实 ✗
+
+T+300s (MemTable TTL 首次检查)
+  └─ 检查活跃 MemTable 是否超时，触发旋转
+
+T+600s (第10次压实调度)
+  └─ T+600s < 900s → 仍跳过 ✗
+
+T+900s (第15次压实调度)
+  ├─ T+900s >= 900s → 时间窗口满足 ✓
+  ├─ 生成 T-900s 之前小时的压实任务
+  └─ 开始执行压实：
+      ├─ 从对象存储下载小文件
+      ├─ DataFusion 合并
+      ├─ 上传大文件
+      └─ 原子更新 file_list（标记旧文件删除）
+          └─ 压实完成，查询性能提升 ✓
+```
+
+#### 数据可查询性的四层边界
+
+| 阶段 | 数据位置 | 查询路径 | 时间点 |
+|-----|---------|---------|-------|
+| **层1: 重放中内存** | 重放临时 MemTable | ❌ 不可查询（不在 IMMUTABLES 中） | 重放进行中 |
+| **层2: 重放完成本地** | `files/*.parquet` | ✅ 可查询（本地文件扫描） | 单 WAL 文件重放完成后 |
+| **层3: 上传完成存储** | 对象存储 + file_list | ✅ 可查询（对象存储扫描） | 上传完成 + file_list 写入后 |
+| **层4: 压实完成优化** | 对象存储（合并后） | ✅ 可查询（性能最优） | T + 3 * max_file_retention_time 后 |
+
+#### 关键时序保护机制
+
+**保护机制1: WAL 重放不阻塞服务启动**
+```rust
+// src/ingester/src/lib.rs:105
+tokio::task::spawn(async move {
+    // 异步执行，不阻塞 init 返回
+    wal::replay_wal_files(wal_dir, wal_files).await;
+});
+```
+- ✅ 服务快速恢复写入能力
+- ❌ 重放期间这部分数据暂不可查询
+
+**保护机制2: 压实 3 倍时间窗口**
+```rust
+// src/service/compact/merge.rs:138
+if time_now.timestamp_micros() - offset 
+    <= Duration::try_seconds(max_file_retention_time as i64)
+        .unwrap().num_microseconds().unwrap() * 3 {
+    return Ok(()); // 时间未到，等待
+}
+```
+- 确保重放产生的文件有足够时间上传
+- 避免压实正在上传/重放的数据
+
+**保护机制3: 本地文件扫描的 PROCESSING 标记**
+```rust
+// src/job/files/parquet.rs:309
+if PROCESSING_FILES.read().await.contains(&file_key) {
+    continue; // 跳过正在处理的文件
+}
+```
+- 防止重放持久化和上传任务同时操作同一文件
+
+**保护机制4: 上传任务的 DB 健康检查**
+```rust
+// src/job/files/parquet.rs:137
+if let Err(e) = infra::file_list::health_check().await {
+    continue; // DB 不可用时跳过，避免产生孤立文件
+}
+```
+- 防止 DB 故障时上传文件但无法写入元数据
+
+#### 重放与压实的潜在交互边界
+
+| 交互场景 | 结果 | 保护机制 |
+|---------|------|---------|
+| 重放产生的文件正在被上传，压实调度启动 | 压实时时间窗口未到，直接跳过 | 3× 时间窗口 |
+| 重放持久化正在写 .parquet，上传扫描启动 | 文件被标记 PROCESSING，跳过 | PROCESSING_FILES 锁 |
+| 重放进行中节点再次崩溃 | 重启后重新执行整个恢复流程 | 恢复逻辑幂等 |
+| 上传到一半节点崩溃 | 重启后重新扫描，重新上传 | 上传操作幂等，元数据去重 |
+
+---
+
 ## 7. 关键设计决策与权衡
 
 ### 7.1 WAL 不直接删除，等待持久化完成
@@ -509,8 +713,15 @@ WAL 归档、压实调度与崩溃恢复三者通过以下机制紧密协作：
 
 1. **WAL 作为事实来源**：所有写入先确认到 WAL，确保数据不丢失
 2. **5 步持久化作为衔接桥梁**：通过原子操作序列在 WAL 和磁盘文件之间建立安全的状态转移
-3. **时间窗口作为安全边界**：3 倍保留时间确保本地上传完成后才开始压实
-4. **偏移量作为进度标记**：每个流的压实进度通过 offset 追踪，支持节点故障转移
-5. **多阶段崩溃恢复**：先清理未完成的持久化，再重放 WAL，确保任何中断点都能正确恢复
+3. **两阶段恢复作为容错基础**：先处理带锁标记的文件，再清理无锁临时文件，确保场景1的数据通过 WAL 重放恢复
+4. **时间窗口作为安全边界**：3 倍保留时间确保本地上传完成后才开始压实
+5. **偏移量作为进度标记**：每个流的压实进度通过 offset 追踪，支持节点故障转移
+6. **多层时序保护**：异步重放、PROCESSING 锁、DB 健康检查四重机制确保重放与压实互不干扰
+
+### 关键修正澄清
+
+- **场景1误解修正**：".par 已写无 .lock" 时 `.wal` 文件**仍然存在**，数据通过 WAL 重放完整恢复，不会丢失
+- **时序边界澄清**：重放是异步后台执行，与上传、压实任务并行，但通过 3× 时间窗口、PROCESSING 标记等机制确保正确性
+- **数据可查询性分层**：重放中内存 → 重放完成本地 → 上传完成存储 → 压实完成优化，四层边界清晰
 
 整个设计的核心哲学是：**通过可预测的文件系统操作和明确的状态标记，在不依赖复杂分布式事务的前提下，实现数据的最终一致性和故障可恢复性。**
