@@ -645,6 +645,208 @@ if let Err(e) = infra::file_list::health_check().await {
 
 ---
 
+### 6.5 重放写盘与上传扫描的判定条件拆分
+
+#### 阶段 A: 重放写盘阶段（Replay → Local Disk）
+
+**所属模块**：`src/ingester/src/`
+
+**核心代码路径**：
+- `replay_wal_files()` → `immutable.persist()` → 5 步持久化
+
+**判定条件（仅依赖持久化层内部状态）**：
+
+| 判定条件 | 代码位置 | 说明 |
+|---------|---------|------|
+| WAL 文件存在 | `wal.rs:112` | 遍历启动时扫描到的 WAL 文件列表 |
+| WAL 文件可打开 | `wal.rs:129-134` | 打开失败则跳过该文件 |
+| 条目 CRC 校验通过 | `wal.rs:154-158` | 校验失败跳过该条目，不影响整个文件 |
+| 条目长度匹配 | `wal.rs:148-152` | 长度不匹配跳过该条目 |
+| Entry 反序列化成功 | `wal.rs:167-175` | 反序列化失败跳过该条目 |
+| PROCESSING_TABLES 无冲突 | `immutable.rs:147` | 防止同一 WAL 被多个持久化线程重复处理 |
+
+**关键特性**：
+- ✅ **无阈值限制**：只要 WAL 文件重放完成就立即写盘，不等待大小/时间阈值
+- ✅ **无外部依赖**：不依赖 DB、不依赖对象存储，纯本地文件系统操作
+- ✅ **文件粒度并行**：多个 WAL 文件可以并行重放和持久化
+- ✅ **幂等操作**：5 步持久化设计确保中断后可安全重试
+- ❌ **无并发生成**：重放产生的是临时 MemTable，不会和正常写入的 MemTable 冲突
+
+**锁机制**：`PROCESSING_TABLES`（ingester 内部锁）
+- 类型：`RwAHashSet<PathBuf>`
+- 作用域：仅在 `immutable.rs` 内使用
+- 保护对象：IMMUTABLES 队列中的待持久化表
+
+---
+
+#### 阶段 B: 上传扫描阶段（Local Disk → Object Storage）
+
+**所属模块**：`src/job/files/parquet.rs`
+
+**核心代码路径**：
+- `scan_wal_files()` → `prepare_files()` → `move_files()` → 上传
+
+**判定条件（分为准入判定、阈值判定、健康判定三层）**：
+
+##### 层1: 准入判定（prepare_files）
+
+| 判定条件 | 代码位置 | 说明 |
+|---------|---------|------|
+| 文件扩展名是 .parquet | `parquet.rs:239` | 扫描时只匹配 parquet 扩展名 |
+| 路径可规范化 | `parquet.rs:294-304` | canonicalize + strip_prefix 失败跳过 |
+| PROCESSING_FILES 无冲突 | `parquet.rs:309-311` | 正在处理的文件跳过 |
+| 元数据可读 | `parquet.rs:313-318` | 优先读缓存 `WAL_PARQUET_METADATA`，失败则读磁盘 |
+| 文件非空 | `parquet.rs:320-328` | `FileMeta::default()` 表示空文件，直接删除 |
+
+##### 层2: 阈值判定（move_files）
+
+**三取一逻辑**，满足任一即可上传：
+
+```rust
+// src/job/files/parquet.rs:469-506
+// 条件1: 大小阈值
+if total_original_size >= min(max_file_size_on_disk, compact.max_file_size)
+    // 条件2: 字段数量阈值（用于控制合并开销）
+    || (file_move_fields_limit > 0 && stream_fields_num >= file_move_fields_limit)
+    // 条件3: 时间阈值
+    || has_expired_files  // 文件创建时间早于 now - max_file_retention_time
+{
+    // 开始上传
+}
+```
+
+| 阈值条件 | 默认值 | 说明 |
+|---------|-------|------|
+| 大小阈值 | 256MB | `min(max_file_size_on_disk, compact.max_file_size)` |
+| 时间阈值 | 300s | `now - file_created > max_file_retention_time` |
+| 字段阈值 | 0（禁用） | `stream_fields_num >= file_move_fields_limit` |
+
+##### 层3: 健康判定（scan_wal_files 循环入口）
+
+| 判定条件 | 代码位置 | 说明 |
+|---------|---------|------|
+| 非离线模式 | `parquet.rs:112-114` | 集群离线则停止上传 |
+| DB 健康检查通过 | `parquet.rs:137-142` | DB 不可用跳过，避免产生孤立文件 |
+
+**关键特性**：
+- ✅ **数据源中立**：不关心文件是重放产生的还是正常写入产生的，一视同仁
+- ✅ **批量处理**：按分区分组后批量合并上传，减少对象存储 API 调用
+- ✅ **先删本地后传存储**：合并时先读入内存，删除本地文件，再上传大文件
+- ❌ **依赖外部服务**：需要 DB 和对象存储可用
+
+**锁机制**：`PROCESSING_FILES`（job 模块内部锁）
+- 类型：`RwAHashSet<String>`
+- 作用域：仅在 `parquet.rs` 内使用
+- 保护对象：待上传的本地文件
+
+---
+
+#### 两层锁的本质区别
+
+| 维度 | PROCESSING_TABLES | PROCESSING_FILES |
+|-----|------------------|-----------------|
+| 所属模块 | ingester | job/files |
+| 保护对象 | 内存中的 IMMUTABLE 表 | 磁盘上的 .parquet 文件 |
+| 生命周期 | 持久化开始 → 持久化结束 | 扫描发现 → 上传完成/失败 |
+| 重放阶段是否使用 | ✅ 是（重放持久化） | ✅ 是（上传重放产物） |
+| 并发保护目标 | 多个持久化线程重复处理同一表 | 多次扫描重复处理同一文件 |
+
+> **关键澄清**：这是两套**完全独立**的并发保护机制，作用于不同阶段、保护不同对象。之前混淆为"同一层并发保护"是错误的。
+
+---
+
+### 6.6 故障排查指引
+
+#### 场景 1: 判断重放未完成
+
+**现象特征**：
+
+1. **日志特征**
+   ```
+   warn: replay wal file: "logs/xxx/0/xxx.wal" starting...
+   warn: replay wal file: "logs/xxx/0/xxx.wal", entries: 1000, records: 50000
+   # 但没有出现：
+   warn: replay wal file: "logs/xxx/0/xxx.wal" done, json_size: ...
+   ```
+
+2. **磁盘特征**
+   - `data_wal_dir/logs/` 目录下仍有 `.wal` 文件存在
+   - `data_wal_dir/logs/` 目录下可能有对应 `.lock` 文件（如果持久化进行中崩溃）
+
+3. **查询特征**
+   - 崩溃前写入的数据在本地查询不到（重放进行中）
+   - 对象存储中没有对应时间段的新文件
+
+4. **指标特征**
+   - `ingest_wal_used_bytes` 指标持续高位不下降
+   - `ingest_memtable_bytes` 指标有临时波动（重放写入 MemTable）
+
+**排查步骤**：
+1. 检查日志中是否有 `replay wal file: ... starting` 但无 `done`
+2. 检查 `logs/` 目录是否还有残留 `.wal` 文件
+3. 检查 ingester 进程 CPU/IO 是否异常（可能重放卡死）
+4. 如进程正常，耐心等待；如进程异常，重启触发再次重放
+
+---
+
+#### 场景 2: 判断上传等待（数据在本地但未上传）
+
+**现象特征**：
+
+1. **日志特征**
+   ```
+   # 没有上传相关日志，或只有：
+   debug: scan files get total: 15, took: 12 ms
+   # 但没有出现：
+   info: move files to s3 success, files: 5, size: 128MB
+   ```
+
+2. **磁盘特征**
+   - `data_wal_dir/logs/` 目录下无 `.wal` 文件（重放已完成）
+   - `data_wal_dir/files/` 目录下有大量 `.parquet` 文件
+   - 文件总大小 < 256MB（未达大小阈值）
+   - 文件最旧创建时间 < 300s（未达时间阈值）
+
+3. **查询特征**
+   - 本地查询可以查到数据（走本地文件扫描）
+   - 对象存储查询查不到（未上传）
+
+4. **指标特征**
+   - `ingest_parquet_files` 指标持续增长
+   - `ingest_wal_used_bytes` 指标下降（WAL 已删）但不为 0
+
+**排查步骤**：
+1. 检查 `files/` 目录下文件总大小和最旧文件时间
+2. 检查日志中是否有 `DB health check failed`（DB 故障导致跳过上传）
+3. 检查 `max_file_retention_time` 配置是否过大
+4. 如急需上传，可等待时间阈值触发，或重启节点（会重置文件创建时间？不，创建时间不变）
+
+---
+
+#### 场景 3: 混合场景排查流程
+
+```
+发现数据查询不到
+    │
+    ├─ 检查 logs/ 目录是否有 .wal 文件
+    │   ├─ 有 → 重放未完成 → 等待或检查重放日志
+    │   └─ 无 → 重放已完成 → 下一步
+    │
+    ├─ 检查 files/ 目录是否有 .parquet 文件
+    │   ├─ 有 → 未上传 → 检查阈值/DB健康
+    │   └─ 无 → 已上传 → 下一步
+    │
+    ├─ 检查对象存储是否有对应文件
+    │   ├─ 有 → 已上传 → 检查 file_list 元数据
+    │   └─ 无 → 上传失败 → 检查对象存储权限/网络
+    │
+    └─ 检查压实 offset 是否推进到该时间段
+        ├─ 未到时间窗口 → 等待 3× 保留时间
+        └─ 已到时间窗口 → 检查压实任务是否被阻塞
+```
+
+---
+
 ## 7. 关键设计决策与权衡
 
 ### 7.1 WAL 不直接删除，等待持久化完成
@@ -722,6 +924,7 @@ WAL 归档、压实调度与崩溃恢复三者通过以下机制紧密协作：
 
 - **场景1误解修正**：".par 已写无 .lock" 时 `.wal` 文件**仍然存在**，数据通过 WAL 重放完整恢复，不会丢失
 - **时序边界澄清**：重放是异步后台执行，与上传、压实任务并行，但通过 3× 时间窗口、PROCESSING 标记等机制确保正确性
+- **判定条件拆分**：重放写盘和上传扫描是两个独立阶段，使用不同锁机制（`PROCESSING_TABLES` vs `PROCESSING_FILES`）、不同判定条件，不可混淆
 - **数据可查询性分层**：重放中内存 → 重放完成本地 → 上传完成存储 → 压实完成优化，四层边界清晰
 
 整个设计的核心哲学是：**通过可预测的文件系统操作和明确的状态标记，在不依赖复杂分布式事务的前提下，实现数据的最终一致性和故障可恢复性。**
