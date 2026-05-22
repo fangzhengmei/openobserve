@@ -510,9 +510,53 @@ if search_type == SearchEventType::Dashboards
 
 #### 3.5.4 非时间排序 Top-K 全局合并
 
-当 `ORDER BY` 不是时间字段（或包含非时间字段）时，执行两阶段 Top-K 合并策略：
+当 `ORDER BY` 不是时间字段（或包含非时间字段）时，执行两阶段 Top-K 合并策略。核心实现位于 `sorting.rs:214-358`。
 
-**阶段一：分区内局部 Top-K** (execution.rs:159-163)
+##### 3.5.4.1 TopKHeap 核心结构
+
+```rust
+// sorting.rs:222-228
+pub struct TopKHeap {
+    heap: BinaryHeap<std::cmp::Reverse<HeapHit>>,  // ✅ Reverse 包装实现方向感知
+    k: usize,
+    /// (col_name, is_descending, is_numeric) — 多列排序按 ORDER BY 顺序
+    cols: Vec<(String, bool, Option<bool>)>,
+}
+```
+
+**关键设计：`Reverse<HeapHit>` 的方向感知机制**
+
+`Reverse` 与 `is_descending` 共同决定元素去留，确保无论 ASC 还是 DESC 排序，堆顶始终是「当前最差」的元素：
+
+| ORDER BY 方向 | HeapHit::cmp 行为 | Reverse 包装后效果 | 堆类型 | 淘汰元素 | 保留元素 |
+|--------------|------------------|-------------------|--------|---------|---------|
+| **DESC** (取最大 K 个) | 正常升序比较 (a < b → Less) | Reverse 反转 → a 较大时堆顶 | **最小堆** | 最小的 | K 个最大的 |
+| **ASC** (取最小 K 个) | 反转比较 (a < b → Greater) | Reverse 再反转 → a 较小时堆顶 | **最大堆** | 最大的 | K 个最小的 |
+
+```rust
+// sorting.rs:342-357 —— HeapHit 比较逻辑
+impl Ord for HeapHit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        for (col, is_desc, is_numeric) in &self.cols {
+            let ord = if *is_numeric {
+                compare_numeric_values(&self.hit, &other.hit, col)
+            } else {
+                compare_string_values(&self.hit, &other.hit, col)
+            };
+            // ✅ ASC 列主动反转，配合 Reverse 包装后效果正确
+            let ord = if *is_desc { ord } else { ord.reverse() };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    }
+}
+```
+
+##### 3.5.4.2 两阶段合并流程
+
+**阶段一：分区内局部 Top-K** (`execution.rs:159-163`)
 ```rust
 if is_non_ts_order_by {
     // 每个分区 fetch local top-(from+size); leader merges globally after all
@@ -522,9 +566,10 @@ if is_non_ts_order_by {
 ```
 每个分区独立计算自己的 Top-K（K = from + size），避免传送到下游的数据量过大。
 
-**阶段二：分区间全局 Top-K** (execution.rs:239-246)
+**阶段二：分区间全局 Top-K** (`execution.rs:239-246`, `sorting.rs:245-276`)
+
 ```rust
-// Feed directly into the heap — never stores more than k hits in memory
+// execution.rs:239-246 —— 分区结果入堆
 if search_res.is_partial {
     non_ts_has_partial = true;
 }
@@ -532,33 +577,67 @@ if let Some(ref mut heap) = topk_heap {
     heap.push_hits(std::mem::take(&mut search_res.hits));  // 消耗掉当前 hits
 }
 ```
-使用 `BinaryHeap`（最小堆）维护全局 Top-K，内存占用固定为 K。
 
-**最终结果提取** (execution.rs:359-369)
 ```rust
-// For non-ts ORDER BY: drain the heap (already bounded to k elements) into the final result
-if is_non_ts_order_by {
-    let merged = topk_heap
-        .take()
-        .map(|h| h.into_sorted_vec(original_from))  // 应用 from 分页
-        .unwrap_or_default();
-
-    let mut final_res = Response::default();
-    final_res.hits = merged;
-    final_res.total = final_res.hits.len();
-    final_res.size = final_res.total as i64;
-    // ... 发送最终结果
+// sorting.rs:267-274 —— 堆元素淘汰逻辑
+if self.heap.len() < self.k {
+    self.heap.push(std::cmp::Reverse(candidate));
+} else if let Some(std::cmp::Reverse(min)) = self.heap.peek()
+    && candidate > *min
+{
+    self.heap.pop();      // 淘汰当前最差
+    self.heap.push(std::cmp::Reverse(candidate));  // 加入新候选
 }
 ```
 
-> **算法复杂度**：设分区数为 N，每个分区 M 条记录，取 Top-K。
+**多列排序支持**：
+- 按 ORDER BY 列顺序依次比较 (`sorting.rs:344-355` `for` 循环)
+- 前一列相等时才比较下一列（与 SQL 语义一致）
+- 每列独立的 `is_descending` 标志
+
+**最终结果提取** (`execution.rs:359-369`, `sorting.rs:279-312`)
+```rust
+// sorting.rs:279-312 —— 出堆后重排序 + 分页
+pub fn into_sorted_vec(self, from: usize) -> Vec<Value> {
+    let mut result: Vec<Value> = self.heap
+        .into_iter()
+        .map(|std::cmp::Reverse(h)| h.hit)
+        .collect();
+
+    // ✅ 出堆后再次按完整多列规则排序（堆本身只保证相对序）
+    result.sort_by(|a, b| {
+        for (col, is_desc, is_numeric) in &cols {
+            let ord = if *is_numeric {
+                compare_numeric_values(a, b, col)
+            } else {
+                compare_string_values(a, b, col)
+            };
+            let ord = if *is_desc { ord.reverse() } else { ord };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    });
+
+    if from >= result.len() { return vec![]; }
+    result[from..].to_vec()  // ✅ 应用 from 分页偏移
+}
+```
+
+> **算法复杂度**：设分区数为 N，每个分区 M 条记录，取 Top-K，排序列数为 C。
 > - 分区内：每个分区 O(M log K)，总计 O(N * M log K)
-> - 全局合并：每次入堆 O(log K)，总计 O(N * K log K)
+> - 全局入堆：每次入堆 O(C * log K)，总计 O(N * K * C log K)
+> - 最终排序：O(K * C log K)
 > - 总内存：O(K)，与数据总量无关
 
 ### 3.6 流式请求构建
 
-**HTTP/2 流请求 payload 结构** (`usePanelSQLExecutor.ts:137-181`)：
+看板查询分为 **SQL** 和 **PromQL** 两条独立链路，各自有不同的 payload 结构。
+
+#### 3.6.1 SQL 查询 payload（type 固定为 "histogram"）
+
+**HTTP/2 流请求 payload 结构** (`usePanelSQLExecutor.ts:137-181`, `:160`, `:373`)：
 
 ```typescript
 const payload = {
@@ -566,11 +645,12 @@ const payload = {
     query: { sql, start_time, end_time, size: -1, histogram_interval },
     regions, clusters
   },
-  type: "histogram" | "promql",
+  type: "histogram" as const,  // ✅ SQL 执行器 type 固定为 histogram
+  isPagination: false,
   traceId: "uuid",
   org_id: "org_identifier",
-  searchType: "dashboards" | "ui" | "insights",  // 见下方不同场景说明
   pageType: "logs",  // 来自 fields.stream_type
+  searchType: searchType.value ?? "dashboards",  // 见下方回退逻辑
   meta: {
     dashboard_id, panel_id, tab_id,
     fallback_order_by_col,
@@ -581,11 +661,49 @@ const payload = {
 };
 ```
 
+#### 3.6.2 PromQL 查询 payload（单列说明）
+
+**PromQL payload 结构** (`usePanelPromQLExecutor.ts:137-163`)：
+
+```typescript
+const payload = {
+  queryReq: {
+    query: promql_query,
+    start_time: startISOTimestamp,
+    end_time: endISOTimestamp,
+    step: queryStepValue || panelStepValue || "0",
+    query_type: it.config.query_type || "range",  // 范围查询默认
+  },
+  type: "promql" as const,  // ✅ PromQL 执行器 type 为 promql
+  traceId: "uuid",
+  org_id: store.state.selectedOrganization.identifier,
+  meta: {
+    dashboard_id, dashboard_name,
+    folder_id, folder_name,
+    panel_id, panel_name,
+    run_id, tab_id, tab_name,
+  },
+};
+```
+
+#### 3.6.3 searchType 回退逻辑（标准看板场景）
+
+`usePanelSQLExecutor.ts:165`, `:378` 中的回退逻辑：
+
+```typescript
+searchType: searchType.value ?? "dashboards"
+```
+
+**完整优先级链**：
+1. **第一优先级**：`route.query.searchtype` URL 参数（`ViewDashboard.vue:550`）
+2. **第二优先级**：props 透传的 `searchType`（`RenderDashboardCharts.vue:118`, `:180`, `:271`）
+3. **第三优先级（回退）**：`"dashboards"`（当上述均为 `null` 时）
+
 **不同场景下 searchType 的实际取值**（代码校正）：
 
 | 场景 | 传递链路 | searchType 实际值 |
 |------|---------|------------------|
-| **标准看板页面** | `ViewDashboard.vue:550` → `route.query.searchtype` 或 `RenderDashboardCharts.vue` 透传 | `"dashboards"` |
+| **标准看板页面** | URL 参数 → props 透传 → `?? "dashboards"` 回退 | `"dashboards"`（或 URL 指定值） |
 | **Logs→Visualize** | `VisualizeLogsQuery.vue:23` (`pageType="logs"`) → `PanelEditor.vue:997` (`case "logs": return "ui"`) | **`"ui"`** |
 | **Traces 分析** (logs 流) | `TracesAnalysisDashboard.vue:336` → `streamType === 'logs' ? 'insights' : 'dashboards'` | `"insights"` |
 | **Traces 指标** | `TracesMetricsDashboard.vue:33` → 硬编码 | `"dashboards"` |
@@ -914,6 +1032,8 @@ variablesDataUpdated()
 8. **Top-K 堆合并**：非时间排序场景内存固定为 O(K)，与数据总量无关
 9. **调度与数据分层并行**：分区间串行保证有序，分区内 rayon 并行利用多核
 10. **分块方向预判**：基于 time_offset 选择 prepend/append，避免全量排序
+11. **Reverse 方向感知堆**：单一堆实现同时支持 ASC/DESC 多列排序，无需分支判断
+12. **searchType 优雅回退**：URL 参数 → props → 默认值三级回退，避免空值异常
 
 ### 7.2 可靠性设计
 
@@ -939,47 +1059,57 @@ variablesDataUpdated()
 
 ## 八、前后文档差异对照
 
-### v1 → v2 → v3 三级版本演进
+### v1 → v2 → v3 → v4 四级版本演进
 
-| 章节 | v1 初始版 | v2 补充版 | v3 校正版 (本次) | 关键变化说明 |
-|------|----------|-----------|-----------------|-------------|
-| **整体架构** | 三阶段概述 | 三阶段概述 + 关键细节标注 | 同 v2 | v2 已完成 |
-| **变量替换** | 仅变量分类 | 补充 **3.2 变量就绪四步判定** | 同 v2 | v2 已完成 |
-| **后端执行** | 「分区并行执行」❌ | 修正为 **分区串行执行** | 补充 **3.5.2.1 分区间串行 vs 分区内并行** 边界 | v2 修正串行，v3 补充并发边界 |
-| **SQL 处理** | 仅元数据解析 | 补充 **3.5.1 SQL AST 改写链** | 同 v2 | v2 已完成 |
-| **Top-K 排序** | 仅文字提及 | 补充完整章节 | 同 v2 | v2 已完成 |
-| **searchType 取值** | 模糊描述为 `dashboards`/`logs` | 无修正 | 补充 **3.6 节不同场景取值表** + **4.1.2 节取值链** | Logs→Visualize 实际为 `"ui"` 而非 `"logs"` |
-| **结果回填** | 基础分块方向 | 补充 Logs→Visualize 修正 | **time_offset 缺失行为校正** | 原"固定追加"错误，实际由 `orderAsc` 决定 |
-| **分块合并策略** | 文字描述 | 补充 XOR 真值表 | 补充 **缺失时行为真值表** | 新增 `isLTR ?? false` 默认值分析 |
-| **代码索引** | 10 个模块 | 14 个模块 | 同 v2 | v2 已完成 |
-| **时序图** | 2 张 | 3 张 | 同 v2 | v2 已完成 |
-| **设计亮点** | 6+5+4 | 8+6+6 | 同 v2 | v2 已完成 |
-| **差异对照** | 无 | v1→v2 对照表 | 扩展为 v1→v2→v3 三级对照 | 本次新增 |
+| 章节 | v1 初始版 | v2 补充版 | v3 校正版 | v4 精校版 (本次) | 关键变化说明 |
+|------|----------|-----------|-----------|-----------------|-------------|
+| **整体架构** | 三阶段概述 | +关键细节 | 同 v2 | 同 v2 | v2 已完成 |
+| **变量替换** | 仅变量分类 | +四步判定 | 同 v2 | 同 v2 | v2 已完成 |
+| **后端执行** | 「并行」❌ | 修正为**串行** | +并发边界 | 同 v3 | v3 已完成 |
+| **SQL 处理** | 仅元数据 | +AST 改写链 | 同 v2 | 同 v2 | v2 已完成 |
+| **Top-K 排序** | 仅文字 | +完整章节 | 同 v2 | **补充 Reverse + 多列排序机制** | 单一堆支持 ASC/DESC 多列排序 |
+| **payload 结构** | 合并描述 | 无 | 无 | **SQL/PromQL 分列说明** | SQL type="histogram", PromQL type="promql" |
+| **searchType 取值** | 模糊描述 | 无 | +取值表 | **补充三级回退链** | URL → props → `?? "dashboards"` |
+| **结果回填** | 基础描述 | +修正 | +缺失行为 | 同 v3 | v3 已完成 |
+| **分块合并** | 文字描述 | +XOR 真值表 | +缺失真值表 | 同 v3 | v3 已完成 |
+| **代码索引** | 10 模块 | 14 模块 | 同 v2 | 同 v3 | v2 已完成 |
+| **时序图** | 2 张 | 3 张 | 同 v2 | 同 v3 | v2 已完成 |
+| **设计亮点** | 6+5+4 | 8+6+6 | 8+6+8 | **12+6+8** | 新增 Reverse 堆、searchType 回退等 |
+| **差异对照** | 无 | v1→v2 | v1→v2→v3 | 扩展为四级对照 | 每次迭代可追溯 |
 
 ### 关键错误修正汇总（累计）
 
 | 版本 | 原错误描述 | 修正后描述 | 影响程度 | 代码佐证 |
 |------|-----------|-----------|---------|---------|
 | v2 | "分区并行执行" | "分区间串行，分区内可并行" | ⚠️ 高 | `execution.rs:154` `for + .await` |
-| v2 | Logs→Visualize `searchType="logs"` | Logs→Visualize `searchType="ui"` | 🟡 中 | `PanelEditor.vue:997` `case "logs": return "ui"` |
-| v3 | time_offset 缺失时"固定追加" | 默认 `isLTR=false`，行为由 `orderAsc` 决定 | 🟡 中 | `usePanelSearchHandlers.ts:164` `?? false` |
+| v2 | Logs→Visualize `searchType="logs"` | Logs→Visualize `searchType="ui"` | 🟡 中 | `PanelEditor.vue:997` |
+| v3 | time_offset 缺失时"固定追加" | 默认 `isLTR=false`，行为由 `orderAsc` 决定 | 🟡 中 | `usePanelSearchHandlers.ts:164` |
+| v4 | payload type 合并描述 | SQL: `"histogram"`, PromQL: `"promql"` | 🟡 中 | `usePanelSQLExecutor.ts:160`, `usePanelPromQLExecutor.ts:149` |
+| v4 | 标准看板 `searchType` 硬编码 | 三级回退: URL → props → `"dashboards"` | 🟢 低 | `usePanelSQLExecutor.ts:165` `?? "dashboards"` |
+| v4 | TopKHeap 仅简单描述 | `Reverse<HeapHit>` + 多列排序方向感知 | 🟡 中 | `sorting.rs:222-358` |
 | v2 | 未提及变量就绪判定 | 四步判定 + 阻塞条件真值表 | 🟡 中 | `usePanelVariableSubstitution.ts:219-330` |
 | v2 | 未提及 SQL AST 改写过程 | 5 个改写器按顺序执行的完整流水线 | 🟡 中 | `search::sql::mod.rs:161-282` |
 | v2 | 未提及非时间排序合并策略 | 两阶段 Top-K + 最小堆全局合并 | 🟡 中 | `execution.rs:159-508` |
-| v3 | 未区分调度层与数据层并发 | 分区间串行（调度）/ 分区内并行（数据） | 🟢 低 | `listing_adapter.rs:246` `into_par_iter()` |
+| v3 | 未区分调度层与数据层并发 | 分区间串行（调度）/ 分区内并行（数据） | 🟢 低 | `listing_adapter.rs:246` |
 | v2 | 未提及 Logs→Visualize 特殊处理 | time_offset 判断优先级修正 | 🟡 中 | `usePanelSearchHandlers.ts:152-157` |
 
-### v3 本次核心校正点
+### v4 本次核心校正点
 
-1. **searchType 实际取值链校正**：
-   - `VisualizeLogsQuery.vue` → `pageType="logs"`
-   - `PanelEditor.vue:997` → `case "logs": return "ui"`
-   - 最终 `searchType = "ui"`
+1. **SQL payload type 明确为 "histogram"**：
+   - `usePanelSQLExecutor.ts:160`, `:373` → `type: "histogram" as const`
+   - 新增 `isPagination: false` 字段说明
 
-2. **time_offset 缺失行为校正**：
-   - 原：默认按追加方式处理
-   - 现：`isLTR = get() ?? false`（默认 RTL），`shouldPrepend = false !== orderAsc`
+2. **PromQL payload 单列说明**：
+   - `usePanelPromQLExecutor.ts:149` → `type: "promql" as const`
+   - 独立字段：`step`, `query_type: "range"`，无 `searchType/pageType/clear_cache`
 
-3. **并发边界澄清**：
-   - 调度层：分区间串行（`for + .await`）
-   - 数据层：分区内可并行（`rayon::into_par_iter`）
+3. **TopKHeap Reverse + 多列排序机制**：
+   - `Reverse<HeapHit>` 包装实现方向感知
+   - DESC 列正常比较 → Reverse 后为最小堆（保留最大 K）
+   - ASC 列主动反转 → Reverse 后为最大堆（保留最小 K）
+   - 多列按 ORDER BY 顺序依次比较，前列相等才比较下列
+
+4. **标准看板 searchType 三级回退链**：
+   - 优先级 1：`route.query.searchtype`（URL 参数）
+   - 优先级 2：props `searchType`（组件透传）
+   - 优先级 3：`?? "dashboards"`（空值回退）
