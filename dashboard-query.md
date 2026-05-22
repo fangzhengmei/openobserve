@@ -526,12 +526,21 @@ pub struct TopKHeap {
 
 **关键设计：`Reverse<HeapHit>` 的方向感知机制**
 
-`Reverse` 与 `is_descending` 共同决定元素去留，确保无论 ASC 还是 DESC 排序，堆顶始终是「当前最差」的元素：
+`Reverse` 与 `is_descending` 共同决定元素去留，确保无论 ASC 还是 DESC 排序，堆顶始终是「当前最差」的元素（即最先被淘汰）：
 
-| ORDER BY 方向 | HeapHit::cmp 行为 | Reverse 包装后效果 | 堆类型 | 淘汰元素 | 保留元素 |
-|--------------|------------------|-------------------|--------|---------|---------|
-| **DESC** (取最大 K 个) | 正常升序比较 (a < b → Less) | Reverse 反转 → a 较大时堆顶 | **最小堆** | 最小的 | K 个最大的 |
-| **ASC** (取最小 K 个) | 反转比较 (a < b → Greater) | Reverse 再反转 → a 较小时堆顶 | **最大堆** | 最大的 | K 个最小的 |
+| ORDER BY 方向 | HeapHit::cmp 行为 | Reverse 包装后效果 | 堆语义 | 堆顶实际元素 | 淘汰策略 | 保留元素 |
+|--------------|------------------|-------------------|--------|-----------|---------|---------|
+| **DESC** (取最大 K 个) | 正常升序比较 (a < b → Less) | Reverse 反转比较结果 → 小值的 Reverse 包装更大 | 最小堆语义 | **当前 K 个中值最小的（当前最差）** | 淘汰堆顶（最小的） | K 个最大的 |
+| **ASC** (取最小 K 个) | 反转比较 (a < b → Greater) | Reverse 再反转恢复升序 → 大值的 Reverse 包装更大 | 最大堆语义 | **当前 K 个中值最大的（当前最差）** | 淘汰堆顶（最大的） | K 个最小的 |
+
+**核心原理**：`BinaryHeap` 是**最大堆**，堆顶始终是 `Ord::cmp` 返回 `Greater` 的元素。通过 `Reverse` 包装 + `is_descending` 方向控制，让「当前最差」元素始终位于堆顶。
+
+```rust
+// sorting.rs:316-319 结构体文档明确说明
+/// Direction-aware so that `Reverse<HeapHit>` always evicts the "current worst":
+/// - DESC col: ascending cmp → `Reverse` = min-heap → evicts smallest → keeps k largest
+/// - ASC  col: descending cmp → `Reverse` = max-heap → evicts largest  → keeps k smallest
+```
 
 ```rust
 // sorting.rs:342-357 —— HeapHit 比较逻辑
@@ -629,7 +638,15 @@ pub fn into_sorted_vec(self, from: usize) -> Vec<Value> {
 > - 分区内：每个分区 O(M log K)，总计 O(N * M log K)
 > - 全局入堆：每次入堆 O(C * log K)，总计 O(N * K * C log K)
 > - 最终排序：O(K * C log K)
-> - 总内存：O(K)，与数据总量无关
+> - **峰值内存**：`k + one_partition_size`（`push_hits` 时同时持有单分区所有 hits + 堆中 k 个元素）
+> - **稳态内存**：O(K)（堆中稳定保留 k 个元素，与分区总数无关）
+>
+> （代码原文：`sorting.rs:216-218` "Peak memory = k + one_partition_size, not total_partitions × partition_size"）
+
+**边界说明**：
+- **最坏情况**：单分区恰好返回 `from + size` 条记录，峰值内存 = `(from + size) + (from + size)` = `2 * (from + size)`
+- **流式处理**：`std::mem::take(&mut search_res.hits)` 转移所有权，避免分区结果的额外拷贝
+- **与分区总数无关**：无论 10 个还是 1000 个分区，稳态内存始终为 O(K)
 
 ### 3.6 流式请求构建
 
@@ -1029,7 +1046,7 @@ variablesDataUpdated()
 5. **Hit 批处理**：微任务合并多次状态更新，避免 UI 抖动
 6. **Streaming Aggs**：聚合查询采用替换而非追加，减少内存拷贝
 7. **串行分区 + 提前终止**：时间排序场景下，累计足够结果即停止后续分区
-8. **Top-K 堆合并**：非时间排序场景内存固定为 O(K)，与数据总量无关
+8. **Top-K 堆合并**：非时间排序场景峰值内存 `k + 单分区规模`，稳态 O(K) 与分区总数无关
 9. **调度与数据分层并行**：分区间串行保证有序，分区内 rayon 并行利用多核
 10. **分块方向预判**：基于 time_offset 选择 prepend/append，避免全量排序
 11. **Reverse 方向感知堆**：单一堆实现同时支持 ASC/DESC 多列排序，无需分支判断
@@ -1059,23 +1076,23 @@ variablesDataUpdated()
 
 ## 八、前后文档差异对照
 
-### v1 → v2 → v3 → v4 四级版本演进
+### v1 → v2 → v3 → v4 → v5 五级版本演进
 
-| 章节 | v1 初始版 | v2 补充版 | v3 校正版 | v4 精校版 (本次) | 关键变化说明 |
-|------|----------|-----------|-----------|-----------------|-------------|
-| **整体架构** | 三阶段概述 | +关键细节 | 同 v2 | 同 v2 | v2 已完成 |
-| **变量替换** | 仅变量分类 | +四步判定 | 同 v2 | 同 v2 | v2 已完成 |
-| **后端执行** | 「并行」❌ | 修正为**串行** | +并发边界 | 同 v3 | v3 已完成 |
-| **SQL 处理** | 仅元数据 | +AST 改写链 | 同 v2 | 同 v2 | v2 已完成 |
-| **Top-K 排序** | 仅文字 | +完整章节 | 同 v2 | **补充 Reverse + 多列排序机制** | 单一堆支持 ASC/DESC 多列排序 |
-| **payload 结构** | 合并描述 | 无 | 无 | **SQL/PromQL 分列说明** | SQL type="histogram", PromQL type="promql" |
-| **searchType 取值** | 模糊描述 | 无 | +取值表 | **补充三级回退链** | URL → props → `?? "dashboards"` |
-| **结果回填** | 基础描述 | +修正 | +缺失行为 | 同 v3 | v3 已完成 |
-| **分块合并** | 文字描述 | +XOR 真值表 | +缺失真值表 | 同 v3 | v3 已完成 |
-| **代码索引** | 10 模块 | 14 模块 | 同 v2 | 同 v3 | v2 已完成 |
-| **时序图** | 2 张 | 3 张 | 同 v2 | 同 v3 | v2 已完成 |
-| **设计亮点** | 6+5+4 | 8+6+6 | 8+6+8 | **12+6+8** | 新增 Reverse 堆、searchType 回退等 |
-| **差异对照** | 无 | v1→v2 | v1→v2→v3 | 扩展为四级对照 | 每次迭代可追溯 |
+| 章节 | v1 初始版 | v2 补充版 | v3 校正版 | v4 精校版 | v5 终修版 (本次) | 关键变化说明 |
+|------|----------|-----------|-----------|-----------|-----------------|-------------|
+| **整体架构** | 三阶段概述 | +关键细节 | 同 v2 | 同 v2 | 同 v2 | v2 已完成 |
+| **变量替换** | 仅变量分类 | +四步判定 | 同 v2 | 同 v2 | 同 v2 | v2 已完成 |
+| **后端执行** | 「并行」❌ | 修正为**串行** | +并发边界 | 同 v3 | 同 v3 | v3 已完成 |
+| **SQL 处理** | 仅元数据 | +AST 改写链 | 同 v2 | 同 v2 | 同 v2 | v2 已完成 |
+| **Top-K 排序** | 仅文字 | +完整章节 | 同 v2 | +Reverse机制 | **DESC 堆顶语义 + 内存峰值修正** | 与 Reverse 实现完全一致 |
+| **payload 结构** | 合并描述 | 无 | 无 | SQL/PromQL分列 | 同 v4 | v4 已完成 |
+| **searchType 取值** | 模糊描述 | 无 | +取值表 | +三级回退链 | 同 v4 | v4 已完成 |
+| **结果回填** | 基础描述 | +修正 | +缺失行为 | 同 v3 | 同 v3 | v3 已完成 |
+| **分块合并** | 文字描述 | +XOR 真值表 | +缺失真值表 | 同 v3 | 同 v3 | v3 已完成 |
+| **代码索引** | 10 模块 | 14 模块 | 同 v2 | 同 v3 | 同 v3 | v2 已完成 |
+| **时序图** | 2 张 | 3 张 | 同 v2 | 同 v3 | 同 v3 | v2 已完成 |
+| **设计亮点** | 6+5+4 | 8+6+6 | 8+6+8 | 12+6+8 | **同 v4（描述已统一）** | 内存描述已同步修正 |
+| **差异对照** | 无 | v1→v2 | v1→v2→v3 | v1→v2→v3→v4 | 扩展为五级对照 | 每次迭代可追溯 |
 
 ### 关键错误修正汇总（累计）
 
@@ -1087,29 +1104,29 @@ variablesDataUpdated()
 | v4 | payload type 合并描述 | SQL: `"histogram"`, PromQL: `"promql"` | 🟡 中 | `usePanelSQLExecutor.ts:160`, `usePanelPromQLExecutor.ts:149` |
 | v4 | 标准看板 `searchType` 硬编码 | 三级回退: URL → props → `"dashboards"` | 🟢 低 | `usePanelSQLExecutor.ts:165` `?? "dashboards"` |
 | v4 | TopKHeap 仅简单描述 | `Reverse<HeapHit>` + 多列排序方向感知 | 🟡 中 | `sorting.rs:222-358` |
+| v5 | TopKHeap DESC 堆顶语义错误 | DESC 堆顶是当前 K 个中最小的（当前最差） | 🟢 低 | `sorting.rs:317-319` 结构体文档 |
+| v5 | 内存简化为 O(K) | 峰值 `k + one_partition_size`，稳态 O(K) | 🟢 低 | `sorting.rs:216-218` 代码注释 |
 | v2 | 未提及变量就绪判定 | 四步判定 + 阻塞条件真值表 | 🟡 中 | `usePanelVariableSubstitution.ts:219-330` |
 | v2 | 未提及 SQL AST 改写过程 | 5 个改写器按顺序执行的完整流水线 | 🟡 中 | `search::sql::mod.rs:161-282` |
 | v2 | 未提及非时间排序合并策略 | 两阶段 Top-K + 最小堆全局合并 | 🟡 中 | `execution.rs:159-508` |
 | v3 | 未区分调度层与数据层并发 | 分区间串行（调度）/ 分区内并行（数据） | 🟢 低 | `listing_adapter.rs:246` |
 | v2 | 未提及 Logs→Visualize 特殊处理 | time_offset 判断优先级修正 | 🟡 中 | `usePanelSearchHandlers.ts:152-157` |
 
-### v4 本次核心校正点
+### v5 本次终修校正点
 
-1. **SQL payload type 明确为 "histogram"**：
-   - `usePanelSQLExecutor.ts:160`, `:373` → `type: "histogram" as const`
-   - 新增 `isPagination: false` 字段说明
+1. **TopKHeap DESC 场景堆顶语义精修**：
+   - 原："Reverse 反转 → a 较大时堆顶"（不精确）
+   - 现：DESC 场景堆顶是**当前 K 个中值最小的**（当前最差，将被淘汰）
+   - 补充 `BinaryHeap` 最大堆本质 + `Reverse` 包装原理
+   - 新增 `sorting.rs:316-319` 结构体文档引用
 
-2. **PromQL payload 单列说明**：
-   - `usePanelPromQLExecutor.ts:149` → `type: "promql" as const`
-   - 独立字段：`step`, `query_type: "range"`，无 `searchType/pageType/clear_cache`
+2. **内存复杂度更正**：
+   - 原：简化表述为 "总内存：O(K)，与数据总量无关"
+   - 现：**峰值内存** = `k + one_partition_size`（`push_hits` 时同时持有）
+   - 现：**稳态内存** = O(K)（堆中稳定保留 k 个元素）
+   - 补充边界说明：最坏情况 `2 * (from + size)`，所有权转移避免拷贝
 
-3. **TopKHeap Reverse + 多列排序机制**：
-   - `Reverse<HeapHit>` 包装实现方向感知
-   - DESC 列正常比较 → Reverse 后为最小堆（保留最大 K）
-   - ASC 列主动反转 → Reverse 后为最大堆（保留最小 K）
-   - 多列按 ORDER BY 顺序依次比较，前列相等才比较下列
-
-4. **标准看板 searchType 三级回退链**：
-   - 优先级 1：`route.query.searchtype`（URL 参数）
-   - 优先级 2：props `searchType`（组件透传）
-   - 优先级 3：`?? "dashboards"`（空值回退）
+3. **差异对照表统一**：
+   - 演进表扩展为 v1→v2→v3→v4→v5 五级
+   - 设计亮点内存描述同步更新为 "峰值 `k + 单分区规模`"
+   - 所有相关描述保持一致
