@@ -731,13 +731,43 @@ if total_original_size >= min(max_file_size_on_disk, compact.max_file_size)
 **关键特性**：
 - ✅ **数据源中立**：不关心文件是重放产生的还是正常写入产生的，一视同仁
 - ✅ **批量处理**：按分区分组后批量合并上传，减少对象存储 API 调用
-- ✅ **先删本地后传存储**：合并时先读入内存，删除本地文件，再上传大文件
 - ❌ **依赖外部服务**：需要 DB 和对象存储可用
+
+**三步真实执行顺序**（严格按照代码实现）：
+
+```
+move_files()
+    │
+    ├─ [merge_files()] 内部执行
+    │   ├─ 读取本地 .parquet 文件到内存
+    │   ├─ DataFusion 合并小文件
+    │   └─ ① 对象存储上传  (parquet.rs:824)
+    │       storage::put(&account, &new_file_key, buf)
+    │
+    ├─ ② 元数据写入  (parquet.rs:542)
+    │   db::file_list::set(&account, &new_file_name, meta)
+    │   └─ 失败则释放所有 PROCESSING_FILES 并返回
+    │
+    └─ ③ 旧本地文件清理  (parquet.rs:579)
+        ├─ 检查 wal::lock_files_exists()
+        ├─ 无锁: remove_file() 直接删除
+        └─ 有锁: add_pending_delete() 加入待删队列
+```
+
+| 步骤 | 操作 | 代码位置 | 失败影响 |
+|-----|------|---------|---------|
+| ① | 对象存储上传 | `parquet.rs:824` | 重试 merge_files，不清理本地文件 |
+| ② | 元数据写入 | `parquet.rs:542` | 释放 PROCESSING_FILES，下次扫描重试 |
+| ③ | 本地文件清理 | `parquet.rs:579` | 加入 pending_delete 队列，后续异步清理 |
+
+> **重要修正**：之前描述的"先删本地后传存储"是错误的。真实顺序是**先上传对象存储 → 再写元数据 → 最后删本地文件**。这样即使上传或元数据写入失败，本地文件仍然存在，可以重试。
 
 **锁机制**：`PROCESSING_FILES`（job 模块内部锁）
 - 类型：`RwAHashSet<String>`
 - 作用域：仅在 `parquet.rs` 内使用
 - 保护对象：待上传的本地文件
+- 设置时机：`prepare_files()` 中扫描发现后立即设置
+- 释放时机：上传成功后删除文件时，或元数据写入失败时
 
 ---
 
@@ -757,7 +787,23 @@ if total_original_size >= min(max_file_size_on_disk, compact.max_file_size)
 
 ### 6.6 故障排查指引
 
+#### 核心判定边界（避免混淆）
+
+| 判定维度 | 重放未完成 | 上传等待 | 上传中 | 上传完成待清理 |
+|---------|-----------|---------|-------|-------------|
+| **logs/ 有 .wal?** | ✅ 是 | ❌ 否 | ❌ 否 | ❌ 否 |
+| **files/ 有 .parquet?** | ❌ 无 | ✅ 是 | ✅ 是 | ⚠️ 有（待删） |
+| **对象存储有新文件?** | ❌ 否 | ❌ 否 | ⚠️ 部分 | ✅ 是 |
+| **本地可查询?** | ❌ 否 | ✅ 是 | ✅ 是 | ✅ 是 |
+| **存储可查询?** | ❌ 否 | ❌ 否 | ⚠️ 部分 | ✅ 是 |
+
+> **关键区分原则**：只要 `logs/` 目录下还有 `.wal` 文件，就是**重放未完成**。只要 `.wal` 已删、`.parquet` 在 `files/` 中，就是**上传阶段问题**，不要再怀疑重放。
+
+---
+
 #### 场景 1: 判断重放未完成
+
+**定义**：WAL 文件未被完整重放并持久化到本地 `.parquet`
 
 **现象特征**：
 
@@ -769,12 +815,13 @@ if total_original_size >= min(max_file_size_on_disk, compact.max_file_size)
    warn: replay wal file: "logs/xxx/0/xxx.wal" done, json_size: ...
    ```
 
-2. **磁盘特征**
-   - `data_wal_dir/logs/` 目录下仍有 `.wal` 文件存在
+2. **磁盘特征（金标准）**
+   - `data_wal_dir/logs/` 目录下**仍有 `.wal` 文件存在**
    - `data_wal_dir/logs/` 目录下可能有对应 `.lock` 文件（如果持久化进行中崩溃）
+   - `data_wal_dir/files/` 目录下**无对应** `.parquet` 文件（或只有不完整的 .par）
 
 3. **查询特征**
-   - 崩溃前写入的数据在本地查询不到（重放进行中）
+   - 崩溃前写入的数据**本地查询不到**（重放进行中，数据在临时 MemTable）
    - 对象存储中没有对应时间段的新文件
 
 4. **指标特征**
@@ -782,27 +829,34 @@ if total_original_size >= min(max_file_size_on_disk, compact.max_file_size)
    - `ingest_memtable_bytes` 指标有临时波动（重放写入 MemTable）
 
 **排查步骤**：
-1. 检查日志中是否有 `replay wal file: ... starting` 但无 `done`
-2. 检查 `logs/` 目录是否还有残留 `.wal` 文件
+1. **首先检查**：`logs/` 目录是否还有残留 `.wal` 文件（这是金标准）
+2. 检查日志中是否有 `replay wal file: ... starting` 但无 `done`
 3. 检查 ingester 进程 CPU/IO 是否异常（可能重放卡死）
 4. 如进程正常，耐心等待；如进程异常，重启触发再次重放
 
 ---
 
-#### 场景 2: 判断上传等待（数据在本地但未上传）
+#### 场景 2: 判断上传阶段各子状态
+
+根据三步执行顺序（上传→写元数据→删本地），上传阶段可细分为三种子状态：
+
+##### 子状态 2a: 上传等待（未达阈值）
+
+**定义**：数据已在本地 `.parquet`，但未满足上传阈值，等待触发条件
 
 **现象特征**：
 
 1. **日志特征**
    ```
-   # 没有上传相关日志，或只有：
+   # 只有扫描日志，无合并上传日志：
    debug: scan files get total: 15, took: 12 ms
    # 但没有出现：
-   info: move files to s3 success, files: 5, size: 128MB
+   info: merge small file: files/...
+   info: merged 5 files into a new file: ...
    ```
 
 2. **磁盘特征**
-   - `data_wal_dir/logs/` 目录下无 `.wal` 文件（重放已完成）
+   - `data_wal_dir/logs/` 目录下**无 `.wal` 文件**（重放已完成）
    - `data_wal_dir/files/` 目录下有大量 `.parquet` 文件
    - 文件总大小 < 256MB（未达大小阈值）
    - 文件最旧创建时间 < 300s（未达时间阈值）
@@ -816,10 +870,65 @@ if total_original_size >= min(max_file_size_on_disk, compact.max_file_size)
    - `ingest_wal_used_bytes` 指标下降（WAL 已删）但不为 0
 
 **排查步骤**：
-1. 检查 `files/` 目录下文件总大小和最旧文件时间
+1. 检查 `files/` 目录下文件总大小和最旧文件创建时间
 2. 检查日志中是否有 `DB health check failed`（DB 故障导致跳过上传）
 3. 检查 `max_file_retention_time` 配置是否过大
-4. 如急需上传，可等待时间阈值触发，或重启节点（会重置文件创建时间？不，创建时间不变）
+4. 如急需上传，可等待时间阈值触发（文件创建时间不变，重启不重置）
+
+---
+
+##### 子状态 2b: 上传进行中（正在执行三步）
+
+**定义**：正在执行 `merge_files()` 或 `db::file_list::set()`，尚未完成
+
+**现象特征**：
+
+1. **日志特征**
+   ```
+   info: merge small file: files/default/logs/xxx/...
+   info: merged 5 files into a new file: files/default/logs/..., original_size: 128MB
+   # 但还没有出现：
+   info: move files to s3 success, files: 5, size: 128MB
+   ```
+
+2. **磁盘特征**
+   - `data_wal_dir/files/` 目录下的 `.parquet` 文件**仍然存在**（本地文件要等元数据写入后才删）
+   - 这些文件在 `PROCESSING_FILES` 集合中（可通过 status API 查看）
+
+3. **查询特征**
+   - 本地可查（文件还在）
+   - 对象存储**部分可查**（如果 `storage::put` 已完成但 `db::file_list::set` 未完成）
+
+**排查步骤**：
+1. 检查 ingester 网络 IO 是否正常（可能在等对象存储响应）
+2. 检查 DB 连接是否正常（可能在等元数据写入）
+3. 如长时间无进展，检查对象存储带宽/限流配置
+
+---
+
+##### 子状态 2c: 上传完成待清理（本地文件待删）
+
+**定义**：已完成上传和元数据写入，但本地文件因被查询锁定而暂未删除
+
+**现象特征**：
+
+1. **日志特征**
+   ```
+   warn: the file is in use, set to pending delete list: files/...
+   ```
+
+2. **磁盘特征**
+   - 对象存储已有对应文件（可手动验证）
+   - `data_wal_dir/files/` 目录下的 `.parquet` 文件**仍然存在**
+   - 文件在 `pending_delete` 列表中（`db/file_list/local`）
+
+3. **查询特征**
+   - 本地和对象存储都可查
+
+**排查步骤**：
+1. 这是正常现象，文件被查询引用时不会立即删除
+2. 查询释放后，`scan_pending_delete_files` 会异步清理
+3. 如长时间不清理，检查是否有查询泄漏
 
 ---
 
@@ -828,22 +937,78 @@ if total_original_size >= min(max_file_size_on_disk, compact.max_file_size)
 ```
 发现数据查询不到
     │
-    ├─ 检查 logs/ 目录是否有 .wal 文件
-    │   ├─ 有 → 重放未完成 → 等待或检查重放日志
-    │   └─ 无 → 重放已完成 → 下一步
+    ├─ 🔍 第一判定：logs/ 目录有 .wal 文件吗?
+    │   ├─ ✅ 有 → 【重放未完成】
+    │   │       ├─ 检查 replay 日志是否有 starting 无 done
+    │   │       ├─ 检查进程 CPU/IO 是否正常
+    │   │       └─ 等待重放完成，或重启重试
+    │   │
+    │   └─ ❌ 无 → 重放已完成，进入上传阶段判定
     │
-    ├─ 检查 files/ 目录是否有 .parquet 文件
-    │   ├─ 有 → 未上传 → 检查阈值/DB健康
-    │   └─ 无 → 已上传 → 下一步
+    ├─ 🔍 第二判定：files/ 目录有 .parquet 文件吗?
+    │   ├─ ✅ 有 → 【上传阶段问题】
+    │   │       ├─ 检查日志：有 merge small file 日志吗?
+    │   │       │   ├─ ❌ 无 → 【上传等待（未达阈值）】
+    │   │       │   │       ├─ 检查文件总大小是否 < 256MB
+    │   │       │   │       ├─ 检查最旧文件创建时间是否 < 300s
+    │   │       │   │       ├─ 检查是否有 DB health check failed
+    │   │       │   │       └─ 等待阈值触发，或检查配置
+    │   │       │   │
+    │   │       │   └─ ✅ 有 → 【上传进行中】
+    │   │       │           ├─ 检查是否有 "merged ... into a new file"
+    │   │       │           ├─ 检查网络/DB 是否正常
+    │   │       │           ├─ 如长时间卡住，检查对象存储限流
+    │   │       │           └─ 等待上传完成
+    │   │       │
+    │   │       └─ 额外检查：对象存储有对应文件吗?
+    │   │               ├─ ✅ 有 → 【上传完成待清理】
+    │   │               │       ├─ 检查是否有 "set to pending delete list" 日志
+    │   │               │       └─ 正常现象，等待查询释放后自动清理
+    │   │               │
+    │   │               └─ ❌ 无 → 【上传失败】
+    │   │                       ├─ 检查对象存储权限/网络
+    │   │                       ├─ 检查 access key/secret key 配置
+    │   │                       └─ 重启重试
+    │   │
+    │   └─ ❌ 无 → 本地文件已删除，进入元数据/压实判定
     │
-    ├─ 检查对象存储是否有对应文件
-    │   ├─ 有 → 已上传 → 检查 file_list 元数据
-    │   └─ 无 → 上传失败 → 检查对象存储权限/网络
+    ├─ 🔍 第三判定：对象存储有对应文件吗?
+    │   ├─ ❌ 无 → 【上传失败】
+    │   │       ├─ 检查对象存储连通性
+    │   │       ├─ 检查 bucket 权限
+    │   │       └─ 检查网络策略/防火墙
+    │   │
+    │   └─ ✅ 有 → 已上传，进入元数据/压实判定
     │
-    └─ 检查压实 offset 是否推进到该时间段
-        ├─ 未到时间窗口 → 等待 3× 保留时间
-        └─ 已到时间窗口 → 检查压实任务是否被阻塞
+    ├─ 🔍 第四判定：file_list 表有对应元数据吗?
+    │   ├─ ❌ 无 → 【元数据写入失败】
+    │   │       ├─ 检查 DB 状态
+    │   │       ├─ 检查 db::file_list::set 相关错误日志
+    │   │       └─ 重启触发重新上传（本地文件已删? 检查 pending_delete）
+    │   │
+    │   └─ ✅ 有 → 元数据已写，进入压实判定
+    │
+    └─ 🔍 第五判定：压实 offset 推进到该时间段吗?
+        ├─ ❌ 未到 → 【等待时间窗口】
+        │       └─ 需等待 3 × max_file_retention_time（默认 900s）
+        │
+        └─ ✅ 已到 → 【压实问题】
+                ├─ 检查压实任务是否被阻塞
+                ├─ 检查 compactor 节点状态
+                └─ 检查 compact_files 表的 offset 记录
 ```
+
+---
+
+#### 场景 4: 常见疑难杂症快速定位
+
+| 现象 | 可能原因 | 验证方法 |
+|-----|---------|---------|
+| logs/ 无 .wal，files/ 有 .parquet，对象存储无文件，且超过 300s | DB 健康检查失败 | 搜索日志 `DB health check failed` |
+| 对象存储有文件但查询不到 | file_list 元数据未写入 | 检查 `db/file_list` 表是否有该文件记录 |
+| 本地文件超过 300s 仍不删除 | 文件被查询锁定 | 搜索日志 `set to pending delete list` |
+| 重放日志显示 done，但数据仍查不到 | 重放持久化时写入了不同的 schema_key | 检查 parquet 文件路径中的 schema_key 是否匹配 |
+| 上传成功但 `ingest_wal_used_bytes` 不下降 | pending_delete 积压 | 检查 `db/file_list/local/pending_delete` 表大小 |
 
 ---
 
@@ -899,13 +1064,23 @@ if total_original_size >= min(max_file_size_on_disk, compact.max_file_size)
 | Immutable 持久化 5 步 | `src/ingester/src/immutable.rs` | 92 |
 | 未完成文件检查 | `src/ingester/src/wal.rs` | 50 |
 | WAL 重放 | `src/ingester/src/wal.rs` | 108 |
-| 文件上传合并 | `src/job/files/parquet.rs` | 351 |
+| 文件上传主函数 | `src/job/files/parquet.rs` | 351 |
+| 上传准入判定 | `src/job/files/parquet.rs` | 284 |
+| 上传阈值判定 | `src/job/files/parquet.rs` | 469 |
+| 对象存储上传 | `src/job/files/parquet.rs` | 824 |
+| 元数据写入 | `src/job/files/parquet.rs` | 542 |
+| 本地文件清理 | `src/job/files/parquet.rs` | 579 |
+| DB 健康检查 | `src/job/files/parquet.rs` | 137 |
+| PROCESSING_TABLES 锁 | `src/ingester/src/immutable.rs` | 40 |
+| PROCESSING_FILES 锁 | `src/job/files/parquet.rs` | 46 |
+| 待删除文件扫描 | `src/job/files/parquet.rs` | 181 |
 | 压实任务生成 | `src/service/compact/merge.rs` | 72 |
 | 压实时间窗口检查 | `src/service/compact/merge.rs` | 138 |
 | 压实执行 | `src/service/compact/merge.rs` | 395 |
 | 文件合并核心 | `src/service/compact/merge.rs` | 655 |
 | 压实调度启动 | `src/job/compactor.rs` | 29 |
 | 启动恢复入口 | `src/ingester/src/lib.rs` | 93 |
+| 主启动顺序 | `src/main.rs` | 286 |
 
 ---
 
