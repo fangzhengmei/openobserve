@@ -31,9 +31,9 @@ pub struct Sql {
     pub stream_type: StreamType,
     pub stream_names: Vec<TableReference>,
     pub has_match_all: bool,            // 是否包含全文检索
-    pub equal_items: HashMap<...>,      // 分区键等值条件
+    pub equal_items: HashMap<...>,      // 分区键等值条件（非时间范围！）
     pub columns: HashMap<...>,          // 涉及的列
-    pub time_range: Option<(i64, i64)>, // 时间范围
+    pub time_range: Option<(i64, i64)>, // 时间范围（来自请求参数）
     pub histogram_interval: Option<i64>,// 直方图间隔
     pub sorted_by_time: bool,           // 是否仅按时间排序
     // ... 其他字段
@@ -128,11 +128,80 @@ fn get_udf_vrl(fn_name: String, func: &str, params: &str, num_args: u8, org_id: 
 
 ---
 
-## 三、时间字段处理机制
+## 三、分区键等值条件与时间范围的区别
+
+### ⚠️ 关键纠正：`equal_items` 不是时间范围提取
+
+之前的理解有误，`equal_items` 和 `time_range` 是**两个完全独立的提取路径**：
+
+### 3.1 `equal_items` — 分区键等值条件提取
+
+**提取位置**：`src/service/search/sql/visitor/partition_column.rs`
+
+**Visitor 模式**：`PartitionColumnVisitor`
+
+```rust
+pub struct PartitionColumnVisitor<'a> {
+    // table_name -> Vec<(field_name, value)>
+    pub equal_items: HashMap<TableReference, Vec<(String, String)>>,
+    schemas: &'a HashMap<TableReference, Arc<SchemaCache>>,
+}
+```
+
+**提取逻辑**（`pre_visit_query`，第 46-151 行）：
+
+1. 仅遍历最外层 Query 的 WHERE 子句
+2. 通过 `split_conjunction(expr)` 将 AND 条件拆分
+3. 匹配两种表达式：
+   - **等值比较**：`field = value` 或 `value = field`
+   - **IN 列表**（非否定）：`field IN (value1, value2, ...)`
+4. 字段归属判断：
+   - `Expr::Identifier`：字段名必须唯一存在于某个表 schema 中（`count == 1`）
+   - `Expr::CompoundIdentifier`：`table.field` 形式，表名必须在 schemas 中
+5. 提取后的值存入 `equal_items`，用于**文件列表的二次过滤**（分区剪枝）
+
+**不支持**：
+- NOT IN（`negated: true` 时跳过，第 103 行）
+- 多表歧义字段（`count > 1` 时跳过，第 76 行）
+- 别名表名（`table_name not in schemas` 时跳过，第 90 行）
+
+### 3.2 `time_range` — 时间范围来源
+
+**提取位置**：`src/service/search/sql/mod.rs:302`
+
+```rust
+time_range: Some((query.start_time, query.end_time)),
+```
+
+**关键点**：
+- `time_range` **不来自 SQL 解析**，直接来自请求参数 `SearchQuery.start_time` 和 `SearchQuery.end_time`
+- 即使 SQL 中写了 `_timestamp > xxx`，也不会修改 `time_range`
+- `time_range` 用于**初次文件列表查询**（`file_list::query_ids` 调用）
+
+### 3.3 两者关系与协作
+
+| 维度 | `equal_items`（分区键等值条件） | `time_range`（时间范围） |
+|------|------------------------------|------------------------|
+| 来源 | SQL WHERE 子句解析 | 请求参数 |
+| 字段 | 所有分区键（含自定义分区键） | 仅 `_timestamp` |
+| 运算符 | `=`、`IN`（非否定） | `start_time`、`end_time` |
+| 用途 | 文件列表二次过滤（`filter_source_by_partition_key`） | 文件列表初次查询 |
+| 生效时机 | 拿到文件列表后，在内存中过滤 | 查询文件列表时，作为 S3 前缀条件 |
+
+**典型执行流**：
+```
+1. 用 time_range = (start, end) 从 S3 查询文件列表 → 得到文件列表 A
+2. 用 equal_items 对文件列表 A 做二次过滤 → 得到文件列表 B
+3. 用文件列表 B 调度查询
+```
+
+---
+
+## 四、时间字段处理机制
 
 时间字段 `_timestamp` 是 OpenObserve 的核心分区字段，在查询规划中享有特殊待遇。
 
-### 3.1 自动注入机制
+### 4.1 自动注入机制
 
 **访问器模式**（`src/service/search/sql/rewriter/add_timestamp.rs`）：
 
@@ -172,47 +241,56 @@ if !is_complex_query(&mut statement) {
 
 **限制条件**：仅对**非复杂查询**自动注入。复杂查询包括：子查询、JOIN、GROUP BY、聚合函数、DISTINCT、UNION、SELECT *。
 
-### 3.2 时间范围过滤与分区剪枝
+### 4.2 无 `_timestamp` 列触发单分片分支
 
-#### A. 时间范围提取
-
-通过 `PartitionColumnVisitor`（`src/service/search/sql/visitor/partition_column.rs`）提取 WHERE 子句中的分区键等值条件，用于文件列表过滤。
-
-#### B. 时间过滤器特殊处理
-
-在 `src/service/search/datafusion/optimizer/physical_optimizer/utils.rs:125-151` 中定义了时间过滤器识别逻辑：
+**关键代码**：`src/service/search/mod.rs:687-704`
 
 ```rust
-pub fn is_only_timestamp_filter(expr: &[&Arc<dyn PhysicalExpr>]) -> bool {
-    expr.iter().all(|expr| is_timestamp_filter(expr))
-}
+// if there is no _timestamp field or EXPLAIN in the query, return single partitions
+let is_explain_query = is_explain_query(&req.sql);
+let is_aggregate = is_aggregate_query(&req.sql).unwrap_or(false);
+let ts_column = get_ts_col_order_by(&sql, TIMESTAMP_COL_NAME, is_aggregate)
+    .map(|(v, _)| v);
 
-fn is_timestamp_filter(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    if let Some(expr) = expr.as_any().downcast_ref::<BinaryExpr>() {
-        match expr.op() {
-            Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq => {
-                // 检查操作数是否为 _timestamp 列与常量值的比较
-                let column = if is_value(expr.left()) && is_column(expr.right()) {
-                    get_column_name(expr.right())
-                } else if is_value(expr.right()) && is_column(expr.left()) {
-                    get_column_name(expr.left())
-                } else { return false; };
-                column == TIMESTAMP_COL_NAME
-            }
-            _ => false,
-        }
-    } else { false }
+let mut skip_get_file_list = ts_column.is_none() || apply_over_hits;
+```
+
+**触发条件**：
+1. `ts_column.is_none()`：查询 ORDER BY 中不包含 `_timestamp` 列
+2. `apply_over_hits`：需要在结果集上二次计算（如函数计算）
+3. `is_explain_query`：EXPLAIN 查询（见下文）
+
+**分支行为**：
+- `skip_get_file_list = true`：不查询真实文件列表
+- 改用统计信息估算（`stats.doc_num`、`stats.storage_size`）生成单个虚拟 FileId
+- 后续 `PartitionGenerator` 看到只有一个文件，返回单分片 `[[start_time, end_time]]`
+
+### 4.3 EXPLAIN 查询触发单分片分支
+
+**关键代码**：`src/service/search/mod.rs:729-731`
+
+```rust
+// if http distinct, we should skip file list
+if is_http_distinct || is_explain_query {
+    skip_get_file_list = true;
 }
 ```
 
-#### C. 排序优化
+**`is_explain_query` 判断**：匹配 SQL 开头为 `EXPLAIN` 或 `EXPLAIN ANALYZE`
+
+**EXPLAIN 特殊处理**：
+1. 不查询文件列表，用统计信息估算
+2. 生成单分片，快速返回执行计划
+3. `DistributeAnalyzeExec`（`src/service/search/datafusion/distributed_plan/distribute_analyze_exec.rs`）专门处理分布式 EXPLAIN ANALYZE，输出格式为 `phase, node_address, node_name, plan` 四列
+
+### 4.4 排序优化
 
 当查询仅按 `_timestamp` 降序排序时（`sorted_by_time` 标记），启用特殊优化：
 - `split_file_groups_by_statistics = true`：按文件统计信息分割文件组
 - `with_file_sort_order`：指定 Parquet 文件按 `_timestamp` 降序排序
 - 避免全局排序，利用文件的已有排序性
 
-### 3.3 直方图时间处理
+### 4.5 直方图时间处理
 
 `HistogramIntervalVisitor`（`src/service/search/sql/visitor/histogram_interval.rs`）负责：
 1. 解析 `histogram(_timestamp, '1 hour')` 语法
@@ -221,9 +299,83 @@ fn is_timestamp_filter(expr: &Arc<dyn PhysicalExpr>) -> bool {
 
 ---
 
-## 四、分片查询策略
+## 五、`match_all` 解析限制
 
-### 4.1 分片生成逻辑
+**核心解析器**：`MatchVisitor`（`src/service/search/sql/visitor/match_all.rs`）
+
+### 5.1 支持的场景 ✅
+
+`match_all` 可以正常工作的场景：
+
+1. **直接作用于流表**：
+   ```sql
+   SELECT * FROM logs WHERE match_all('error')
+   ```
+
+2. **子查询内部使用**（`pre_visit_query` 递归访问内层）：
+   ```sql
+   SELECT * FROM (SELECT * FROM logs WHERE match_all('error')) t
+   ```
+
+3. **IN 子查询内部使用**：
+   ```sql
+   SELECT * FROM logs WHERE id IN (
+       SELECT id FROM trace WHERE match_all('slow')
+   ) AND match_all('critical')
+   ```
+
+4. **CTE 内部使用**：
+   ```sql
+   WITH cte AS (SELECT id FROM logs WHERE match_all('error'))
+   SELECT * FROM cte
+   ```
+
+### 5.2 不支持的场景 ❌
+
+**`is_support_match_all = false`**，直接返回 SQL 错误：
+
+```rust
+if match_visitor.has_match_all && !match_visitor.is_support_match_all {
+    return Err(Error::ErrorCode(ErrorCodes::SearchSQLNotValid(
+        "match_all() should directly apply to stream, FROM clause should not be join/subuqery/cte".to_string(),
+    )));
+}
+```
+
+具体限制场景：
+
+| 场景 | 代码行 | 判断逻辑 | 示例 |
+|------|--------|---------|------|
+| **JOIN 查询** | 106-109 | `select.from.iter().any(\|from\| !from.joins.is_empty())` | `SELECT * FROM t1 JOIN t2 ON t1.id = t2.id WHERE match_all('error')` |
+| **多表 FROM** | 100-103 | `select.from.len() > 1` | `SELECT * FROM t1, t2 WHERE t1.id = t2.id AND match_all('error')` |
+| **外层子查询** | 112-120 | `TableFactor::Derived` 且外层 WHERE 有 match_all | `SELECT * FROM (SELECT id FROM t1) t WHERE match_all('error')` |
+| **外层 CTE** | 124-127 | `query.with.is_some()` 且外层 WHERE 有 match_all | `WITH cte AS (SELECT id FROM t1) SELECT * FROM cte WHERE match_all('error')` |
+
+### 5.3 流没有 FTS 字段的限制 ❌
+
+**`match_all_wrong_streams = true`**：
+
+```rust
+if has_match_all
+    && let TableFactor::Table { name, .. } = &select.from[0].relation
+    && let Ok(table) = object_name_to_table_reference(name.clone(), true)
+    && let Some(has_fst_fields) = self.has_fst_fields.get(&table)
+    && !*has_fst_fields
+{
+    self.match_all_wrong_streams = true;
+}
+```
+
+返回错误：
+```
+match_all() should only apply to the stream that have full text search fields
+```
+
+---
+
+## 六、分片查询策略
+
+### 6.1 分片生成逻辑
 
 `PartitionGenerator`（`src/service/search/partition.rs`）是分片策略的核心：
 
@@ -256,7 +408,17 @@ pub fn generate_partitions(
 }
 ```
 
-### 4.2 分片策略分类
+### 6.2 单分片返回的完整触发条件汇总
+
+| 触发条件 | 代码位置 | 说明 |
+|---------|---------|------|
+| 聚合查询 | `partition.rs` | `is_aggregate = true` 时返回单分片 |
+| 无 `_timestamp` 列 | `mod.rs:688-704` | `ts_column.is_none()` → skip_get_file_list → 单虚拟文件 → 单分片 |
+| EXPLAIN 查询 | `mod.rs:729-731` | `is_explain_query` → skip_get_file_list → 单分片 |
+| HTTP DISTINCT | `mod.rs:729-731` | `is_http_distinct` → skip_get_file_list → 单分片 |
+| `apply_over_hits` | `mod.rs:704` | 需要在结果集二次计算 → skip_get_file_list → 单分片 |
+
+### 6.3 分片策略分类
 
 | 查询类型 | 分片策略 | 设计意图 |
 |---------|---------|---------|
@@ -271,7 +433,7 @@ pub fn generate_partitions(
 2. 剩余时间按正常步长分片
 3. 按排序顺序（DESC/ASC）排列分片优先级
 
-### 4.3 文件到节点的分配
+### 6.4 文件到节点的分配
 
 在 `src/service/search/datafusion/distributed_plan/node.rs` 中实现了文件分片到集群节点的分配：
 - 基于一致性哈希或轮询策略
@@ -280,74 +442,101 @@ pub fn generate_partitions(
 
 ---
 
-## 五、下推优化机制
+## 七、索引下推机制
 
-下推优化是 OpenObserve 性能的关键，分为多个层次：
+### 7.1 下推生效前置条件
 
-### 5.1 索引下推（Index Pushdown）
+**全局开关**：`config.common.inverted_index_enabled`（`index.rs:92`）
 
-**核心优化器**：`IndexRule`（`src/service/search/datafusion/optimizer/physical_optimizer/index.rs`）
-
-#### 工作原理：
+**索引下推生效的完整条件链**：
 
 ```
-原始 FilterExec
-    ├── 谓词: name = 'openobserve' AND _timestamp > 1715395200000
-    └── 输入: TableScan
-
-优化后：
-    ├── FilterExec（仅保留 _timestamp 过滤，可完全移除）
-    └── 索引条件: IndexCondition { Equal("name", "openobserve") }
+配置开关开启
+    ↓
+1. 字段必须在 index_fields 集合中（建表时指定的索引字段）
+    ↓
+2. 表达式类型必须匹配（见下表）
+    ↓
+3. 所有非 _timestamp 过滤条件都能下推（is_only_timestamp_filter）
+    ↓
+4. 以下任一条件满足：
+   a. can_remove_filter = true（功能开关 + 所有条件可下推）
+   b. 无过滤条件但 optimizer_enabled = true（如 SELECT count(*)）
+    ↓
+5. 计划结构匹配 SimpleCount / SimpleSelect 等模式（Leader/Follower 优化器）
 ```
 
-#### 可下推的表达式类型（`is_expr_valid_for_index`）：
+### 7.2 可下推的表达式类型
 
-| 表达式类型 | 支持情况 | 示例 |
-|-----------|---------|------|
-| 列 = 常量 | ✅ | `name = 'test'` |
-| 列 != 常量 | ✅ | `name != 'test'` |
-| 列 IN (常量列表) | ✅ | `status IN (200, 201)` |
-| match_all('text') | ✅ | `match_all('error')` |
-| str_match(col, 'text') | ✅ | `str_match(log, 'error')` |
-| AND / OR 组合 | ✅ | `a=1 AND b=2` |
-| NOT 取反 | ✅ | `NOT (name = 'test')` |
-| 范围比较 (>, <) | ❌ | `age > 18` |
-| 函数调用（除上述） | ❌ | `lower(name) = 'test'` |
+**`is_expr_valid_for_index`**（`index.rs:258-314`）：
 
-#### 索引优化模式
+| 表达式类型 | 支持情况 | 额外条件 |
+|-----------|---------|---------|
+| `column = value` / `value = column` | ✅ | column 必须在 index_fields 中 |
+| `column != value` | ✅ | 同上 |
+| `column IN (v1, v2, ...)` | ✅ | column 在 index_fields，所有值为常量 |
+| `column NOT IN (...)` | ❌ | negated = true 不支持 |
+| `match_all('text')` | ✅ | 参数必须是字符串，且分词后非空（如 'c' 只有单字符不支持） |
+| `fuzzy_match_all('text', n)` | ✅ | 必须有 2 个参数 |
+| `str_match(col, 'text')` | ✅ | col 必须在 index_fields 中 |
+| `match_field(col, 'text')` | ✅ | 同上 |
+| `expr1 AND expr2` | ✅ | 两边都可下推 |
+| `expr1 OR expr2` | ✅ | 两边都可下推 |
+| `NOT expr` | ✅ | 内部表达式可下推 |
+| 范围比较 (>, <, >=, <=) | ❌ | 不在支持列表中 |
+| 其他函数调用 | ❌ | 仅支持白名单内的函数 |
+
+**`match_all` 空 token 检查**（第 293-298 行）：
+```rust
+MATCH_ALL_UDF_NAME => {
+    expr.args().len() == 1
+        && extract_string_literal(&expr.args()[0])
+            .map(|s| !o2_collect_search_tokens(&s).is_empty())
+            .unwrap_or(false)
+}
+```
+例如 `match_all('c')` 分词后为空 → **不可下推**。
+
+### 7.3 索引优化模式
 
 `LeaderIndexOptimizerRule` 和 `FollowerIndexOptimizerRule` 配合实现两级优化：
 
-| 模式 | 适用场景 | 优化效果 |
-|------|---------|---------|
-| `SimpleCount` | `SELECT count(*) FROM t` | 直接从索引计数，无需扫描数据 |
-| `SimpleSelect` | `SELECT * FROM t ORDER BY _timestamp DESC LIMIT N` | 按时间倒序取 TopN，利用索引排序性 |
-| `SimpleTopN` | `SELECT name, count(*) GROUP BY name ORDER BY cnt DESC LIMIT N` | 下推 TopN 到各节点，减少数据传输 |
-| `SimpleDistinct` | `SELECT DISTINCT name FROM t LIMIT N` | 下推去重逻辑，减少数据传输 |
-| `SimpleHistogram` | `SELECT histogram(_timestamp, '1h'), count(*) GROUP BY 1` | 下推直方图计算 |
+| 模式 | 匹配算子 | SQL 示例 |
+|------|---------|----------|
+| `SimpleCount` | AggregateExec | `SELECT count(*) FROM t WHERE name = 'oo'` |
+| `SimpleSelect` | SortPreservingMergeExec | `SELECT * FROM t ORDER BY _timestamp DESC LIMIT 10` |
+| `SimpleTopN` | Sort + Limit | `SELECT name, count(*) GROUP BY name ORDER BY cnt DESC LIMIT 10` |
+| `SimpleDistinct` | Distinct | `SELECT DISTINCT name FROM t LIMIT 10` |
+| `SimpleHistogram` | AggregateExec + histogram | `SELECT histogram(_timestamp, '1h'), count(*) GROUP BY 1` |
 
-### 5.2 过滤下推（Filter Pushdown）
+**Follower 优化器限制**（注释，第 55-56 行）：
+> NOTE: use this optimizer in follower only when all filter can be extract to index condition(except _timestamp filter)
 
-使用 DataFusion 内置的 `PushDownFilter` 规则，将 WHERE 条件尽可能下推到数据源层。
+### 7.4 Filter 移除逻辑
 
-配置开关（`src/service/search/datafusion/exec.rs:92-93`）：
+**`construct_filter_exec`**（`index.rs:221-255`）：
+
 ```rust
-config.options_mut().execution.parquet.pushdown_filters =
-    cfg.common.feature_pushdown_filter_enabled;
+// check if we can remove the filter
+let is_remove_filter = self.is_remove_filter || index_conditions.can_remove_filter();
+
+if is_remove_filter {
+    // 构造新的 FilterExec，仅保留不可下推的条件
+    let plan = construct_filter_exec(filter, other_conditions)?;
+    return Ok(Transformed::new(plan, true, TreeNodeRecursion::Stop));
+}
 ```
 
-### 5.3 限制下推（Limit Pushdown）
+当 `other_conditions.is_empty()` 时，FilterExec 被完全移除，替换为 ProjectionExec 或直接返回输入。
 
-1. **逻辑层**：`PushDownLimit` 规则将 LIMIT 下推到子查询
-2. **物理层**：`LimitPushdown` 规则将 LIMIT 下推到各分片执行
-3. **特殊处理**：`AddSortAndLimitRule` 为无 LIMIT 的查询添加默认限制
-
-### 5.4 下推执行流程
+### 7.5 下推执行流程
 
 ```
 SQL → 逻辑计划 → PushDownFilter → PushDownLimit → 物理计划
                                               ↓
                                   IndexRule（提取索引条件）
+                                              ↓
+                                  检查 can_optimize（全部可下推？）
                                               ↓
                                   LeaderIndexOptimizer（全局优化）
                                               ↓
@@ -356,9 +545,9 @@ SQL → 逻辑计划 → PushDownFilter → PushDownLimit → 物理计划
 
 ---
 
-## 六、分布式执行与回退机制
+## 八、分布式执行与回退机制
 
-### 6.1 远程扫描执行（RemoteScanExec）
+### 8.1 远程扫描执行（RemoteScanExec）
 
 `RemoteScanExec`（`src/service/search/datafusion/distributed_plan/remote_scan_exec.rs`）是分布式执行的核心算子：
 
@@ -375,39 +564,73 @@ pub struct RemoteScanExec {
 }
 ```
 
-#### 执行流程：
+### 8.2 RemoteScan 回退失败边界
 
+**核心逻辑**：`get_remote_batch` 函数（第 273-423 行）
+
+#### 可回退场景 ✅（返回空流 + 记录 partial_err）
+
+| 阶段 | 错误类型 | 代码位置 | 处理方式 |
+|------|---------|---------|---------|
+| 连接建立 | 任何错误 | 347-361 | `get_empty_stream(empty_stream.with_error(e))` |
+| RPC 调用 | `Cancelled` | 367-371 | 同上 |
+| RPC 调用 | `DeadlineExceeded` | 367-371 | 同上 |
+| RPC 调用 | `Internal` + Parquet 文件缺失 | 367-371 | 同上（`is_parquet_file_not_found` 检测） |
+| 流读取超时 | `DeadlineExceeded` | 397-419 | 仅记录 partial_err，break 循环 |
+
+**`is_parquet_file_not_found` 检测**（第 425-437 行）：
 ```rust
-fn execute(&self, partition: usize, context: Arc<TaskContext>)
-    -> Result<SendableRecordBatchStream> {
-    // 1. 序列化子计划为字节
-    let proto = get_physical_extension_codec();
-    let physical_plan_bytes =
-        physical_plan_to_bytes_with_extension_codec(input.clone(), &proto)?;
-    
-    // 2. 通过 Flight gRPC 发送到远程节点
-    let (mut client, request) = make_flight_client(...).await?;
-    let stream = client.do_get(request).await?.into_inner();
-    
-    // 3. 解码远程结果流
-    let mut stream = FlightDecoderStream::new(stream, schema, metrics, query_context);
-    
-    // 4. 超时控制与回退
-    let stream = async_stream::stream! {
-        loop {
-            tokio::select! {
-                batch = stream.next() => { /* 正常处理 */ }
-                _ = &mut timeout => {
-                    process_partial_err(partial_err, e);
-                    break;  // 超时不失败，返回部分结果
-                }
-            }
-        }
-    };
+pub fn is_parquet_file_not_found(e: &tonic::Status) -> bool {
+    e.code() == tonic::Code::Internal && {
+        let msg = e.message();
+        msg.find('{')
+            .and_then(|start| msg.rfind('}').map(|end| &msg[start..=end]))
+            .and_then(|json_part| infra::errors::ErrorCodes::from_json(json_part).ok())
+            .map(|err_code| {
+                err_code.get_code()
+                    == infra::errors::ErrorCodes::SearchParquetFileNotFound.get_code()
+            })
+            .unwrap_or(false)
+    }
 }
 ```
 
-### 6.2 分布式计划重写
+#### 不可回退场景 ❌（返回错误，导致整个查询失败）
+
+| 阶段 | 错误类型 | 代码位置 | 处理方式 |
+|------|---------|---------|---------|
+| RPC 调用 | 除上述 3 种外的所有错误 | 367-378 | `return Err(DataFusionError::Execution(e.to_string()))` |
+| 流解码 | 任何错误 | 403-405 | `yield batch.map_err(\|e\| DataFusionError::Internal(...))` |
+| 计划序列化 | 任何错误 | execute 函数 | 直接返回 Err |
+
+**不可回退的错误码示例**：
+- `PermissionDenied`：权限不足
+- `InvalidArgument`：参数错误
+- `Unauthenticated`：认证失败
+- `NotFound`：资源不存在
+- `AlreadyExists`：资源已存在
+- `FailedPrecondition`：前置条件不满足
+- `OutOfRange`：超出范围
+- `Unimplemented`：未实现
+- `Internal`（非 Parquet 文件缺失）：其他内部错误
+
+#### 空文件列表快速返回
+
+**非 super cluster 模式下的优化**（第 326-333 行）：
+```rust
+// fast return for empty file list querier node
+if !is_super
+    && is_querier
+    && !is_ingester
+    && !enrich_mode
+    && remote_scan_node.is_file_list_empty(partition)
+{
+    return Ok(get_empty_stream(empty_stream));
+}
+```
+querier 节点无文件时，直接返回空流，不发起 RPC 调用。
+
+### 8.3 分布式计划重写
 
 `RemoteScanRule`（`src/service/search/datafusion/optimizer/physical_optimizer/remote_scan.rs`）负责将单机物理计划转换为分布式计划：
 
@@ -421,80 +644,25 @@ fn execute(&self, partition: usize, context: Arc<TaskContext>)
 | `HashJoinExec` | 左右子树独立插入 RemoteScanExec |
 | 单节点优化 | 整个计划作为 RemoteScanExec 输入 |
 
-#### 代码示例（UnionExec 处理）：
-```rust
-} else if node.name() == "UnionExec" {
-    let mut visitor = TableNameVisitor::new();
-    node.visit(&mut visitor)?;
-    if !visitor.has_remote_scan {
-        let mut new_children: Vec<Arc<dyn ExecutionPlan>> = vec![];
-        for child in node.children() {
-            // SortExec 需要先加 SortPreservingMergeExec
-            if child.name() == "SortExec" {
-                let sort = child.as_any().downcast_ref::<SortExec>().unwrap();
-                let sort_merge = Arc::new(SortPreservingMergeExec::new(...));
-                let remote_scan = Arc::new(RemoteScanExec::new(sort_merge, ...)?);
-                new_children.push(remote_scan);
-            } else {
-                let remote_scan = Arc::new(RemoteScanExec::new(child.clone(), ...)?);
-                new_children.push(remote_scan);
-            }
-        }
-        let new_node = node.with_new_children(new_children)?;
-        return Ok(Transformed::yes(new_node));
-    }
-}
-```
+### 8.4 错误处理逻辑
 
-### 6.3 回退执行（Partial Failure Handling）
-
-OpenObserve 采用**部分失败不中断整体查询**的优雅降级策略。
-
-#### 回退触发场景：
-
-1. **节点连接失败**：`make_flight_client` 返回错误
-2. **RPC 调用失败**：`client.do_get` 返回错误
-3. **查询超时**：`tokio::time::sleep` 触发
-4. **Parquet 文件缺失**：`is_parquet_file_not_found` 检测
-
-#### 错误处理逻辑（`src/service/search/datafusion/distributed_plan/common.rs`）：
+**`process_partial_err`**（`src/service/search/datafusion/distributed_plan/common.rs:164-172`）：
 
 ```rust
 pub fn process_partial_err(partial_err: Arc<Mutex<String>>, e: tonic::Status) {
     let mut guard = partial_err.lock();
-    if guard.is_empty() {
+    let partial_err = guard.clone();
+    if partial_err.is_empty() {
         guard.push_str(e.to_string().as_str());
     } else {
         guard.push_str(format!(" \n {e}").as_str());
     }
 }
-
-pub fn get_empty_stream(empty_stream: EmptyStream) -> SendableRecordBatchStream {
-    let EmptyStream { trace_id, schema, grpc_addr, partial_err, e, ... } = empty_stream;
-    if let Some(e) = e && e.code() != tonic::Code::Ok {
-        log::error!("[trace_id {trace_id}] flight->search error: {e:?}");
-        process_partial_err(partial_err, e);
-    }
-    // 返回空流而非错误
-    let stream = futures::stream::empty::<Result<RecordBatch>>();
-    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
-}
 ```
 
-#### 可回退的错误类型：
+多个节点错误用 ` \n ` 分隔拼接。
 
-| 错误码 | 处理方式 | 说明 |
-|-------|---------|------|
-| `Cancelled` | 回退 | 用户取消操作 |
-| `DeadlineExceeded` | 回退 | 查询超时 |
-| `Internal` + Parquet 文件缺失 | 回退 | 文件已被删除或合并 |
-| 其他错误 | 失败 | 如权限错误、SQL 语法错误等 |
-
-#### 结果标记：
-
-查询结果中的 `is_partial` 字段标记是否存在部分失败，`partial_err` 字段记录具体错误信息。
-
-### 6.4 执行流程图
+### 8.5 执行流程图
 
 ```
 用户请求
@@ -509,12 +677,15 @@ create_logical_plan() → DataFusion 逻辑计划
     ↓
 create_physical_plan() → 转换为物理计划
     ↓
-物理优化 → 索引条件提取、RemoteScan 插入
+物理优化 → IndexRule 提取索引条件 → 检查 can_optimize
+    ↓
+RemoteScanRule 插入 RemoteScanExec
     ↓
 RemoteScanExec.execute() → 分发到各节点
-    ├─ 节点1 → 本地执行 → 返回结果
-    ├─ 节点2 → 连接失败 → 返回空流 + partial_err
-    └─ 节点3 → 正常执行 → 返回结果
+    ├─ 节点1 → 正常执行 → 返回结果
+    ├─ 节点2 → Cancelled/Deadline/ParquetNotFound → 返回空流 + partial_err
+    ├─ 节点3 → PermissionDenied → 返回错误 → 查询失败
+    └─ 节点4 → 流读取超时 → 记录 partial_err，继续返回已有结果
     ↓
 结果合并 → 排序、聚合、分页
     ↓
@@ -523,7 +694,7 @@ RemoteScanExec.execute() → 分发到各节点
 
 ---
 
-## 七、复杂查询判定
+## 九、复杂查询判定
 
 `is_complex_query` 函数（`src/service/search/sql/visitor/utils.rs:47-129`）是查询规划的重要分支点：
 
@@ -550,19 +721,22 @@ pub fn is_complex_query(statement: &mut Statement) -> bool {
 
 ---
 
-## 八、关键设计决策总结
+## 十、关键设计决策总结
 
 ### 1. 时间优先策略
 - `_timestamp` 是一等公民，自动注入、自动排序、自动分片
 - 利用时间局部性，迷你分片快速返回首批结果
+- 无 `_timestamp` 列时回退到单分片统计估算
 
 ### 2. 索引激进下推
-- 尽可能将过滤条件转化为索引查询
+- 全局开关 + 字段白名单 + 表达式白名单三层检查
 - 成功提取索引条件后可移除原 Filter 算子
 - 支持全文检索、精确匹配、IN 列表等多种下推形式
+- `match_all` 空 token 检测避免无效下推
 
-### 3. 优雅降级机制
-- 部分节点失败不导致整体查询失败
+### 3. 优雅降级机制（带边界）
+- **可回退**：连接失败、取消、超时、Parquet 文件缺失
+- **不可回退**：权限错误、参数错误、认证失败等
 - 超时返回部分结果而非空错误
 - 通过 `is_partial` 和 `partial_err` 告知用户数据完整性
 
@@ -576,9 +750,14 @@ pub fn is_complex_query(statement: &mut Statement) -> bool {
 - 按组织隔离函数注册
 - 内置函数与用户函数统一注册机制
 
+### 6. `match_all` 语义限制
+- 必须直接作用于物理流表，不能作用于中间结果（子查询/CTE/JOIN 的外层）
+- 内部子查询/CTE 使用不受限
+- 流必须配置 FTS 字段
+
 ---
 
-## 九、代码优化建议
+## 十一、代码优化建议
 
 ### 1. VRL UDF 性能优化
 当前实现是逐行解释执行 VRL，可考虑：
@@ -587,7 +766,8 @@ pub fn is_complex_query(statement: &mut Statement) -> bool {
 - 对于简单函数提供原生 Rust 实现路径
 
 ### 2. 回退机制增强
-当前仅记录错误但不重试，可考虑：
+当前仅对特定错误码回退，可考虑：
+- 添加可配置的回退错误码列表
 - 对于可重试错误（如网络波动）添加重试机制
 - 支持动态调整超时时间
 
@@ -600,3 +780,14 @@ pub fn is_complex_query(statement: &mut Statement) -> bool {
 当前仅支持等值和全文检索，可扩展：
 - 支持范围查询下推到 zonemap 索引
 - 支持布隆过滤器下推
+- 支持 `NOT IN` 下推（当前仅支持 `IN`）
+
+### 5. `equal_items` 与 `time_range` 统一
+当前两条路径独立，可考虑：
+- 统一分区条件提取逻辑，从 SQL 中自动提取 `_timestamp` 范围
+- 避免请求参数与 SQL 条件不一致导致的查询范围扩大
+
+### 6. `match_all` 限制提示
+当前错误提示较笼统，可改进：
+- 明确告知用户是 JOIN/CTE/子查询外层哪种场景
+- 提供改写建议（如将 match_all 移入子查询内部）
