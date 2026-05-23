@@ -241,56 +241,14 @@ if !is_complex_query(&mut statement) {
 
 **限制条件**：仅对**非复杂查询**自动注入。复杂查询包括：子查询、JOIN、GROUP BY、聚合函数、DISTINCT、UNION、SELECT *。
 
-### 4.2 无 `_timestamp` 列触发单分片分支
-
-**关键代码**：`src/service/search/mod.rs:687-704`
-
-```rust
-// if there is no _timestamp field or EXPLAIN in the query, return single partitions
-let is_explain_query = is_explain_query(&req.sql);
-let is_aggregate = is_aggregate_query(&req.sql).unwrap_or(false);
-let ts_column = get_ts_col_order_by(&sql, TIMESTAMP_COL_NAME, is_aggregate)
-    .map(|(v, _)| v);
-
-let mut skip_get_file_list = ts_column.is_none() || apply_over_hits;
-```
-
-**触发条件**：
-1. `ts_column.is_none()`：查询 ORDER BY 中不包含 `_timestamp` 列
-2. `apply_over_hits`：需要在结果集上二次计算（如函数计算）
-3. `is_explain_query`：EXPLAIN 查询（见下文）
-
-**分支行为**：
-- `skip_get_file_list = true`：不查询真实文件列表
-- 改用统计信息估算（`stats.doc_num`、`stats.storage_size`）生成单个虚拟 FileId
-- 后续 `PartitionGenerator` 看到只有一个文件，返回单分片 `[[start_time, end_time]]`
-
-### 4.3 EXPLAIN 查询触发单分片分支
-
-**关键代码**：`src/service/search/mod.rs:729-731`
-
-```rust
-// if http distinct, we should skip file list
-if is_http_distinct || is_explain_query {
-    skip_get_file_list = true;
-}
-```
-
-**`is_explain_query` 判断**：匹配 SQL 开头为 `EXPLAIN` 或 `EXPLAIN ANALYZE`
-
-**EXPLAIN 特殊处理**：
-1. 不查询文件列表，用统计信息估算
-2. 生成单分片，快速返回执行计划
-3. `DistributeAnalyzeExec`（`src/service/search/datafusion/distributed_plan/distribute_analyze_exec.rs`）专门处理分布式 EXPLAIN ANALYZE，输出格式为 `phase, node_address, node_name, plan` 四列
-
-### 4.4 排序优化
+### 4.2 排序优化
 
 当查询仅按 `_timestamp` 降序排序时（`sorted_by_time` 标记），启用特殊优化：
 - `split_file_groups_by_statistics = true`：按文件统计信息分割文件组
 - `with_file_sort_order`：指定 Parquet 文件按 `_timestamp` 降序排序
 - 避免全局排序，利用文件的已有排序性
 
-### 4.5 直方图时间处理
+### 4.3 直方图时间处理
 
 `HistogramIntervalVisitor`（`src/service/search/sql/visitor/histogram_interval.rs`）负责：
 1. 解析 `histogram(_timestamp, '1 hour')` 语法
@@ -375,9 +333,45 @@ match_all() should only apply to the stream that have full text search fields
 
 ## 六、分片查询策略
 
-### 6.1 分片生成逻辑
+### ⚠️ 关键纠正：`skip_get_file_list` 与 `PartitionGenerator` 的关系
 
-`PartitionGenerator`（`src/service/search/partition.rs`）是分片策略的核心：
+**之前的错误理解**：
+> `skip_get_file_list = true`：不查询真实文件列表，改用统计信息估算生成单个虚拟 FileId，后续 `PartitionGenerator` 看到只有一个文件，返回单分片。
+
+**正确的理解**（来自 `mod.rs:842-850`）：
+
+```rust
+if skip_get_file_list {
+    let mut response = search::SearchPartitionResponse::default();
+    response.partitions.push([req.start_time, req.end_time]); // 直接硬编码单分片
+    response.max_query_range = max_query_range_in_hour;
+    response.histogram_interval = sql.histogram_interval;
+    response.is_histogram_eligible = is_histogram_eligible;
+    log::info!("[trace_id {trace_id}] search_partition: returning single partition");
+    return Ok(response); // 直接返回，完全绕过 PartitionGenerator！
+};
+```
+
+**核心区别**：
+
+| 路径 | `skip_get_file_list` 值 | 是否经过 PartitionGenerator | 处理位置 |
+|------|------------------------|--------------------------|---------|
+| **多分片路径** | `false` | ✅ 是 | `mod.rs:1062` 创建 PartitionGenerator → `generate_partitions()` |
+| **单分片路径** | `true` | ❌ 否，完全绕过 | `mod.rs:842` 直接硬编码 `[[start, end]]` 并返回 |
+
+### 6.1 单分片返回的完整触发条件汇总
+
+| 触发条件 | 代码位置 | 触发 `skip_get_file_list` | 是否经过 PartitionGenerator |
+|---------|---------|------------------------|--------------------------|
+| 聚合查询 | `partition.rs:83-84` | `false`（正常流程） | ✅ 是，`is_aggregate=true` 时内部返回单分片 |
+| 无 `_timestamp` 列 | `mod.rs:688-704` | `true`（`ts_column.is_none()`） | ❌ 否，提前返回 |
+| EXPLAIN 查询 | `mod.rs:729-731` | `true`（`is_explain_query`） | ❌ 否，提前返回 |
+| HTTP DISTINCT | `mod.rs:729-731` | `true`（`is_http_distinct`） | ❌ 否，提前返回 |
+| `apply_over_hits` | `mod.rs:704` | `true`（结果集二次计算） | ❌ 否，提前返回 |
+
+### 6.2 PartitionGenerator 分片生成逻辑
+
+`PartitionGenerator`（`src/service/search/partition.rs`）是分片策略的核心，**仅在 `skip_get_file_list = false` 时被调用**：
 
 ```rust
 pub struct PartitionGenerator {
@@ -408,16 +402,6 @@ pub fn generate_partitions(
 }
 ```
 
-### 6.2 单分片返回的完整触发条件汇总
-
-| 触发条件 | 代码位置 | 说明 |
-|---------|---------|------|
-| 聚合查询 | `partition.rs` | `is_aggregate = true` 时返回单分片 |
-| 无 `_timestamp` 列 | `mod.rs:688-704` | `ts_column.is_none()` → skip_get_file_list → 单虚拟文件 → 单分片 |
-| EXPLAIN 查询 | `mod.rs:729-731` | `is_explain_query` → skip_get_file_list → 单分片 |
-| HTTP DISTINCT | `mod.rs:729-731` | `is_http_distinct` → skip_get_file_list → 单分片 |
-| `apply_over_hits` | `mod.rs:704` | 需要在结果集二次计算 → skip_get_file_list → 单分片 |
-
 ### 6.3 分片策略分类
 
 | 查询类型 | 分片策略 | 设计意图 |
@@ -433,12 +417,18 @@ pub fn generate_partitions(
 2. 剩余时间按正常步长分片
 3. 按排序顺序（DESC/ASC）排列分片优先级
 
-### 6.4 文件到节点的分配
+### 6.4 多分片路径完整流程（`skip_get_file_list = false`）
 
-在 `src/service/search/datafusion/distributed_plan/node.rs` 中实现了文件分片到集群节点的分配：
-- 基于一致性哈希或轮询策略
-- 考虑节点的角色（querier / ingester）
-- 支持超级集群跨区域调度
+```
+1. 用 time_range 查询 S3 文件列表 → 得到文件列表 A
+2. 用 equal_items 二次过滤 → 得到文件列表 B
+3. 计算分片参数：
+   - total_secs = original_size / base_speed / cpu_cores
+   - part_num = max(1, total_secs / query_partition_by_secs)
+   - step = (end_time - start_time) / part_num
+4. 创建 PartitionGenerator
+5. 调用 generate_partitions() 生成分片列表
+```
 
 ---
 
@@ -528,20 +518,6 @@ if is_remove_filter {
 ```
 
 当 `other_conditions.is_empty()` 时，FilterExec 被完全移除，替换为 ProjectionExec 或直接返回输入。
-
-### 7.5 下推执行流程
-
-```
-SQL → 逻辑计划 → PushDownFilter → PushDownLimit → 物理计划
-                                              ↓
-                                  IndexRule（提取索引条件）
-                                              ↓
-                                  检查 can_optimize（全部可下推？）
-                                              ↓
-                                  LeaderIndexOptimizer（全局优化）
-                                              ↓
-                                  RemoteScanRule（分布式下推）
-```
 
 ---
 
@@ -662,36 +638,6 @@ pub fn process_partial_err(partial_err: Arc<Mutex<String>>, e: tonic::Status) {
 
 多个节点错误用 ` \n ` 分隔拼接。
 
-### 8.5 执行流程图
-
-```
-用户请求
-    ↓
-Sql::new_from_req() → 解析 SQL、提取元信息、自动注入 _timestamp
-    ↓
-创建 SessionContext → 注册 UDF、配置优化规则
-    ↓
-create_logical_plan() → DataFusion 逻辑计划
-    ↓
-逻辑优化 → 直方图重写、排序限制、Filter/Limit 下推
-    ↓
-create_physical_plan() → 转换为物理计划
-    ↓
-物理优化 → IndexRule 提取索引条件 → 检查 can_optimize
-    ↓
-RemoteScanRule 插入 RemoteScanExec
-    ↓
-RemoteScanExec.execute() → 分发到各节点
-    ├─ 节点1 → 正常执行 → 返回结果
-    ├─ 节点2 → Cancelled/Deadline/ParquetNotFound → 返回空流 + partial_err
-    ├─ 节点3 → PermissionDenied → 返回错误 → 查询失败
-    └─ 节点4 → 流读取超时 → 记录 partial_err，继续返回已有结果
-    ↓
-结果合并 → 排序、聚合、分页
-    ↓
-返回给用户 → 标记 is_partial=true（如有部分失败）
-```
-
 ---
 
 ## 九、复杂查询判定
@@ -721,7 +667,338 @@ pub fn is_complex_query(statement: &mut Statement) -> bool {
 
 ---
 
-## 十、关键设计决策总结
+## 十、完整执行链路场景拆解
+
+以下用 3 个代表性 SQL 场景，逐步拆解从解析校验到分片决策再到索引下推与 RemoteScan 回退的完整链路。
+
+---
+
+### 场景 1：简单日志查询（多分片 + 索引下推 + 部分回退）
+
+**SQL**：
+```sql
+SELECT log_level, message 
+FROM logs 
+WHERE service = 'api-gateway' 
+  AND _timestamp BETWEEN 1717209600000000 AND 1717296000000000
+ORDER BY _timestamp DESC 
+LIMIT 100
+```
+
+**请求参数**：
+- `start_time = 1717209600000000`
+- `end_time = 1717296000000000`
+- `stream_type = logs`
+
+---
+
+#### 阶段 1：SQL 解析与元信息提取（`Sql::new_from_req`）
+
+**步骤 1.1：SQL 语法解析**
+- 代码：`sql/mod.rs:156-159`
+- 触发条件：有效的 SQL 语法 ✅
+- 结果：成功解析为 `Statement::Query`
+
+**步骤 1.2：各类 Visitor 遍历提取元信息**
+
+| Visitor | 命中分支 | 结果 | 代码位置 |
+|---------|---------|------|---------|
+| `ColumnVisitor` | 命中 ORDER BY + LIMIT | `columns = {logs: [log_level, message, service, _timestamp]}`, `order_by = [(_timestamp, DESC)]`, `limit = 100` | `sql/visitor/` |
+| `MatchVisitor` | 未命中 match_all | `has_match_all = false` | `sql/visitor/match_all.rs` |
+| `PartitionColumnVisitor` | 命中 `service = 'api-gateway'` | `equal_items = {logs: [("service", "api-gateway")]}` | `sql/visitor/partition_column.rs:46-151` |
+| `HistogramIntervalVisitor` | 未命中直方图 | `histogram_interval = None` | - |
+| `ComplexQueryVisitor` | 未命中（无聚合/JOIN等） | `is_complex = false` | `sql/visitor/utils.rs:47-129` |
+
+**步骤 1.3：自动注入 `_timestamp`**
+- 代码：`sql/mod.rs:274-281`
+- 触发条件：`is_complex = false` ✅
+- 结果：SELECT 列表被重写为 `SELECT _timestamp, log_level, message FROM ...`
+
+**步骤 1.4：`time_range` 来源**
+- 代码：`sql/mod.rs:302`
+- 来源：`query.start_time` 和 `query.end_time`（请求参数，**不是 SQL 解析**）
+- 结果：`time_range = Some((1717209600000000, 1717296000000000))`
+
+**步骤 1.5：`sorted_by_time` 判定**
+- 触发条件：仅按 `_timestamp` 排序 ✅
+- 结果：`sorted_by_time = true`
+
+---
+
+#### 阶段 2：分片决策（`search_partition`）
+
+**步骤 2.1：检查单分片触发条件**
+- 代码：`mod.rs:687-704`
+- `is_explain_query = false`
+- `is_aggregate = false`
+- `ts_column = get_ts_col_order_by(...)` → `Some("_timestamp")`（ORDER BY 包含 `_timestamp`）
+- `apply_over_hits = false`
+- **结果**：`skip_get_file_list = false` → 进入多分片分支
+
+**步骤 2.2：查询文件列表**
+- 代码：`mod.rs:760-765`
+1. 用 `time_range` 从 S3 查询文件列表 → 得到文件列表 A（100 个文件）
+2. 用 `equal_items` 对文件列表 A 做二次过滤 → 得到文件列表 B（30 个文件）
+
+**步骤 2.3：计算分片参数**
+- 代码：`mod.rs:944-999`
+- `original_size = 3GB`（30 个文件总大小）
+- `cpu_cores = 16`（集群 querier 节点 CPU 总和）
+- `base_speed = 100MB/s`
+- `total_secs = 3GB / (100MB/s * 16) = 1.875` 秒
+- `part_num = 4`（根据配置调整）
+- `step = (end_time - start_time) / 4 = 21600_000_000 微秒 = 6 小时`
+
+**步骤 2.4：创建 PartitionGenerator 并生成分片**
+- 代码：`mod.rs:1062-1066` + `partition.rs:56-88`
+- `generator = PartitionGenerator::new(min_step=1s, mini_partition_duration_secs=60s, is_histogram=false)`
+- 调用 `generate_partitions(start, end, step, DESC, is_aggregate=false, add_mini_partition=false)`
+- 命中分支：`else`（非直方图、非聚合）→ `generate_partitions_with_mini_partition`
+- 结果（按 DESC 排序，优先执行最近的分片）：
+  ```
+  [
+    [1717285200000000, 1717296000000000],  // 分片 1：最近 3 小时（迷你分片）
+    [1717274400000000, 1717285200000000],  // 分片 2：前 3 小时
+    [1717252800000000, 1717274400000000],  // 分片 3：前 6 小时
+    [1717209600000000, 1717252800000000],  // 分片 4：最早 12 小时
+  ]
+  ```
+
+---
+
+#### 阶段 3：索引下推优化
+
+**步骤 3.1：创建 SessionContext 并注册 UDF**
+- 代码：`exec.rs:265-312`
+- 注册约 20 个内置 UDF + 用户自定义 VRL 函数
+
+**步骤 3.2：生成逻辑计划与逻辑优化**
+- DataFusion 内置优化：`PushDownFilter`、`PushDownLimit`
+- OpenObserve 自定义优化：`SortLimitRule`（命中）
+
+**步骤 3.3：生成物理计划**
+- 初始结构：
+  ```
+  SortPreservingMergeExec: [_timestamp DESC], fetch=100
+    FilterExec: service = 'api-gateway' AND _timestamp BETWEEN ...
+      NewEmptyExec: name="logs"
+  ```
+
+**步骤 3.4：IndexRule 提取索引条件**
+- 代码：`optimizer/physical_optimizer/index.rs:86-118`
+- 全局开关：`inverted_index_enabled = true` ✅
+- 遍历 FilterExec 谓词：
+  1. `service = 'api-gateway'`：
+     - `column = "service"` 在 `index_fields` 中 ✅
+     - 是等值比较 ✅
+     - 生成 `Condition::Equal("service", "api-gateway")`
+  2. `_timestamp BETWEEN ...`：
+     - 是范围比较 ❌
+     - 归为 `other_conditions`
+- 检查 `is_only_timestamp_filter(&other_conditions)` → true ✅
+- `can_optimize = true`（所有非时间条件都可下推）
+- `can_remove_filter = true` ✅
+- **结果**：FilterExec 被完全移除（`other_conditions` 仅含时间过滤）
+
+**步骤 3.5：LeaderIndexOptimizerRule 匹配优化模式**
+- 代码：`optimizer/physical_optimizer/index_optimizer/mod.rs:119-151`
+- 检查 `is_complex_plan` → false ✅
+- 匹配 `SortPreservingMergeExec`：
+  - 调用 `is_simple_select(plan)` → `Some(SimpleSelect(100, false))` ✅
+- **结果**：`index_optimizer_mode = Some(IndexOptimizeMode::SimpleSelect(100, false))`
+
+---
+
+#### 阶段 4：分布式计划重写
+
+**步骤 4.1：RemoteScanRule 插入 RemoteScanExec**
+- 代码：`optimizer/physical_optimizer/remote_scan.rs`
+- 匹配 `SortPreservingMergeExec` → 子计划前插入 `RemoteScanExec`
+- 4 个分片分配到 4 个 querier 节点
+
+---
+
+#### 阶段 5：RemoteScan 回退处理
+
+**节点 1（正常）**：
+- `make_flight_client` 成功 ✅
+- `client.do_get(request)` 成功 ✅
+- 返回 30 条记录
+
+**节点 2（正常）**：
+- 正常执行，返回 25 条记录
+
+**节点 3（流读取超时）**：
+- 连接建立成功 ✅
+- `client.do_get(request)` 成功 ✅
+- 流读取时 `tokio::select!` 触发 `DeadlineExceeded`
+- 代码：`remote_scan_exec.rs:397-419`
+- 调用 `process_partial_err(partial_err, e)` → 记录错误
+- break 循环，仅返回已收到的 20 条记录
+
+**节点 4（Parquet 文件缺失）**：
+- `client.do_get(request)` 返回 `Internal` 错误
+- `is_parquet_file_not_found(e)` → true ✅
+- 代码：`remote_scan_exec.rs:367-371`
+- 返回 `get_empty_stream(empty_stream.with_error(e))`
+- 记录 `partial_err`，不返回任何数据
+
+**最终结果**：
+- 总记录数：30 + 25 + 20 + 0 = 75 条
+- `is_partial = true`
+- `partial_err = "DeadlineExceeded: timeout \n Internal: Parquet file not found"`
+- 按 `_timestamp DESC` 排序后取前 100 条（实际只有 75 条）
+
+---
+
+### 场景 2：带 match_all 的 TopN 聚合查询（单分片 + 索引下推 + 失败回退）
+
+**SQL**：
+```sql
+SELECT service, count(*) as cnt 
+FROM logs 
+WHERE match_all('error timeout') 
+  AND _timestamp BETWEEN 1717209600000000 AND 1717296000000000
+GROUP BY service 
+ORDER BY cnt DESC 
+LIMIT 10
+```
+
+**请求参数**：
+- `start_time = 1717209600000000`
+- `end_time = 1717296000000000`
+
+---
+
+#### 阶段 1：SQL 解析与元信息提取
+
+**步骤 1.1：各类 Visitor 遍历**
+
+| Visitor | 命中分支 | 结果 |
+|---------|---------|------|
+| `ColumnVisitor` | 命中 GROUP BY + 聚合 | `columns = {logs: [service, _timestamp]}`, `group_by = [service]`, `has_agg_function = true`, `order_by = [(cnt, DESC)]` |
+| `MatchVisitor` | 命中 match_all 且直接作用于流表 | `has_match_all = true`, `is_support_match_all = true` |
+| `PartitionColumnVisitor` | 未命中（无等值条件） | `equal_items = {}` |
+| `ComplexQueryVisitor` | 命中（GROUP BY + 聚合） | `is_complex = true` |
+
+**步骤 1.2：自动注入 `_timestamp`**
+- 触发条件：`is_complex = true` ❌
+- **结果**：不自动注入 `_timestamp`
+
+**步骤 1.3：`sorted_by_time` 判定**
+- ORDER BY 是 `cnt DESC`，不是 `_timestamp` ❌
+- **结果**：`sorted_by_time = false`
+
+---
+
+#### 阶段 2：分片决策
+
+**步骤 2.1：检查单分片触发条件**
+- 代码：`mod.rs:687-704`
+- `is_aggregate = true`（有 GROUP BY + 聚合）
+- `ts_column = get_ts_col_order_by(...)` → `None`（ORDER BY 是 `cnt DESC`）
+- **结果**：`skip_get_file_list = true` → 提前返回单分片
+
+**步骤 2.2：提前返回（完全绕过 PartitionGenerator）**
+- 代码：`mod.rs:842-850`
+- **不查询文件列表，不创建 PartitionGenerator**
+- 直接硬编码返回：`partitions = [[1717209600000000, 1717296000000000]]`
+
+---
+
+#### 阶段 3：索引下推优化
+
+**步骤 3.1：IndexRule 提取索引条件**
+- 谓词：`match_all('error timeout') AND _timestamp BETWEEN ...`
+- `match_all('error timeout')`：
+  - 函数名匹配 ✅
+  - 参数是字符串 ✅
+  - `o2_collect_search_tokens("error timeout") = ["error", "timeout"]` → 非空 ✅
+  - 生成 `Condition::MatchAll("error timeout")`
+- `_timestamp BETWEEN ...` → 归为 `other_conditions`
+- `is_only_timestamp_filter(&other_conditions)` → true ✅
+- **结果**：`can_optimize = true`，FilterExec 被移除
+
+**步骤 3.2：LeaderIndexOptimizerRule 匹配优化模式**
+- 计划结构：
+  ```
+  Sort: [cnt DESC], fetch=10
+    AggregateExec: groupBy=[service], aggr=[count(*)]
+      FilterExec: match_all('error timeout') AND _timestamp BETWEEN ...
+        TableScan: logs
+  ```
+- 匹配 `is_simple_topn(plan)` → `Some(SimpleTopN(10, ["service"], false))` ✅
+- **结果**：`index_optimizer_mode = Some(IndexOptimizeMode::SimpleTopN(...))`
+
+---
+
+#### 阶段 4：RemoteScan 执行与回退
+
+**节点 1（PermissionDenied）**：
+- `make_flight_client` 成功 ✅
+- `client.do_get(request)` 返回 `PermissionDenied` 错误
+- 检查：`Cancelled? ❌`, `DeadlineExceeded? ❌`, `ParquetFileNotFound? ❌`
+- **不可回退** → `return Err(DataFusionError::Execution("PermissionDenied: ..."))`
+- **整个查询失败**，错误返回给用户
+
+---
+
+### 场景 3：EXPLAIN 或无时间列排序（单分片分支 + 跳过 PartitionGenerator）
+
+#### 场景 3a：EXPLAIN ANALYZE
+
+**SQL**：
+```sql
+EXPLAIN ANALYZE SELECT * FROM logs WHERE service = 'api-gateway' ORDER BY _timestamp DESC LIMIT 100
+```
+
+**阶段 1：SQL 解析**
+- `is_explain_query = true`（SQL 以 `EXPLAIN` 开头）
+
+**阶段 2：分片决策**
+- 代码：`mod.rs:729-731`
+- `is_explain_query = true` → `skip_get_file_list = true`
+- 代码：`mod.rs:842-850` → 直接返回单分片
+- **完全绕过 PartitionGenerator**
+
+**阶段 3：特殊执行计划**
+- 最外层包装 `DistributeAnalyzeExec`
+- 输出 schema：`phase, node_address, node_name, plan`
+- 执行时收集各节点的执行计划和 metrics
+
+---
+
+#### 场景 3b：无时间列排序
+
+**SQL**：
+```sql
+SELECT log_level, count(*) 
+FROM logs 
+WHERE _timestamp BETWEEN 1717209600000000 AND 1717296000000000
+GROUP BY log_level 
+ORDER BY log_level ASC
+```
+
+**阶段 1：SQL 解析**
+- `is_aggregate = true`
+- ORDER BY 是 `log_level ASC`，不是 `_timestamp`
+
+**阶段 2：分片决策**
+- 代码：`mod.rs:688-704`
+- `ts_column = get_ts_col_order_by(...)` → `None`（ORDER BY 不含 `_timestamp`）
+- `skip_get_file_list = true`
+- 代码：`mod.rs:842-850` → 直接返回单分片
+- **完全绕过 PartitionGenerator**
+
+**阶段 3：索引下推**
+- 谓词：`_timestamp BETWEEN ...`（纯时间过滤）
+- 无可下推的非时间条件 → `index_condition = None`
+- `can_optimize = false`
+- 不走索引优化路径，全表扫描
+
+---
+
+## 十一、关键设计决策总结
 
 ### 1. 时间优先策略
 - `_timestamp` 是一等公民，自动注入、自动排序、自动分片
@@ -755,9 +1032,13 @@ pub fn is_complex_query(statement: &mut Statement) -> bool {
 - 内部子查询/CTE 使用不受限
 - 流必须配置 FTS 字段
 
+### 7. 单分片双路径设计
+- **路径 A（聚合查询）**：在 PartitionGenerator 内部返回单分片，经过完整文件列表查询
+- **路径 B（无时间列/EXPLAIN 等）**：在 mod.rs 中提前返回，完全绕过 PartitionGenerator，不查询文件列表
+
 ---
 
-## 十一、代码优化建议
+## 十二、代码优化建议
 
 ### 1. VRL UDF 性能优化
 当前实现是逐行解释执行 VRL，可考虑：
@@ -791,3 +1072,8 @@ pub fn is_complex_query(statement: &mut Statement) -> bool {
 当前错误提示较笼统，可改进：
 - 明确告知用户是 JOIN/CTE/子查询外层哪种场景
 - 提供改写建议（如将 match_all 移入子查询内部）
+
+### 7. 单分片路径文档化
+当前 `skip_get_file_list` 的分支逻辑较隐蔽，建议：
+- 添加更清晰的代码注释说明两种单分片路径的区别
+- 考虑统一单分片返回逻辑，减少分支复杂度
