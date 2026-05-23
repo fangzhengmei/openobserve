@@ -526,7 +526,77 @@ pub fn is_within_window(state: &Model, time_window_minutes: i64) -> bool {
 - 清理超过24小时的去重状态记录
 - 企业版特性，OSS 版本为 no-op
 
-### 5.7 指标监控
+### 5.7 去重全抑制时跳过事故关联（重要补充）
+
+> **关键发现**：去重全抑制时（所有结果行都被抑制），**直接 return，不会进入事故关联逻辑**，也不会发送任何通知。
+
+**代码逻辑**（`handlers.rs:977-999`）：
+```rust
+Ok((deduplicated_data, deduplicated)) => {
+    if deduplicated_data.is_empty() && deduplicated {
+        // 所有结果行都被去重抑制
+        log::debug!(
+            "[SCHEDULER trace_id {scheduler_trace_id}] All alert results deduplicated for org: {}, module_key: {}",
+            &new_trigger.org,
+            &new_trigger.module_key
+        );
+
+        // 标记抑制状态
+        trigger_data_stream.dedup_enabled = Some(true);
+        trigger_data_stream.dedup_suppressed = Some(true);
+
+        // 更新触发器时间
+        trigger_data.period_end_time = if should_store_last_end_time {
+            Some(trigger_results.end_time)
+        } else {
+            None
+        };
+        new_trigger.data = json::to_string(&trigger_data).unwrap();
+        db::scheduler::update_trigger(new_trigger, true, &query_trace_id).await?;
+        publish_triggers_usage(trigger_data_stream);
+        
+        // ⚠️ 直接 return，跳过后续的事故关联和通知！
+        return Ok(());
+    }
+    deduplicated_data
+}
+```
+
+**执行流程分析**：
+
+```
+去重前 data 有 N 条结果行
+    │
+    ▼
+apply_deduplication() 处理每条结果行
+    │
+    ▼
+结果：deduplicated_data.is_empty() && deduplicated == true
+    │
+    ├─ 是（全抑制）→ 更新触发器状态 → return Ok(())
+    │           （跳过事故关联、跳过通知）
+    │
+    └─ 否（部分/全部通过）→ 继续执行后续逻辑
+                │
+                ▼
+            事故关联检查（handlers.rs:1051+）
+                │
+                ▼
+            直接发送通知（handlers.rs:1138+）
+```
+
+**对事故关联的影响**：
+1. 去重全抑制时，即使 `creates_incident = true`，也**不会调用** `correlate_alert_to_incident()`
+2. 不会创建新事故，不会更新已有事故的告警计数
+3. 不会发送任何事故通知
+4. 去重状态表仍会更新（`occurrence_count` 和 `last_seen_at`）
+
+**业务影响**：
+- 如果告警结果行在去重窗口内重复出现，事故系统不会感知到这些重复触发
+- 事故的严重级别升级逻辑不会被触发
+- 可能导致事故系统中的告警计数与实际触发次数不一致
+
+### 5.8 指标监控
 
 去重相关 Prometheus 指标：
 
@@ -667,16 +737,98 @@ async fn send_incident_notifications(
 
 > **注意**：事故通知负载中完全没有告警结果行的数据，只有事故和告警的元数据。
 
-### 6.4 分组通知发送
+### 6.4 分组通知发送（重要补充）
 
-分组通知通过异步任务发送，位于 `src/job/alert_grouping.rs`（未在截取部分显示）：
+分组通知通过异步任务发送，位于 `src/job/alert_grouping.rs`：
 
-- `send_grouped_notification_sync(batch)`：同步发送分组通知
-- 根据 `SendStrategy` 决定最终发送内容
+#### 只使用主告警的配置（重要发现）
+
+> **关键发现**：分组发送时**只使用批次中第一个告警（主告警）的配置**，其他告警的配置被完全忽略。
+
+**主告警选择逻辑**（`alert_grouping.rs:88-94`）：
+```rust
+// Get the first alert (primary) and grouping config
+let primary_alert = &batch.alerts[0].alert;
+let grouping_config = primary_alert
+    .deduplication
+    .as_ref()
+    .and_then(|d| d.grouping.as_ref())
+    .ok_or_else(|| anyhow::anyhow!("Grouping config not found"))?;
+```
+
+**被忽略的配置**：
+1. 批次中其他告警的 `template`（模板）
+2. 批次中其他告警的 `destinations`（目的地列表）
+3. 批次中其他告警的 `row_template`（行模板）
+4. 批次中其他告警的 `context_attributes`（上下文属性，部分被注入）
+
+**实际使用的配置**：
+- 通知模板：只使用 `primary_alert.template`
+- 目的地列表：只使用 `primary_alert.destinations`
+- 上下文属性：`primary_alert.context_attributes` + 分组相关注入（`grouped_alerts`、`alert_count`、`grouped_summary`、`is_grouped`）
+
+#### 结果行合并策略（`alert_grouping.rs:158-171`）：
+
+```rust
+let combined_rows = match send_strategy {
+    SendStrategy::FirstWithCount | SendStrategy::Summary => {
+        // 只使用第一个告警的数据行
+        batch.alerts[0].rows.clone()
+    }
+    SendStrategy::All => {
+        // 合并所有告警的所有数据行
+        let mut all_rows = Vec::new();
+        for batched in &batch.alerts {
+            all_rows.extend(batched.rows.clone());
+        }
+        all_rows
+    }
+};
+```
+
+#### 发送失败后的批次去向（重要发现）
+
+> **关键发现**：分组发送失败后**没有重试机制，批次被永久丢弃**。
+
+**发送失败处理逻辑**（`alert_grouping.rs:205-255`）：
+```rust
+match notification_alert.send_notification(...).await {
+    Ok((success_msg, err_msg)) => {
+        if !err_msg.is_empty() {
+            // 部分目的地失败：记录错误和指标，返回 Err，不重试
+            config::metrics::ALERT_GROUPING_SEND_ERRORS_TOTAL
+                .with_label_values(&[batch.org_id.as_str(), "partial_failure"])
+                .inc();
+            return Err(anyhow::anyhow!("Partial failure: {}", err_msg));
+        }
+        // 全部成功：记录成功指标
+        Ok(())
+    }
+    Err(e) => {
+        // 全部失败：记录错误和指标，返回 Err，不重试
+        config::metrics::ALERT_GROUPING_SEND_ERRORS_TOTAL
+            .with_label_values(&[batch.org_id.as_str(), "send_failed"])
+            .inc();
+        Err(anyhow::anyhow!("Send failed: {}", e))
+    }
+}
+```
+
+**批次生命周期**：
+1. 批次从 `PENDING_BATCHES` 中移除（通过 `get_ready_batch()` 或 `get_expired_batches()`）
+2. 调用 `send_grouped_notification_sync(batch)` 发送
+3. 无论成功或失败，批次都不会被放回 `PENDING_BATCHES`
+4. 没有重试队列，没有持久化，失败即永久丢失
+
+**相关指标**：
+- `ALERT_GROUPING_SEND_ERRORS_TOTAL`：发送错误数（标签：org, type=partial_failure/send_failed）
+- `ALERT_GROUPING_NOTIFICATIONS_SENT_TOTAL`：成功发送数（标签：org, strategy, reason=expired/max_size）
+- `ALERT_GROUPING_WAIT_TIME`：等待时长直方图
+- `ALERT_GROUPING_BATCH_SIZE`：批次大小直方图
 
 ---
 
-## 7. 重试与延迟阈值的真实规则（重要修正）
+## 7. 重试与延迟阈值的真实规则（重要修正 + 补充）
 
 ### 7.1 最大重试次数配置
 
@@ -691,7 +843,92 @@ pub fn get_scheduler_max_retries() -> (bool, i32) {
 - 来自配置项 `limit.scheduler_max_retries`
 - 如果 `max_retries > 0`，第一个返回值为 `true` 表示启用重试
 
-### 7.2 评估失败时的重试逻辑（`handlers.rs:741-800`）
+### 7.2 调度拉取条件（重要补充）
+
+调度器通过 `pull()` 方法从数据库拉取待执行的触发器，核心 SQL 位于 `sqlite.rs:405-418`：
+
+```sql
+UPDATE scheduled_jobs
+SET status = 'Processing', start_time = $2,
+    end_time = CASE
+        WHEN module = $3 THEN $4
+        ELSE $5
+    END
+WHERE id IN (
+    SELECT id
+    FROM scheduled_jobs
+    WHERE status = 'Waiting' 
+      AND next_run_at <= $7 
+      AND NOT (is_realtime = $8 AND is_silenced = $9)
+    ORDER BY next_run_at
+    LIMIT $10
+)
+RETURNING *;
+```
+
+**拉取条件总结**：
+1. `status = 'Waiting'`：状态必须是等待中
+2. `next_run_at <= now`：下次执行时间已到
+3. `NOT (is_realtime = true AND is_silenced = false)`：排除实时且未静默的告警（这些由事件驱动）
+4. 按 `next_run_at` 排序，最老的先执行
+5. 限制并发数（`alert_schedule_concurrency`）
+
+**调度拉取节奏**：
+- 由 `SchedulerJobPuller` 负责，`poll_interval_secs` 控制拉取间隔（默认10秒）
+- 每次拉取数量不超过可用工作线程数
+- 拉取后立即将状态改为 `Processing` 并设置 `start_time` 和 `end_time`（超时时间）
+
+**超时监控**（`watch_timeout` 后台任务）：
+- 定期扫描状态为 `Processing` 的触发器
+- 如果 `now - start_time > timeout`，将状态改回 `Waiting` 并 `retries + 1`
+- 超时后会被重新拉取执行
+
+### 7.3 失败后重试触发节奏（重要补充）
+
+> **关键发现**：重试触发节奏**不是**告警频率，而是调度拉取间隔（约10秒）。
+
+**状态流转**：
+```
+评估失败
+    │
+    ▼
+retries + 1 < max_retries ?
+    ├─ 是 → update_status(Waiting, retries+1)
+    │       │
+    │       ▼
+    │   下次 pull() 时被重新拉取（约10秒后）
+    │       │
+    │       ▼
+    │   再次执行评估
+    │
+    └─ 否 → 计算下一个调度时间，retries 清零
+            │
+            ▼
+        跳到下一个正常周期执行
+```
+
+**重试触发的完整流程**（`handlers.rs:716-728`）：
+```rust
+// 未超过最大重试次数
+db::scheduler::update_status(
+    &new_trigger.org,
+    new_trigger.module,
+    &new_trigger.module_key,
+    db::scheduler::TriggerStatus::Waiting,  // 状态改回 Waiting
+    trigger.retries + 1,                    // 重试计数 +1
+    None,
+    true,
+    &query_trace_id,
+).await?;
+```
+
+**关键要点**：
+1. `update_status` **不会修改 `next_run_at`**，保持原有的执行时间
+2. 由于 `next_run_at` 已经是过去的时间（因为执行失败了），下次 `pull()` 时会立即满足 `next_run_at <= now` 条件
+3. 所以重试会在**下一次调度拉取时**被触发，间隔约等于 `poll_interval_secs`（默认10秒）
+4. 重试间隔与告警频率无关，只与调度拉取间隔有关
+
+### 7.4 评估失败时的重试逻辑（`handlers.rs:741-800`）
 
 ```rust
 if result.is_err() {
@@ -811,7 +1048,7 @@ if result.is_err() {
     ├─ 是 → apply_deduplication()
     │      ├─ 每条结果行计算指纹
     │      ├─ 存在且在窗口内 → 更新 last_seen_at 和 count，抑制
-    │      ├─ 全部被抑制 → 结束
+    │      ├─ **全部被抑制 → 直接 return（跳过事故关联和通知！）**
     │      └─ 部分/全部通过 → 继续
     │
     └─ 否 → 继续
@@ -855,6 +1092,7 @@ if result.is_err() {
 - 分组配置：`src/config/src/meta/alerts/deduplication.rs:148-200`
 - 事故关联抑制：`src/service/alerts/incidents.rs:630-656`
 - 事故关联首行维度提取：`src/service/alerts/incidents.rs:489-500`
+- 去重全抑制跳过事故关联：`src/service/alerts/scheduler/handlers.rs:977-999`
 
 ### 9.3 模板渲染
 - 行模板渲染：`src/service/alerts/alert.rs:1389-1511`
@@ -869,6 +1107,7 @@ if result.is_err() {
 - 去重状态实体（含死字段）：`src/infra/src/table/entity/alert_dedup_state.rs:20-40`
 - 去重状态保存（只更新两个字段）：`src/service/alerts/deduplication.rs:71-97`
 - 去重状态清理：`src/job/alert_manager.rs:100-185`
+- 去重全抑制返回：`src/service/alerts/scheduler/handlers.rs:977-999`
 
 ### 9.5 通知投递
 - 通知入口：`src/service/alerts/alert.rs:1042-1141`
@@ -876,10 +1115,17 @@ if result.is_err() {
 - Email 通道：`src/service/alerts/alert.rs:1323-1355`
 - SNS 通道：`src/service/alerts/alert.rs:1357-1387`
 - 事故通知（无结果行数据）：`src/service/alerts/incidents.rs:298-416`
+- 分组通知发送（主告警配置）：`src/job/alert_grouping.rs:68-256`
+- 分组结果行合并策略：`src/job/alert_grouping.rs:158-171`
+- 分组发送失败处理：`src/job/alert_grouping.rs:205-255`
 
 ### 9.6 重试逻辑
 - 最大重试次数配置：`src/infra/src/scheduler/mod.rs:235-237`
 - 评估失败重试：`src/service/alerts/scheduler/handlers.rs:741-800`
+- 调度拉取 SQL：`src/infra/src/scheduler/sqlite.rs:405-418`
+- 调度拉取条件：`src/infra/src/scheduler/mod.rs:157-164`
+- 重试状态更新（不改 next_run_at）：`src/service/alerts/scheduler/handlers.rs:716-728`
+- 超时监控：`src/infra/src/scheduler/mod.rs:189-198`
 
 ---
 
@@ -892,7 +1138,12 @@ if result.is_err() {
 | 事故关联合并所有结果行维度 | 只使用 `first_row` 提取维度，其他行维度被**完全忽略** | 多结果行时可能导致错误的事故聚合 |
 | 事故通知包含结果行数据 | 事故通知只有**事故元数据**，不包含任何告警结果行 | 接收方无法从事故通知中获取具体的告警数据 |
 | `notification_sent` 字段控制通知发送 | 该字段是**死字段**，从未被读取或更新 | 去重判断完全依赖时间窗口，与通知状态无关 |
-| 评估失败时指数退避重试 | 评估失败时 `retries+1` 重新排队，超过最大重试则跳到下一周期 | 没有退避，重试间隔等于调度频率 |
+| 评估失败时指数退避重试 | 评估失败时 `retries+1` 重新排队，超过最大重试则跳到下一周期 | 没有退避，重试间隔等于调度拉取间隔（~10秒） |
+| **新增**：重试间隔等于告警频率 | 重试触发由调度拉取间隔决定，约等于 `poll_interval_secs`（默认10秒） | 重试比预期更频繁，可能增加系统负载 |
+| **新增**：分组发送合并所有告警的模板和目的地 | 分组只使用**第一个告警**的模板、目的地配置，其他告警的配置被忽略 | 批次中其他告警的通知可能发错目的地或用错模板 |
+| **新增**：分组发送失败有重试机制 | 分组发送失败后**没有重试**，批次被永久丢弃 | 发送失败时会丢失告警通知 |
+| **新增**：去重全抑制时仍会进入事故关联 | 去重全抑制时**直接 return**，跳过事故关联和所有通知 | 事故系统无法感知到被去重抑制的告警触发 |
+| **新增**：调度拉取只看 `next_run_at` | 拉取条件：`status=Waiting AND next_run_at<=now`，重试时不修改 `next_run_at` | 失败后立即被重新拉取，间隔约10秒 |
 
 ---
 
@@ -927,3 +1178,8 @@ if result.is_err() {
 3. **分组与去重整合**：分组时也能应用去重逻辑，避免重复告警
 4. **事故通知内容**：在事故通知中可选包含关键的告警结果行数据
 5. **智能延迟处理**：实际启用最大可接受延迟逻辑，避免过度跳过
+6. **分组配置一致性**：分组发送时应考虑所有告警的目的地并集，或至少记录被忽略的告警
+7. **分组发送重试**：分组发送失败后应有重试机制，避免永久丢失告警通知
+8. **去重与事故关联协同**：去重全抑制时也应通知事故系统更新告警计数，保持数据一致性
+9. **重试间隔可配置**：重试间隔应可独立配置，而非固定等于调度拉取间隔
+10. **持久化分组批次**：分组批次应持久化到数据库，避免进程重启时丢失待发送批次
