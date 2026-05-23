@@ -340,16 +340,112 @@ pub fn is_place_holder_or_empty(plan: &Arc<dyn ExecutionPlan>) -> bool {
 }
 ```
 
-**关键注意事项：**
+**代码推导结论（基于代码逻辑可确定）：**
 - `NewEmptyExec`（OpenObserve 自定义的占位执行计划）不在短路条件中，它匹配的是 DataFusion 原生的 `EmptyExec`
-- 富化表使用的正是 `NewEmptyExec`（schema 为 `enrichment_tables`/`enrich`），因此通常不会被短路
+- 富化表使用的正是 `NewEmptyExec`（schema 为 `enrichment_tables`/`enrich`），因此在代码逻辑层面不会被短路
 - 短路检查发生在 `enrichment_broadcast_join_rewrite` 之前，一旦命中，不仅跳过富化广播，还会跳过通用广播连接和所有后续 RemoteScan 优化
-
-**短路后的实际行为（条件性结论）：**
-- 如果查询计划中包含 DataFusion 原生的 `EmptyExec`（如 `SELECT 1` 这类无表查询），会在短路检查点直接返回
-- 如果查询同时包含富化表 JOIN 和原生 `EmptyExec`，整个计划会被短路，**enrichment_broadcast 改写被完全跳过**，后续 JOIN 策略交由 DataFusion 默认处理（当前代码未明确指定为 Shuffle JOIN，实际行为取决于 DataFusion 版本和配置）
 - `enrichment_broadcast_join_rewrite` 内部（L67）也会调用 `remote_scan_to_top_if_needed`，用于为右表（普通日志流）添加 RemoteScanExec，确保分布式环境下右表数据能被正确拉取
-- **边界条件**：只有当短路检查返回 `false` 且后续所有广播条件均不满足时，才会进入默认的 RemoteScanRewriter 路径
+- 只有当短路检查返回 `false` 且后续所有广播条件均不满足时，代码逻辑才会进入默认的 RemoteScanRewriter 路径
+
+**执行计划实证结论（需实际运行查询验证）：**
+- 如果查询计划中包含 DataFusion 原生的 `EmptyExec`（如 `SELECT 1` 这类无表查询），代码逻辑会在短路检查点直接返回原计划
+- 如果查询同时包含富化表 JOIN 和原生 `EmptyExec`，整个计划会被短路，**enrichment_broadcast 改写在代码层面被完全跳过**，后续 JOIN 策略交由 DataFusion 默认处理（当前代码未明确指定为 Shuffle JOIN，实际行为取决于 DataFusion 版本和配置，需通过物理计划输出验证）
+
+> **实证界限标注**：上述"执行计划实证结论"部分，关于 JOIN 策略的具体实现（如是否为 Shuffle JOIN）目前只能通过代码推导得出，缺乏实际的物理计划输出作为实证。如需验证，可通过设置 `common.print_key_sql = true` 配置，在日志中查看实际生成的物理计划。
+
+---
+
+#### 3.5.5 短路分支的查询级执行计划实证分析
+
+##### 可验证的查询对比设计
+
+以下设计可用于实证验证短路分支的行为，可通过 `print_key_sql = true` 输出物理计划进行验证。
+
+**查询 A：触发短路的查询（含原生 EmptyExec）**
+```sql
+SELECT 1 AS dummy, l.* 
+FROM logs l 
+JOIN enrichment_tables.geoip g ON l.ip = g.ip
+```
+- **预期触发点**：`SELECT 1` 常量表达式可能被优化为原生 `EmptyExec` 或 `PlaceholderRowExec`
+- **代码推导命中顺序**：
+  1. JoinReorderRule: 检查右表是否为富化表 → 交换左右顺序（若满足条件）
+  2. RemoteScanRule.optimize:
+     - 🔴 `is_place_holder_or_empty` → 返回 `true`（命中 EmptyExec/PlaceholderRowExec）
+     - 直接 `return Ok(plan)`，跳过所有后续优化
+- **预期最终计划关键环节**（需实证验证）：
+  - 不会出现 `EnrichmentExec`
+  - 不会出现 `BroadcastHashJoinExec`
+  - JOIN 实现取决于 DataFusion 默认策略
+
+**查询 B：不触发短路的正常富化 JOIN**
+```sql
+SELECT l.*, g.country 
+FROM logs l 
+JOIN enrichment_tables.geoip g ON l.ip = g.ip
+WHERE l._timestamp > now() - interval '1 hour'
+```
+- **预期触发点**：仅使用 `NewEmptyExec` 作为占位符，不会触发短路
+- **代码推导命中顺序**：
+  1. JoinReorderRule: 检查右表是否为富化表 → 交换左右顺序（若满足条件）
+  2. RemoteScanRule.optimize:
+     - 🔴 `is_place_holder_or_empty` → 返回 `false`（仅含 NewEmptyExec）
+     - 🟢 `should_use_enrichment_broadcast_join` → 返回 `true`
+     - `enrichment_broadcast_join_rewrite` 执行改写：
+       - EnrichmentExecRewriter: NewEmptyExec → EnrichmentExec
+       - remote_scan_to_top_if_needed: 为右表添加 RemoteScanExec
+- **预期最终计划关键环节**（需实证验证）：
+  - 出现 `EnrichmentExec` 作为 HashJoin 的左子节点
+  - 出现 `BroadcastHashJoinExec`（或类似广播连接实现）
+  - 右表可能包含 `RemoteScanExec` + `FilterExec`
+
+##### 优化规则命中顺序的可核实证据链
+
+| 规则名称 | 执行顺序 | 命中条件 | 代码位置 | 命中/跳过 | 输出特征 |
+|---------|---------|---------|---------|----------|---------|
+| **JoinReorderRule** | 第1位 | 右表富化+左表非富化+JOIN可交换 | `optimizer/mod.rs:174` | 仅影响右表富化场景 | plan.children() 顺序变化 |
+| **RemoteScanRule** | 第2位 | 所有查询 | `optimizer/mod.rs:179` | 所有查询都经过 | 详见下表分支 |
+| **AggregateTopkRule** | 第3位 | 企业版+含Limit | `optimizer/mod.rs:183` | 需满足企业版特性 | 出现TopK相关算子 |
+| **StreamingAggregation** | 第4位 | 企业版+配置启用 | `optimizer/mod.rs:190` | 需满足企业版特性 | 出现StreamingAggregate |
+| **LeaderIndexOptimizerRule** | 第5位 | 含索引字段查询 | `optimizer/mod.rs:217` | 涉及索引字段 | 出现IndexExec |
+| **LimitPushdown** | 第6位 | 含Limit的查询 | `optimizer/mod.rs:219` | 涉及Limit | Limit算子下移 |
+
+##### RemoteScanRule 内部分支的实证路径
+
+```
+RemoteScanRule.optimize(plan)
+    │
+    ├─ 🔴 is_place_holder_or_empty(plan)?
+    │   ├─ true  → return Ok(plan)  
+    │   │       → 【实证特征】计划中无 EnrichmentExec/RemoteScanExec
+    │   │       → 【代码推导】跳过 enrichment_broadcast 和通用 broadcast
+    │   │
+    │   └─ false → 继续
+    │
+    ├─ 🟢 should_use_enrichment_broadcast_join(plan)?
+    │   ├─ true  → return enrichment_broadcast_join_rewrite(plan)
+    │   │       → 【实证特征】计划中出现 EnrichmentExec + BroadcastHashJoin
+    │   │       → 【代码推导】NewEmptyExec 已被替换为 EnrichmentExec
+    │   │
+    │   └─ false → 继续
+    │
+    ├─ should_use_broadcast_join(plan)?
+    │   ├─ true  → return broadcast_join_rewrite(plan)
+    │   │       → 【实证特征】出现通用 BroadcastHashJoin
+    │   │
+    │   └─ false → 继续
+    │
+    ├─ single_node_optimize(plan)?
+    │   ├─ true  → return remote_scan_to_top_if_needed(plan)
+    │   │       → 【实证特征】RemoteScanExec 置顶
+    │   │
+    │   └─ false → 继续
+    │
+    └─ RemoteScanRewriter → 默认路径
+            → 【实证特征】RemoteScanExec 注入到 RepartitionExec 之上
+```
+
+> **实证界限标注**：上述"实证特征"部分描述的计划节点名称（如 `BroadcastHashJoinExec`、`EnrichmentExec`）在代码中有明确定义（`enrichment_exec.rs`、`remote_scan.rs`），但具体的计划输出格式和命名可能受 DataFusion 版本影响，需通过实际运行查询并查看物理计划输出进行最终验证。目前这些结论基于代码逻辑推导，尚未包含实际运行的物理计划输出作为直接实证。
 
 ## 4. 错误旁路机制
 
@@ -570,51 +666,57 @@ pub async fn get_cache_stats() -> (usize, usize) {
 
 ### 6.2 富化表 JOIN 查询流程
 
+#### 代码推导的执行流程（基于代码注册顺序）
+
 ```
 SQL 查询 (SELECT * FROM logs JOIN enrichment_tables.geoip ON ...)
     ↓
-[SQL Parser]
+[SQL Parser] ← 代码确定
     ↓
-[Logical Plan]
+[Logical Plan] ← 代码确定
     ↓
-[Logical Optimizer]
+[Logical Optimizer] ← 代码确定
     ↓
-[Physical Plan 创建]
+[Physical Plan 创建] ← 代码确定
     ↓
 [Physical Optimizer 规则链（按注册顺序执行）]
-    ├─ 🔵 顺序1: JoinReorderRule.optimize
+    ├─ 🔵 顺序1: JoinReorderRule.optimize ← 代码确定（optimizer/mod.rs:174）
     │   └─ 检查：右表富化+左表非富化+JOIN可交换？
     │       ├─ ✅ 是：swap_inputs → 富化表换到左侧
     │       └─ ❌ 否：保持原顺序
-    ├─ 🟠 顺序2: RemoteScanRule.optimize
-    │   ├─ 🔴 is_place_holder_or_empty?
+    ├─ 🟠 顺序2: RemoteScanRule.optimize ← 代码确定（optimizer/mod.rs:179）
+    │   ├─ 🔴 is_place_holder_or_empty? ← 代码确定
     │   │   ├─ 检查：是否含 PlaceholderRowExec/EmptyExec/DataSourceExec?
     │   │   ├─ ✅ 是：直接返回原计划，跳过所有后续（含广播连接）
     │   │   └─ ❌ 否：继续
-    │   ├─ should_use_enrichment_broadcast_join?
+    │   ├─ should_use_enrichment_broadcast_join? ← 代码确定
     │   │   ├─ 检查：只有一个 HashJoin 且无其他多表算子？
     │   │   ├─ 检查：左表是 enrichment_tables/enrich schema？
     │   │   └─ 检查：右表仅含安全算子（Filter/Repartition 等）？
-    │   └─ enrichment_broadcast_join_rewrite
+    │   └─ enrichment_broadcast_join_rewrite ← 代码确定
     │       ├─ EnrichmentExecRewriter: NewEmptyExec → EnrichmentExec
     │       └─ remote_scan_to_top_if_needed → 为右表添加 RemoteScanExec
-    ├─ 顺序3: AggregateTopkRule（如启用）
-    ├─ 顺序4: StreamingAggregation 规则（如启用）
-    ├─ 顺序5: LeaderIndexOptimizerRule
-    └─ 顺序6: LimitPushdown
+    ├─ 顺序3: AggregateTopkRule（如启用）← 代码确定（optimizer/mod.rs:183）
+    ├─ 顺序4: StreamingAggregation 规则（如启用）← 代码确定（optimizer/mod.rs:190）
+    ├─ 顺序5: LeaderIndexOptimizerRule ← 代码确定（optimizer/mod.rs:217）
+    └─ 顺序6: LimitPushdown ← 代码确定（optimizer/mod.rs:219）
     ↓
-[EnrichmentExec::execute]
+[EnrichmentExec::execute] ← 代码确定
     ├─ 尝试磁盘 Parquet 读取
     ├─ 失败则回退到内存缓存
     ├─ VRL Value → RecordBatch 并行转换
     └─ 输出到 HashJoinExec
     ↓
-[Broadcast HashJoin]（若改写成功）
+[Broadcast HashJoin]（若改写成功）← 需实证验证
     ↓
 查询结果
 ```
 
-**注意**：若 `is_place_holder_or_empty` 命中短路，后续 JOIN 策略交由 DataFusion 默认处理，当前代码未明确指定其具体实现方式。
+#### 实证界限标注
+
+> **区分说明**：上述流程图中，标注"← 代码确定"的环节基于代码注册顺序和逻辑分支推导得出，证据强度较高；标注"← 需实证验证"的环节（如最终生成的具体 JOIN 算子名称、物理计划输出格式）可能受 DataFusion 版本和运行时配置影响，需通过实际运行查询并设置 `common.print_key_sql = true` 查看物理计划输出进行最终验证。
+
+> **短路分支的代码推导结论**：若 `is_place_holder_or_empty` 命中短路，代码逻辑层面会直接返回原计划，`enrichment_broadcast` 改写在代码层面被完全跳过，后续 JOIN 策略交由 DataFusion 默认处理，当前代码未明确指定其具体实现方式。此结论基于代码逻辑推导，关于 DataFusion 默认策略的具体实现需进一步实证验证。
 
 ## 7. 关键设计决策
 
