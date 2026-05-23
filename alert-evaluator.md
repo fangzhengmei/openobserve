@@ -845,7 +845,7 @@ match notification_alert.send_notification(...).await {
 
 ### 7.2 trigger_data.reset() 的实际作用边界（重要校正）
 
-**代码定义（`triggers.rs:136-139`）：
+**代码定义**（`triggers.rs:136-139`）：
 ```rust
 impl ScheduledTriggerData {
     pub fn reset(&mut self) {
@@ -858,13 +858,15 @@ impl ScheduledTriggerData {
 **实际作用边界**：
 1. ✅ 重置 `period_end_time` → 设置为 `None`
 2. ✅ 重置 `tolerance` → 设置为 `0`
-3. ❌ **不重置** `last_satisfied_at`（代码注释明确说明："Does not reset the last_satisfied_at field"
+3. ❌ **不重置** `last_satisfied_at`（代码注释明确说明："Does not reset the last_satisfied_at field"）
 4. ❌ **完全不涉及** `retries` 字段（`retries` 属于 `Trigger` 表的独立字段）
 
 **调用位置分析**：
 - `handlers.rs:617`：超过最大重试时调用，重置告警评估时间窗口
 - `handlers.rs:776`：评估失败超过最大重试时调用，重置评估时间窗口
 - `handlers.rs:1766`、`1848`、`1887`：其他模块失败时调用
+
+> **全文一致性说明**：`trigger_data.reset()` 的作用边界在文档中保持一致——只重置 `period_end_time` 和 `tolerance` 两个字段，与 `retries` 字段完全无关。此结论同样适用于 7.3、7.7、9.7、10 节中的相关描述。
 
 ### 7.3 重试计数在成功与失败路径中的真实归零来源（重要校正）
 
@@ -887,13 +889,15 @@ let mut new_trigger = db::scheduler::Trigger {
 | 路径 | retries 归零方式 | 代码位置 |
 |------|---------------|---------|
 | **成功路径** | `new_trigger.retries` 初始化时就是 0，调用 `update_trigger(new_trigger, ...)` 时写入 0 | `handlers.rs:365` + 初始化 + `handlers.rs:1175` 调用 |
-| **失败未超最大重试 | 调用 `update_status(..., trigger.retries + 1, ...)`，**不**归零，`retries` 递增 | `handlers.rs:1208-1218` |
+| **失败未超最大重试** | 调用 `update_status(..., trigger.retries + 1, ...)`，**不**归零，`retries` 递增 | `handlers.rs:1208-1218` |
 | **失败超过最大重试** | `new_trigger.retries` 初始化时就是 0，调用 `update_trigger(new_trigger, ...)` 写入 0 | `handlers.rs:365` 初始化 + `handlers.rs:619` 调用 |
 
 **关键要点**：
 1. `retries` 归零发生在 `new_trigger` 初始化时，不是通过 `reset()`
 2. 失败重试时用的是原 `trigger.retries`（不是 `new_trigger.retries`）
 3. `trigger_data.reset()` 与 `retries` 完全无关
+
+> **全文一致性说明**：`retries` 归零来源在文档中保持一致——来自 `new_trigger` 初始化时的 `retries: 0`，与 `trigger_data.reset()` 无关。此结论同样适用于 7.2、7.7、9.7、10 节中的相关描述。
 
 ### 7.4 最大重试次数配置
 
@@ -948,7 +952,7 @@ RETURNING *;
 - 如果 `now - start_time > timeout`，将状态改回 `Waiting` 并 `retries + 1`
 - 超时后会被重新拉取执行
 
-### 7.3 失败后重试触发节奏（重要补充）
+### 7.6 失败后重试触发节奏（重要补充）
 
 > **关键发现**：重试触发节奏**不是**告警频率，而是调度拉取间隔（约10秒）。
 
@@ -993,7 +997,7 @@ db::scheduler::update_status(
 3. 所以重试会在**下一次调度拉取时**被触发，间隔约等于 `poll_interval_secs`（默认10秒）
 4. 重试间隔与告警频率无关，只与调度拉取间隔有关
 
-### 7.4 评估失败时的重试逻辑（`handlers.rs:741-800`）
+### 7.7 评估失败时的重试逻辑（`handlers.rs:741-800`）
 
 ```rust
 if result.is_err() {
@@ -1012,7 +1016,7 @@ if result.is_err() {
         new_trigger.next_run_at = alert.trigger_condition.get_next_trigger_time(
             true, alert.tz_offset, false, None
         )?;
-        trigger_data.reset();
+        trigger_data.reset();  // 只重置 period_end_time 和 tolerance（与 retries 无关）
         new_trigger.data = json::to_string(&trigger_data).unwrap();
         db::scheduler::update_trigger(new_trigger, true, &query_trace_id).await?;
     } else {
@@ -1022,7 +1026,7 @@ if result.is_err() {
             new_trigger.module,
             &new_trigger.module_key,
             db::scheduler::TriggerStatus::Waiting,
-            trigger.retries + 1,  // 重试计数 +1
+            trigger.retries + 1,  // 重试计数 +1（使用原 trigger.retries，不是 new_trigger.retries）
             None,
             true,
             &query_trace_id,
@@ -1044,7 +1048,7 @@ if result.is_err() {
 4. 成功时：`retries` 通过 `new_trigger` 初始化时的 `retries: 0` 清零（与 `trigger_data.reset()` 无关）
 5. **关键区别**：`trigger_data.reset()` 只重置 `period_end_time` 和 `tolerance`，与 `retries` 无关
 
-### 7.6 延迟阈值的真实情况
+### 7.8 延迟阈值的真实情况
 
 > **重要修正**：`_get_max_considerable_delay()` 函数定义了但**从未被调用**，是死代码。
 
@@ -1217,9 +1221,9 @@ if result.is_err() {
 | 分组发送失败有重试机制 | 分组发送失败后**没有重试**，批次被永久丢弃 | 发送失败时会丢失告警通知 |
 | 去重全抑制时仍会进入事故关联 | 去重全抑制时**直接 return**，跳过事故关联和所有通知 | 事故系统无法感知到被去重抑制的告警触发 |
 | 调度拉取只看 `next_run_at` | 拉取条件：`status=Waiting AND next_run_at<=now`，重试时不修改 `next_run_at` | 失败后立即被重新拉取，间隔约10秒 |
-| **新增校正**：成功时 `trigger_data.reset()` 重置 retries | `trigger_data.reset()` 只重置 `period_end_time` 和 `tolerance`，**与 retries 无关** | `retries` 归零是 `new_trigger` 初始化时 `retries: 0` 的结果 |
-| **新增校正**：`trigger_data` 和 `TriggerData` 是同一个结构 | 有三个易混淆的结构：`ScheduledTriggerData`（调度状态）、`TriggerData`（审计流）、`Trigger`（数据库记录） | 文档中 `trigger_data` 绝大多数是 `ScheduledTriggerData`，注意区分 |
-| **新增校正**：`trigger_data.reset()` 重置所有状态 | 只重置 2 个字段，不重置 `last_satisfied_at`、`backfill_job`、`retries` 等 | 需要明确知道 reset 的作用边界，避免误判 |
+| 成功时 `trigger_data.reset()` 重置 retries | `trigger_data.reset()` 只重置 `period_end_time` 和 `tolerance`，**与 retries 无关** | `retries` 归零是 `new_trigger` 初始化时 `retries: 0` 的结果 |
+| `trigger_data` 和 `TriggerData` 是同一个结构 | 有三个易混淆的结构：`ScheduledTriggerData`（调度状态）、`TriggerData`（审计流）、`Trigger`（数据库记录） | 文档中 `trigger_data` 绝大多数是 `ScheduledTriggerData`，注意区分 |
+| `trigger_data.reset()` 重置所有状态 | 只重置 2 个字段，不重置 `last_satisfied_at`、`backfill_job`、`retries` 等 | 需要明确知道 reset 的作用边界，避免误判 |
 
 ---
 
