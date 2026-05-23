@@ -830,7 +830,72 @@ match notification_alert.send_notification(...).await {
 
 ## 7. 重试与延迟阈值的真实规则（重要修正 + 补充）
 
-### 7.1 最大重试次数配置
+### 7.1 三个易混淆的数据结构（重要校正）
+
+在深入重试逻辑前，首先澄清三个易混淆的数据结构：
+
+| 结构 | 定义位置 | 核心字段 | reset() 行为 |
+|------|---------|---------|-------------|
+| `ScheduledTriggerData` | `meta/triggers.rs:92-102` | `period_end_time`, `tolerance`, `last_satisfied_at`, `backfill_job` | 只重置 `period_end_time` 和 `tolerance` |
+| `TriggerData` | `meta/self_reporting/usage.rs:65-99` | 审计流字段，含 `retries` | 无 reset() 方法 |
+| `Trigger` | `meta/triggers.rs:62-81` | 数据库主记录，含 `retries` 字段 | 无 reset() 方法 |
+
+> **关键澄清**：
+- 文档中出现的 `trigger_data` 绝大多数是 `ScheduledTriggerData` 类型，**不是** `TriggerData`，也**不是** `Trigger`。
+
+### 7.2 trigger_data.reset() 的实际作用边界（重要校正）
+
+**代码定义（`triggers.rs:136-139`）：
+```rust
+impl ScheduledTriggerData {
+    pub fn reset(&mut self) {
+        self.period_end_time = None;
+        self.tolerance = 0;
+    }
+}
+```
+
+**实际作用边界**：
+1. ✅ 重置 `period_end_time` → 设置为 `None`
+2. ✅ 重置 `tolerance` → 设置为 `0`
+3. ❌ **不重置** `last_satisfied_at`（代码注释明确说明："Does not reset the last_satisfied_at field"
+4. ❌ **完全不涉及** `retries` 字段（`retries` 属于 `Trigger` 表的独立字段）
+
+**调用位置分析**：
+- `handlers.rs:617`：超过最大重试时调用，重置告警评估时间窗口
+- `handlers.rs:776`：评估失败超过最大重试时调用，重置评估时间窗口
+- `handlers.rs:1766`、`1848`、`1887`：其他模块失败时调用
+
+### 7.3 重试计数在成功与失败路径中的真实归零来源（重要校正）
+
+**之前的理解**：成功时通过 `trigger_data.reset()` 重置 `retries`
+
+**实际代码**（`handlers.rs:361-367`）：
+```rust
+// handle_alert_triggers 函数开始时
+let mut new_trigger = db::scheduler::Trigger {
+    next_run_at: now,
+    is_silenced: false,
+    status: db::scheduler::TriggerStatus::Waiting,
+    retries: 0,  // ⚠️ 这里默认设置为 0！
+    ..trigger.clone()  // 其他字段从原 trigger 复制
+};
+```
+
+**真实归零机制**：
+
+| 路径 | retries 归零方式 | 代码位置 |
+|------|---------------|---------|
+| **成功路径** | `new_trigger.retries` 初始化时就是 0，调用 `update_trigger(new_trigger, ...)` 时写入 0 | `handlers.rs:365` + 初始化 + `handlers.rs:1175` 调用 |
+| **失败未超最大重试 | 调用 `update_status(..., trigger.retries + 1, ...)`，**不**归零，`retries` 递增 | `handlers.rs:1208-1218` |
+| **失败超过最大重试** | `new_trigger.retries` 初始化时就是 0，调用 `update_trigger(new_trigger, ...)` 写入 0 | `handlers.rs:365` 初始化 + `handlers.rs:619` 调用 |
+
+**关键要点**：
+1. `retries` 归零发生在 `new_trigger` 初始化时，不是通过 `reset()`
+2. 失败重试时用的是原 `trigger.retries`（不是 `new_trigger.retries`）
+3. `trigger_data.reset()` 与 `retries` 完全无关
+
+### 7.4 最大重试次数配置
 
 ```rust
 // infra/src/scheduler/mod.rs:235-237
@@ -843,7 +908,7 @@ pub fn get_scheduler_max_retries() -> (bool, i32) {
 - 来自配置项 `limit.scheduler_max_retries`
 - 如果 `max_retries > 0`，第一个返回值为 `true` 表示启用重试
 
-### 7.2 调度拉取条件（重要补充）
+### 7.5 调度拉取条件（重要补充）
 
 调度器通过 `pull()` 方法从数据库拉取待执行的触发器，核心 SQL 位于 `sqlite.rs:405-418`：
 
@@ -971,14 +1036,15 @@ if result.is_err() {
 
 **重试规则总结**：
 1. 评估失败时，检查 `retries + 1 >= max_retries`
-2. **未超过**：`retries + 1`，状态改为 `Waiting`，重新排队
+2. **未超过**：`retries + 1`，状态改为 `Waiting`，重新排队（使用原 `trigger.retries`）
 3. **已超过**：
    - 可选自动禁用告警（`pause_alerts_on_retries = true`）
-   - 计算下一个正常调度时间，重试计数清零
-   - 触发器数据重置（`trigger_data.reset()`）
-4. 成功时：重试计数自动清零（`trigger_data.reset()` 包含重试计数重置）
+   - 计算下一个正常调度时间，触发器数据重置（`trigger_data.reset()`）
+   - `retries` 通过 `new_trigger` 初始化时的 `retries: 0` 清零
+4. 成功时：`retries` 通过 `new_trigger` 初始化时的 `retries: 0` 清零（与 `trigger_data.reset()` 无关）
+5. **关键区别**：`trigger_data.reset()` 只重置 `period_end_time` 和 `tolerance`，与 `retries` 无关
 
-### 7.3 延迟阈值的真实情况
+### 7.6 延迟阈值的真实情况
 
 > **重要修正**：`_get_max_considerable_delay()` 函数定义了但**从未被调用**，是死代码。
 
@@ -1126,6 +1192,13 @@ if result.is_err() {
 - 调度拉取条件：`src/infra/src/scheduler/mod.rs:157-164`
 - 重试状态更新（不改 next_run_at）：`src/service/alerts/scheduler/handlers.rs:716-728`
 - 超时监控：`src/infra/src/scheduler/mod.rs:189-198`
+- new_trigger 初始化 retries=0（重试归零来源）：`src/service/alerts/scheduler/handlers.rs:361-367`
+
+### 9.7 数据结构与 reset 边界
+- ScheduledTriggerData 定义：`src/config/src/meta/triggers.rs:92-102`
+- ScheduledTriggerData::reset()（只重置2个字段）：`src/config/src/meta/triggers.rs:136-139`
+- TriggerData 定义（审计流）：`src/config/src/meta/self_reporting/usage.rs:65-99`
+- Trigger 定义（数据库记录）：`src/config/src/meta/triggers.rs:62-81`
 
 ---
 
@@ -1139,11 +1212,14 @@ if result.is_err() {
 | 事故通知包含结果行数据 | 事故通知只有**事故元数据**，不包含任何告警结果行 | 接收方无法从事故通知中获取具体的告警数据 |
 | `notification_sent` 字段控制通知发送 | 该字段是**死字段**，从未被读取或更新 | 去重判断完全依赖时间窗口，与通知状态无关 |
 | 评估失败时指数退避重试 | 评估失败时 `retries+1` 重新排队，超过最大重试则跳到下一周期 | 没有退避，重试间隔等于调度拉取间隔（~10秒） |
-| **新增**：重试间隔等于告警频率 | 重试触发由调度拉取间隔决定，约等于 `poll_interval_secs`（默认10秒） | 重试比预期更频繁，可能增加系统负载 |
-| **新增**：分组发送合并所有告警的模板和目的地 | 分组只使用**第一个告警**的模板、目的地配置，其他告警的配置被忽略 | 批次中其他告警的通知可能发错目的地或用错模板 |
-| **新增**：分组发送失败有重试机制 | 分组发送失败后**没有重试**，批次被永久丢弃 | 发送失败时会丢失告警通知 |
-| **新增**：去重全抑制时仍会进入事故关联 | 去重全抑制时**直接 return**，跳过事故关联和所有通知 | 事故系统无法感知到被去重抑制的告警触发 |
-| **新增**：调度拉取只看 `next_run_at` | 拉取条件：`status=Waiting AND next_run_at<=now`，重试时不修改 `next_run_at` | 失败后立即被重新拉取，间隔约10秒 |
+| 重试间隔等于告警频率 | 重试触发由调度拉取间隔决定，约等于 `poll_interval_secs`（默认10秒） | 重试比预期更频繁，可能增加系统负载 |
+| 分组发送合并所有告警的模板和目的地 | 分组只使用**第一个告警**的模板、目的地配置，其他告警的配置被忽略 | 批次中其他告警的通知可能发错目的地或用错模板 |
+| 分组发送失败有重试机制 | 分组发送失败后**没有重试**，批次被永久丢弃 | 发送失败时会丢失告警通知 |
+| 去重全抑制时仍会进入事故关联 | 去重全抑制时**直接 return**，跳过事故关联和所有通知 | 事故系统无法感知到被去重抑制的告警触发 |
+| 调度拉取只看 `next_run_at` | 拉取条件：`status=Waiting AND next_run_at<=now`，重试时不修改 `next_run_at` | 失败后立即被重新拉取，间隔约10秒 |
+| **新增校正**：成功时 `trigger_data.reset()` 重置 retries | `trigger_data.reset()` 只重置 `period_end_time` 和 `tolerance`，**与 retries 无关** | `retries` 归零是 `new_trigger` 初始化时 `retries: 0` 的结果 |
+| **新增校正**：`trigger_data` 和 `TriggerData` 是同一个结构 | 有三个易混淆的结构：`ScheduledTriggerData`（调度状态）、`TriggerData`（审计流）、`Trigger`（数据库记录） | 文档中 `trigger_data` 绝大多数是 `ScheduledTriggerData`，注意区分 |
+| **新增校正**：`trigger_data.reset()` 重置所有状态 | 只重置 2 个字段，不重置 `last_satisfied_at`、`backfill_job`、`retries` 等 | 需要明确知道 reset 的作用边界，避免误判 |
 
 ---
 
@@ -1183,3 +1259,8 @@ if result.is_err() {
 8. **去重与事故关联协同**：去重全抑制时也应通知事故系统更新告警计数，保持数据一致性
 9. **重试间隔可配置**：重试间隔应可独立配置，而非固定等于调度拉取间隔
 10. **持久化分组批次**：分组批次应持久化到数据库，避免进程重启时丢失待发送批次
+11. **代码可读性改进**：明确区分 `ScheduledTriggerData`、`TriggerData`、`Trigger` 三个易混淆结构的命名，避免误用
+12. **reset() 边界文档**：在 `reset()` 方法注释中明确说明其只重置 `period_end_time` 和 `tolerance`，不涉及其他字段
+13. **失败路径一致性**：评估失败超过最大重试时，`retries` 归零应明确显式设置，而非依赖 `new_trigger` 初始化的隐式行为
+14. **重试计数审计**：在 `trigger_data_stream` 中记录重试计数的变化过程，便于问题排查
+15. **ScheduledTriggerData 命名优化**：考虑重命名为 `AlertSchedulerState` 或类似名称，减少与 `TriggerData` 的混淆
