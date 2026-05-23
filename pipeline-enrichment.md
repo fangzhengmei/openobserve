@@ -6,23 +6,25 @@ OpenObserve 的采集管道（Pipeline）与富化表（Enrichment Table）查�
 
 - **采集管道层**：负责数据的实时/定时采集、转换、过滤和路由
 - **富化表层**：提供静态参考数据的存储、加载和查询能力
-- **函数执行层**：通过 VRL/JS 函数实现管道与富化表的数据关联
-- **查询优化层**：针对富化表 JOIN 查询进行特殊的广播连接优化
+- **函数执行层**：仅通过 VRL 函数实现管道与富化表的数据关联（JS 函数被管道禁用）
+- **查询优化层**：针对富化表 JOIN 查询进行智能重排与广播连接优化
 
 ## 2. 字段转换机制
 
 ### 2.1 转换函数类型
 
-管道支持两种函数运行时，均支持富化表查询：
+**管道仅支持 VRL 函数**，JS 函数在管道中被明确禁止。
 
-**VRL 函数（推荐）** - `src/service/ingestion/mod.rs:138-206`
+**VRL 函数（唯一选择）** - `src/service/ingestion/mod.rs:138-206`
 - 编译时注入富化表注册表 `TableRegistry`
 - 支持 `get_enrichment_table_record` 等 VRL 内置函数
 - 高性能 AST 解释执行
 
-**JS 函数** - `src/service/ingestion/mod.rs:129-136`
-- 通过 QuickJS 运行时执行
-- 用于复杂逻辑处理场景
+**JS 函数的限制** - `src/service/pipeline/mod.rs:38-64`
+- **管道中完全禁用 JS 函数**：`validate_no_javascript_functions` 在保存/更新管道时强制检查
+- JS 运行时（QuickJS）**没有注入富化表查询能力**：`compile_js_function` 和 `apply_js_fn` 中完全没有 `TableRegistry` 或 enrichment 相关代码
+- JS 函数仅用于 `_meta` 组织的 SSO claim 解析，不参与管道执行
+- QuickJS 运行时仅暴露 `inputJson`、`orgId`、`streamName` 三个全局变量，无法访问富化表
 
 ### 2.2 函数编译流程
 
@@ -173,21 +175,69 @@ async fn fetch_data(...) -> Result<SendableRecordBatchStream> {
 }
 ```
 
-### 3.5 广播连接优化
+### 3.5 广播连接优化与重排机制
 
-`src/service/search/datafusion/optimizer/physical_optimizer/enrichment.rs:34-112`
+#### 3.5.1 重排机制：右表为富化表时的自动交换
+
+`src/service/search/datafusion/optimizer/physical_optimizer/join_reorder.rs:64-81`
+
+当富化表出现在 JOIN 的右侧时，`JoinReorderRule` 会自动执行左右表交换：
 
 ```rust
-pub fn enrichment_broadcast_join_rewrite(plan: Arc<dyn ExecutionPlan>, ...) -> Result<Arc<dyn ExecutionPlan>> {
-    // 1. 识别 HashJoinExec 节点
-    // 2. 将 NewEmptyExec 替换为 EnrichmentExec（加载富化数据）
-    // 3. 转换为广播连接（小表广播到大表侧）
-    // 适用条件：
-    //   - 只有一个 HashJoin
-    //   - 左表是 enrichment_tables/enrich schema
-    //   - 右表是普通日志/指标流
+fn swap_join_order(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
+    #[cfg(feature = "enterprise")]
+    if config::get_config().common.feature_enrichment_broadcast_join_enabled
+        && !is_enrichment_table(left)
+        && is_enrichment_table(right)
+        && hash_join.join_type().supports_swap()
+        && let Ok(swap_hash_join) = HashJoinExec::swap_inputs(hash_join, hash_join.mode)
+        && should_use_enrichment_broadcast_join(&swap_hash_join)
+    {
+        return Ok(Transformed::yes(swap_hash_join));
+    }
 }
 ```
+
+**重排触发条件（必须全部满足）：**
+1. `feature_enrichment_broadcast_join_enabled` 配置为 `true`
+2. 右表是富化表（schema 为 `enrichment_tables` 或 `enrich`）
+3. 左表不是富化表
+4. JOIN 类型支持交换（Inner、Left、Right、Full、LeftSemi、RightSemi、LeftAnti、RightAnti 等）
+5. 交换后的执行计划满足广播连接条件
+
+#### 3.5.2 广播连接改写的完整触发边界
+
+`src/service/search/datafusion/optimizer/physical_optimizer/enrichment.rs:115-208`
+
+```rust
+pub fn should_use_enrichment_broadcast_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    // 条件1：整个计划中只有一个 HashJoinExec，且没有其他多表算子
+    //   - 禁止：多个 HashJoin、Union、Interleave、RecursiveQuery、其他 Join 类型
+    //   - 计数规则：HashJoin=1，其他多表算子=2，总计数必须等于1
+    
+    // 条件2：左表必须是富化表
+    //   - schema 为 enrichment_tables 或 enrich
+    
+    // 条件3：右表必须是简单流且仅包含安全算子
+    //   - 右表本身不能是富化表
+    //   - 仅允许以下算子：NewEmptyExec、FilterExec、CooperativeExec、
+    //     RepartitionExec、CoalesceBatchesExec
+    //   - 禁止：Aggregate、Sort、Limit 等复杂算子
+}
+```
+
+**完整执行流程：**
+1. JoinReorderRule 检查右表是否为富化表，若是则尝试交换左右表
+2. enrichment_broadcast_join_rewrite 验证广播连接条件
+3. 将左表 NewEmptyExec 替换为 EnrichmentExec（加载富化数据）
+4. 转换为广播连接执行计划（小表广播到大表侧）
+
+**无法触发广播连接的边界场景：**
+- SQL 包含多个 JOIN 或 UNION 操作
+- 右表使用了 Aggregate/Sort/Limit 等复杂算子
+- JOIN 类型不支持交换（如 CrossJoin）
+- 富化表 JOIN 富化表（左右都是富化表）
+- 配置 `feature_enrichment_broadcast_join_enabled = false`
 
 ## 4. 错误旁路机制
 
@@ -216,7 +266,7 @@ let (error_sender, mut error_receiver) = channel::<(String, String, String, Opti
 - 条件评估失败：继续下一条记录
 
 **Function 节点错误** - `src/service/pipeline/batch_execution.rs:875-936`
-- VRL/JS 函数执行失败：记录错误，返回原始记录（不丢弃）
+- VRL 函数执行失败：记录错误，返回原始记录（不丢弃）
 - 结果数组模式错误：记录错误，中止当前批次处理
 
 **跨类型目标节点错误** - `src/service/pipeline/batch_execution.rs:735-773`
@@ -416,13 +466,19 @@ SQL 查询 (SELECT * FROM logs JOIN enrichment_tables.geoip ON ...)
 [Logical Plan]
     ↓
 [Physical Optimizer]
+    ├─ JoinReorderRule.swap_join_order
+    │   ├─ 检查：feature_enrichment_broadcast_join_enabled?
+    │   ├─ 检查：右表是富化表且左表不是？
+    │   ├─ 检查：JOIN 类型支持交换？
+    │   ├─ ✅ 是：HashJoinExec::swap_inputs → 富化表换到左侧
+    │   └─ ❌ 否：保持原顺序
     ├─ should_use_enrichment_broadcast_join?
-    │   ├─ 检查：只有一个 HashJoin？
-    │   ├─ 检查：左表是 enrichment_tables schema？
-    │   └─ 检查：右表是普通流且无复杂算子？
+    │   ├─ 检查：只有一个 HashJoin 且无其他多表算子？
+    │   ├─ 检查：左表是 enrichment_tables/enrich schema？
+    │   └─ 检查：右表仅含安全算子（Filter/Repartition 等）？
     └─ enrichment_broadcast_join_rewrite
-        ├─ 将 NewEmptyExec 替换为 EnrichmentExec
-        └─ 转换为广播连接执行计划
+        ├─ EnrichmentExecRewriter: NewEmptyExec → EnrichmentExec
+        └─ remote_scan_to_top_if_needed → 广播连接执行计划
     ↓
 [EnrichmentExec::execute]
     ├─ 尝试磁盘 Parquet 读取
@@ -454,23 +510,31 @@ SQL 查询 (SELECT * FROM logs JOIN enrichment_tables.geoip ON ...)
   - 磁盘：进程重启后快速恢复，避免全量远程拉取
 - **权衡**：磁盘占用额外存储空间
 
-### 7.4 广播连接优化
-- **决策**：富化表 JOIN 自动转换为广播连接
-- **理由**：富化表是小表，广播可以避免数据 shuffle
-- **权衡**：仅适用于左表为富化表的场景
+### 7.4 智能重排 + 广播连接优化
+- **决策**：通过 JoinReorderRule 自动将右表富化表交换到左侧，然后转换为广播连接
+- **理由**：
+  - 富化表是小表，广播可以避免数据 shuffle
+  - 用户无需关心 JOIN 顺序，优化器自动处理
+  - 仅在右表算子足够简单时触发，避免性能退化
+- **权衡**：
+  - 仅适用于单 JOIN 查询，多 JOIN/UNION 场景不优化
+  - 企业版特性，需 `feature_enrichment_broadcast_join_enabled = true`
+  - 仅当右表为简单流（无 Aggregate/Sort 等）时触发重排
 
 ## 8. 核心文件索引
 
 | 模块 | 文件路径 | 主要职责 |
 |------|---------|---------|
 | 管道核心 | `src/service/pipeline/batch_execution.rs` | 管道批量执行、节点处理、错误旁路 |
-| 管道管理 | `src/service/pipeline/mod.rs` | 管道 CRUD、验证、版本控制 |
+| 管道管理 | `src/service/pipeline/mod.rs` | 管道 CRUD、JS 函数禁用验证、版本控制 |
 | 富化表实现 | `src/service/enrichment/mod.rs` | StreamTable 实现、两级缓存加载 |
 | 富化执行计划 | `src/service/search/datafusion/distributed_plan/enrichment_exec.rs` | 查询时富化数据加载、指标统计 |
 | 富化表提供者 | `src/service/search/datafusion/table_provider/enrich_table.rs` | DataFusion TableProvider 实现 |
-| 广播连接优化 | `src/service/search/datafusion/optimizer/physical_optimizer/enrichment.rs` | 富化 JOIN 查询重写 |
+| 广播连接优化 | `src/service/search/datafusion/optimizer/physical_optimizer/enrichment.rs` | 富化 JOIN 条件验证、广播连接重写 |
+| JOIN 重排优化 | `src/service/search/datafusion/optimizer/physical_optimizer/join_reorder.rs` | 右表富化表自动交换左右顺序 |
 | 函数编译 | `src/common/utils/functions.rs` | VRL 编译器配置、富化表注册表 |
-| 函数执行 | `src/service/ingestion/mod.rs` | VRL/JS 函数编译与执行 |
+| JS 运行时 | `src/common/utils/js.rs` | QuickJS 运行时（无富化表访问能力，管道禁用） |
+| 函数执行 | `src/service/ingestion/mod.rs` | VRL 函数编译与执行 |
 | 错误持久化 | `src/service/db/pipeline_errors.rs` | 管道错误存储与查询 |
 | 管道缓存 | `src/service/db/pipeline.rs` | ExecutablePipeline 缓存管理 |
 | 全局配置 | `src/common/infra/config.rs` | ENRICHMENT_TABLES 等全局缓存 |
