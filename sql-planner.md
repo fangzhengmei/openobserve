@@ -176,28 +176,52 @@ time_range: Some((query.start_time, query.end_time)),
 **关键点**：
 - `time_range` **不来自 SQL 解析**，直接来自请求参数 `SearchQuery.start_time` 和 `SearchQuery.end_time`
 - 即使 SQL 中写了 `_timestamp > xxx`，也不会修改 `time_range`
-- `time_range` 用于**初次文件列表查询**（`file_list::query_ids` 调用）
+- `time_range` 用于**元数据数据库查询**（`file_list::query_ids` 调用）
 
 ### 3.3 两者关系与协作
+
+⚠️ **关键纠正 1**：`time_range` 不是 S3 前缀检索，而是**元数据数据库查询条件**
+
+⚠️ **关键纠正 2**：`equal_items` **不**在 `search_partition` 阶段传递给 `query_ids`，而是在后续 flight 文件筛选阶段使用
 
 | 维度 | `equal_items`（分区键等值条件） | `time_range`（时间范围） |
 |------|------------------------------|------------------------|
 | 来源 | SQL WHERE 子句解析 | 请求参数 |
 | 字段 | 所有分区键（含自定义分区键） | 仅 `_timestamp` |
 | 运算符 | `=`、`IN`（非否定） | `start_time`、`end_time` |
-| 用途 | 文件列表二次过滤（`filter_source_by_partition_key`） | 文件列表初次查询 |
-| 生效时机 | 拿到文件列表后，在内存中过滤 | 查询文件列表时，作为 S3 前缀条件 |
+| 首次使用阶段 | flight 文件筛选（`get_file_list_by_ids`） | search_partition 文件列表查询（`query_ids`） |
+| 生效机制 | 内存中基于文件路径字符串匹配过滤 | 数据库查询条件（SQL 语句 WHERE 子句） |
 
-**典型执行流**：
+**真实的 `query_ids` SQL**（`infra/src/file_list/sqlite.rs:532`）：
+```sql
+SELECT id, records, original_size 
+FROM file_list 
+WHERE stream = $1 
+  AND max_ts >= $2 
+  AND max_ts <= $3 
+  AND min_ts < $4;
 ```
-1. 用 time_range = (start, end) 从 S3 查询文件列表 → 得到文件列表 A
-2. 用 equal_items 对文件列表 A 做二次过滤 → 得到文件列表 B
-3. 用文件列表 B 调度查询
+- 参数：`stream = org_id/stream_type/stream_name`, `max_ts >= time_start`, `max_ts <= max_ts_upper_bound`, `min_ts < time_end`
+- 这是对 `file_list` 表（SQLite/Postgres）的数据库查询，**不是 S3 前缀检索**
+
+**典型执行流（修正后）**：
+```
+【search_partition 阶段】
+1. 用 time_range 从元数据数据库查询文件 ID 列表 → 得到文件 ID 列表 A
+2. 用文件 ID 列表生成分片（PartitionGenerator）
+3. 返回分片列表给客户端
+   
+【flight/实际执行阶段】
+4. 用文件 ID 调用 query_by_ids 获取完整 FileKey 信息 → 得到文件列表 B
+5. 遍历文件列表 B，对每个文件调用 match_file：
+   a. 用 equal_items 生成分区键过滤器
+   b. 检查文件路径是否匹配分区键值 → 过滤得到文件列表 C
+6. 用文件列表 C 实际扫描数据
 ```
 
 ### 3.4 `equal_items` 在各阶段的作用边界
 
-⚠️ **关键纠正**：`equal_items` 不是只在 `search_partition` 阶段使用，而是在 `search_partition` → `match_file` → `match_source` → `filter_source_by_partition_key` 的完整链路上传递和转换。
+⚠️ **关键纠正**：`equal_items` **不在 `search_partition` 阶段使用**，而是从 SQL 解析后一直传递到 flight 执行阶段，在 `get_file_list_by_ids` → `match_file` → `match_source` → `filter_source_by_partition_key` 链路上使用。
 
 #### 完整链路与数据格式转换
 
@@ -208,20 +232,27 @@ SQL WHERE 子句解析
     ↓ 提取结果：HashMap<TableReference, Vec<(String, String)>>
     ↓ 例如：{logs: [("service", "api-gateway"), ("service", "worker")]}
     ↓
-【search_partition 阶段】→ 文件列表查询后，在节点分配时传入
-    ↓ 转换：调用 generate_filter_from_equal_items()
-    ↓ 输入：&[(String, String)] 如 [("service", "api-gateway"), ("service", "worker")]
-    ↓ 输出：Vec<(String, Vec<String>)> 如 [("service", ["api-gateway", "worker"])]
+【search_partition 阶段】→ 不使用 equal_items！
+    ↓ 仅用 time_range 查询 file_list 数据库 → 得到文件 ID 列表
+    ↓ 用文件 ID 列表生成分片
+    ↓ equal_items 仅存储在 Sql 结构体中，传递给后续阶段
+    ↓
+【flight 阶段：get_file_list_by_ids】(grpc/flight.rs:627-670)
+    ↓ 步骤 1：调用 file_list::query_by_ids(ids) 获取完整 FileKey 信息
+    ↓ 步骤 2：遍历每个 FileKey，调用 match_file 过滤
     ↓
 【match_file 阶段】(mod.rs:1454-1489)
-    ↓ 首先检查 fast path：
-    ↓   • partition_keys.is_empty() ？
+    ↓ 首先检查 fast path（任一满足则 return true，不过滤）：
+    ↓   • partition_keys.is_empty() ？（流无分区键配置）
     ↓   • !source.key.contains('=') ？（文件路径不含分区键）
-    ↓   • stream_type == EnrichmentTables ？
-    ↓   → 任一满足则 return true（不过滤）
+    ↓   • stream_type == EnrichmentTables ？（富集表类型）
     ↓ slow path：
+    ↓   • 调用 generate_filter_from_equal_items() 转换格式
+    ↓     输入：&[(String, String)] 如 [("service", "api-gateway"), ("service", "worker")]
+    ↓     输出：Vec<(String, Vec<String>)> 如 [("service", ["api-gateway", "worker"])]
     ↓   • 对 equal_items 中的值应用 partition_key.get_partition_value() 转换
-    ↓   • 转换为文件系统实际存储的分区值格式（如哈希、日期格式等）
+    ↓     转换为文件系统实际存储的分区值格式（如哈希、日期格式等）
+    ↓   • 调用 match_source
     ↓
 【match_source 阶段】(mod.rs:1507-1551)
     ↓ 检查 1：org_id/stream_type/stream_name 匹配
@@ -234,6 +265,46 @@ SQL WHERE 子句解析
     ↓   • 文件路径包含 "/field=" 吗？→ 不包含则继续下一个过滤器
     ↓   • 文件路径包含任一 "/field=value/" 吗？→ 都不包含则返回 false（过滤掉）
     ↓ 返回 true（所有过滤器都匹配或不相关）
+```
+
+#### `search_partition` 阶段不使用 `equal_items` 的证据
+
+**`search_partition` 调用 `query_ids`**（`mod.rs:754-761`）：
+```rust
+let stream_files = crate::service::file_list::query_ids(
+    trace_id,
+    &sql.org_id,
+    stream_type,
+    &stream_name,
+    sql.time_range.unwrap_or_default(),  // 只传递 time_range，没有 equal_items！
+)
+.await?;
+```
+
+**`query_ids` 函数签名**（`service/file_list.rs:253-259`）：
+```rust
+pub async fn query_ids(
+    trace_id: &str,
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    time_range: (i64, i64),  // 没有 equal_items 参数！
+) -> Result<Vec<infra_file_list::FileId>>
+```
+
+#### `equal_items` 在 flight 阶段的首次使用
+
+**`get_file_list_by_ids` 函数签名**（`grpc/flight.rs:627-634`）：
+```rust
+async fn get_file_list_by_ids(
+    trace_id: &str,
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    time_range: Option<(i64, i64)>,
+    equal_items: &[(String, String)],  // 首次在这里接收 equal_items
+    ids: &[i64],
+) -> Result<(Vec<FileKey>, usize), Error>
 ```
 
 #### 各阶段的具体作用
@@ -1045,10 +1116,20 @@ LIMIT 100
 - `apply_over_hits = false`
 - **结果**：`skip_get_file_list = false` → 进入多分片分支
 
-**步骤 2.2：查询文件列表**
-- 代码：`mod.rs:760-765`
-1. 用 `time_range` 从 S3 查询文件列表 → 得到文件列表 A（100 个文件）
-2. 用 `equal_items` 对文件列表 A 做二次过滤 → 得到文件列表 B（30 个文件）
+**步骤 2.2：查询文件列表（元数据数据库查询，不是 S3）**
+- 代码：`mod.rs:754-761` + `infra/src/file_list/sqlite.rs:498-556`
+- **不使用 `equal_items`！** 仅传递 `time_range`
+- 执行数据库查询：
+  ```sql
+  SELECT id, records, original_size 
+  FROM file_list 
+  WHERE stream = 'org_id/logs/stream_name' 
+    AND max_ts >= 1717209600000000 
+    AND max_ts <= max_ts_upper_bound 
+    AND min_ts < 1717296000000000;
+  ```
+- 结果：得到文件 ID 列表 A（100 个文件 ID）
+- `equal_items` 存储在 `Sql` 结构体中，传递给后续 flight 阶段
 
 **步骤 2.3：计算分片参数**
 - 代码：`mod.rs:944-999`
@@ -1141,6 +1222,58 @@ LIMIT 100
 - 代码：`optimizer/physical_optimizer/remote_scan.rs`
 - 匹配 `SortPreservingMergeExec` → 子计划前插入 `RemoteScanExec`
 - 4 个分片分配到 4 个 querier 节点
+
+---
+
+#### 阶段 4.5：flight 文件筛选（`equal_items` 首次实际使用）
+
+当 RemoteScan 在 follower 节点执行时，进入 flight 服务的 `do_get` 处理流程：
+
+**步骤 4.5.1：获取文件列表**
+- 代码：`grpc/flight.rs:627-649`
+- 调用 `get_file_list_by_ids(trace_id, org_id, stream_type, stream_name, time_range, equal_items, ids)`
+- 步骤 1：用文件 ID 调用 `file_list::query_by_ids` 获取完整 `FileKey` 信息（含 `key` 路径）→ 得到文件列表 B（100 个文件）
+
+**步骤 4.5.2：`equal_items` 分区键过滤**
+- 代码：`grpc/flight.rs:651-666` + `mod.rs:1454-1489`
+- 遍历文件列表 B，对每个文件调用 `match_file`：
+  ```rust
+  if match_file(
+      org_id, stream_type, stream_name, time_range,
+      &file, &partition_keys, equal_items,
+  ).await
+  ```
+
+**步骤 4.5.3：`match_file` fast path 检查**
+- `partition_keys.is_empty()`？→ 流配置了 `service` 作为分区键 ❌
+- `!source.key.contains('=')`？→ 文件路径包含 `service=api-gateway` ✅（不，包含 `=`）
+- `stream_type == EnrichmentTables`？→ `logs` ❌
+- **结果**：进入 slow path
+
+**步骤 4.5.4：`generate_filter_from_equal_items` 格式转换**
+- 代码：`mod.rs:1493-1504`
+- 输入：`equal_items = [("service", "api-gateway")]`
+- 输出：`filters = [("service", ["api-gateway"])]`
+
+**步骤 4.5.5：分区键值转换**
+- 代码：`mod.rs:1475-1481`
+- 对 `service` 键值 `api-gateway` 应用 `partition_key.get_partition_value()`
+- 假设 `service` 是哈希分区，转换为 `hash_256(api-gateway)` → 实际存储值
+
+**步骤 4.5.6：`filter_source_by_partition_key` 文件路径匹配**
+- 代码：`config/src/utils/schema.rs:316-325`
+- 对文件路径 `files/default/logs/access_log/service=api-gateway/...` 进行字符串匹配：
+  - 包含 `/service=` ✅
+  - 包含 `/service=api-gateway/` ✅ → 保留
+- 对文件路径 `files/default/logs/access_log/service=worker/...`：
+  - 包含 `/service=` ✅
+  - 不包含 `/service=api-gateway/` ❌ → 过滤掉
+- **结果**：得到文件列表 C（30 个文件）
+
+**步骤 4.5.7：时间范围二次检查**
+- 代码：`mod.rs:1542-1547`
+- 检查文件 `min_ts`/`max_ts` 与查询 `time_range` 是否有交集
+- 进一步过滤掉时间不匹配的文件
 
 ---
 
@@ -1280,6 +1413,21 @@ LIMIT 10
 
 ---
 
+#### 阶段 3.5：flight 文件筛选（`equal_items` 为空，fast path 跳过）
+
+**说明**：本场景 SQL 中没有分区键等值条件（没有 `service = xxx` 这样的条件），所以 `equal_items = []`。
+
+**步骤 3.5.1：`match_file` fast path 检查**
+- 代码：`mod.rs:1464-1468`
+- `partition_keys.is_empty()`？→ 流配置了分区键 ❌
+- `!source.key.contains('=')`？→ 文件路径包含分区键 `=` ✅（不，包含）
+- `stream_type == EnrichmentTables`？→ ❌
+- **但 `equal_items` 为空**：`generate_filter_from_equal_items(&[])` 返回空数组
+- `filter_source_by_partition_key(source, &[])` → 没有过滤器，直接返回 true
+- **结果**：所有文件都通过，不进行分区键过滤
+
+---
+
 #### 阶段 4：RemoteScan 执行与回退
 
 **节点 1（PermissionDenied）**：
@@ -1347,14 +1495,28 @@ ORDER BY log_level ASC
 - 代码：`mod.rs:842-850` → 直接返回单分片
 - **完全绕过 PartitionGenerator，不查询文件列表**
 
-**阶段 3：equal_items 作用链路**
-虽然 `skip_get_file_list = true` 绕过了文件列表查询，但 `equal_items` 仍会在后续执行阶段使用：
+**阶段 3：flight 文件筛选（`equal_items` 在单分片路径下的使用）**
 
-| 阶段 | 作用 |
-|------|------|
-| **search_partition** | 由于 `skip_get_file_list = true`，不查询文件列表，因此 `equal_items` 在此阶段不生效 |
-| **match_file** | 如果后续有文件匹配需求（如 WAL 查询），`equal_items` 会被转换为 filters |
-| **filter_source_by_partition_key** | 如果有文件路径需要检查，会基于 `/service=api-gateway/` 进行字符串匹配 |
+虽然 `skip_get_file_list = true` 绕过了 `search_partition` 阶段的文件列表查询，但在实际执行时仍会经过 flight 阶段的文件筛选：
+
+**步骤 3.1：获取文件列表**
+- 代码：`grpc/flight.rs:627-649`
+- `skip_get_file_list = true` 时，用统计信息生成的虚拟 FileId（`mod.rs:807-812`）
+- 调用 `query_by_ids` 获取文件信息 → 实际需要查询真实文件列表
+
+**步骤 3.2：`equal_items` 分区键过滤**
+- 代码：`grpc/flight.rs:651-666` + `mod.rs:1454-1489`
+- 遍历文件列表，对每个文件调用 `match_file`：
+  - `equal_items = [("service", "api-gateway")]`
+  - `generate_filter_from_equal_items` → `[("service", ["api-gateway"])]`
+  - 应用 `get_partition_value()` 转换值格式
+  - `filter_source_by_partition_key` 检查文件路径是否包含 `/service=api-gateway/`
+- **结果**：仅保留 `service = api-gateway` 的文件
+
+**步骤 3.3：时间范围二次检查**
+- 检查文件 `min_ts`/`max_ts` 与查询 `time_range` 是否有交集
+
+---
 
 **阶段 4：索引下推**
 - 谓词：`service = 'api-gateway' AND _timestamp BETWEEN ...`
@@ -1397,36 +1559,48 @@ ORDER BY log_level ASC
 - 即使 `is_remove_filter = false`，索引条件仍会被提取和使用
 - `match_all` 空 token 检测避免无效下推
 
-### 3. `equal_items` 全链路传递
-- 从 SQL WHERE 子句提取分区键等值条件
-- 在 `search_partition` → `match_file` → `match_source` → `filter_source_by_partition_key` 完整链路上传递和转换
+### 3. `time_range` 元数据数据库查询
+- ⚠️ **不是 S3 前缀检索**，而是 SQLite/Postgres 元数据数据库查询条件
+- 真实 SQL（`sqlite.rs:532`）：
+  ```sql
+  SELECT id, records, original_size FROM file_list 
+  WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4
+  ```
+- 时间范围基于文件的 `min_ts`/`max_ts` 元数据进行过滤
+- 在 `search_partition` 阶段首次使用，获取文件 ID 列表
+
+### 4. `equal_items` 全链路传递（两阶段分离）
+- ⚠️ **不在 `search_partition` 阶段使用**，`query_ids` 函数签名不接收 `equal_items` 参数
+- 从 SQL WHERE 子句提取后，存储在 `Sql` 结构体中传递到 flight 执行阶段
+- **首次实际使用在 flight 阶段的 `get_file_list_by_ids`**（`grpc/flight.rs:627`）
+- 完整链路：`get_file_list_by_ids` → `match_file` → `generate_filter_from_equal_items` → `match_source` → `filter_source_by_partition_key`
 - `generate_filter_from_equal_items` 格式转换：`Vec<(String, String)>` → `Vec<(String, Vec<String>)>`
 - `match_file` 支持 fast path 跳过（无分区键/无 `=` 字符/富集表类型）
 - 最终基于文件路径字符串匹配，不依赖元数据
 
-### 4. 优雅降级机制（带边界）
+### 5. 优雅降级机制（带边界）
 - **可回退**：连接失败、取消、超时、Parquet 文件缺失
 - **不可回退**：权限错误、参数错误、认证失败等
 - 超时返回部分结果而非空错误
 - 通过 `is_partial` 和 `partial_err` 告知用户数据完整性
 
-### 5. 分层优化架构
+### 6. 分层优化架构
 - SQL 层重写（Visitor 模式）→ 逻辑优化 → 物理优化 → 分布式优化
 - 每一层都有独立的规则集，可独立开关和扩展
 - 企业版功能通过 feature flag 无缝插入
 - `get_ts_col_order_by` 非 enterprise 用解析结构，enterprise 用原始 SQL 字符串
 
-### 6. 用户函数隔离
+### 7. 用户函数隔离
 - VRL 函数在运行时逐行解释执行
 - 按组织隔离函数注册
 - 内置函数与用户函数统一注册机制
 
-### 7. `match_all` 语义限制
+### 8. `match_all` 语义限制
 - 必须直接作用于物理流表，不能作用于中间结果（子查询/CTE/JOIN 的外层）
 - 内部子查询/CTE 使用不受限
 - 流必须配置 FTS 字段
 
-### 8. 单分片双路径设计
+### 9. 单分片双路径设计
 - **路径 A（聚合查询）**：在 PartitionGenerator 内部返回单分片，经过完整文件列表查询
 - **路径 B（无时间列/EXPLAIN 等）**：在 mod.rs 中提前返回，完全绕过 PartitionGenerator，不查询文件列表
 - `get_ts_col_order_by` 的返回值是路径 B 的关键触发条件
@@ -1464,30 +1638,38 @@ ORDER BY log_level ASC
 - 支持布隆过滤器下推
 - 支持 `NOT IN` 下推（当前仅支持 `IN`）
 
-### 6. `equal_items` 链路优化
-当前 `equal_items` 在多个阶段传递和转换，可考虑：
-- 统一数据格式，避免多次转换
-- 提前在 SQL 解析阶段完成 `get_partition_value()` 转换
-- 添加缓存机制避免重复的分区键值转换
+### 6. `time_range` 元数据查询优化
+当前 `time_range` 在 `query_ids` 中作为元数据数据库查询条件，可考虑：
+- 添加数据库索引优化 `max_ts`/`min_ts` 范围查询
+- 考虑将 `equal_items` 条件也下推到元数据查询层，减少后续内存过滤
+- 统一 `query_ids` 和 `query_by_ids` 的时间范围过滤逻辑
 
-### 7. `equal_items` 与 `time_range` 统一
+### 7. `equal_items` 链路优化（两阶段分离）
+当前 `equal_items` 在 `search_partition` 阶段不使用，仅在 flight 阶段使用，可考虑：
+- 统一数据格式，避免多次转换
+- 考虑在 `search_partition` 阶段就应用分区键过滤，减少分片时的文件数量
+- 添加缓存机制避免重复的分区键值转换
+- 明确文档化两阶段分离的设计原因
+
+### 8. `equal_items` 与 `time_range` 统一
 当前两条路径独立，可考虑：
 - 统一分区条件提取逻辑，从 SQL 中自动提取 `_timestamp` 范围
 - 避免请求参数与 SQL 条件不一致导致的查询范围扩大
 
-### 8. `get_ts_col_order_by` 代码简化
+### 9. `get_ts_col_order_by` 代码简化
 当前 enterprise 与非 enterprise 实现差异较大，可考虑：
 - 统一接口，将差异封装在内部实现中
 - 非 enterprise 版本也可以支持更复杂的时间列检测
 - 减少 `#[cfg]` 分支对代码可读性的影响
 
-### 9. `match_all` 限制提示
+### 10. `match_all` 限制提示
 当前错误提示较笼统，可改进：
 - 明确告知用户是 JOIN/CTE/子查询外层哪种场景
 - 提供改写建议（如将 match_all 移入子查询内部）
 
-### 10. 单分片路径文档化
+### 11. 单分片路径文档化
 当前 `skip_get_file_list` 的分支逻辑较隐蔽，建议：
 - 添加更清晰的代码注释说明两种单分片路径的区别
 - 考虑统一单分片返回逻辑，减少分支复杂度
-- 补充 `equal_items` 在 `skip_get_file_list = true` 场景下的使用说明
+- 补充 `equal_items` 在 `skip_get_file_list = true` 场景下仍会在 flight 阶段使用的说明
+- 明确 `time_range` 是元数据数据库查询，不是 S3 前缀检索
