@@ -5,8 +5,10 @@
 告警评估器的完整链路由以下核心模块组成：
 
 ```
-调度器触发 → 告警评估 → 分组批处理 → 历史去重 → 事件关联(可选) → 模板渲染 → 通知投递
+调度器触发 → 告警评估 → [分组批处理] 或 [历史去重] → 事件关联(可选) → 模板渲染 → 通知投递
 ```
+
+> **重要修正**：分组批处理和历史去重是**互斥**的分支关系，而非顺序关系。分组启用时**不会**执行去重。
 
 主要涉及的代码文件：
 
@@ -49,11 +51,23 @@ let start_time = final_end_time - Duration::try_minutes(alert.trigger_condition.
    - 参考：`handlers.rs:299-315`
    - 支持时间对齐（`align_time`）
 
-#### 延迟处理机制：
+#### 延迟处理机制（修正）：
 
-- **最大可接受延迟**：`min(1小时, 频率 × 20%)`，参考 `handlers.rs:333-344`
-- 超过延迟的告警会被跳过，并记录到 `triggers` 使用率流中
+> **重要修正**：`_get_max_considerable_delay()` 函数（`handlers.rs:333-344`）定义了 `min(1小时, 频率 × 20%)` 的最大可接受延迟逻辑，但**该函数从未被实际调用**，是死代码。
+
+**实际的跳过逻辑**（`handlers.rs:629-692`）：
+- 只要 `delay > frequency`（延迟超过一个执行周期），就会跳过中间的执行点
+- 跳过的时间戳通过 `get_skipped_timestamps()` 计算并记录到 `triggers` 使用率流中
 - 跳过的告警会记录 `skipped_alerts_count` 指标
+- 最终使用的 `final_end_time` 是跳过所有积压后的最新时间点
+
+```rust
+// 只要 next_run_at <= supposed_to_run_at + delay，就会被跳过
+while next_run_at <= supposed_to_run_at + delay {
+    skipped_timestamps.push(next_run_at);
+    // 计算下一个执行时间...
+}
+```
 
 ### 2.2 评估窗口参数
 
@@ -140,13 +154,40 @@ pub enum SendStrategy {
 }
 ```
 
+#### 分组与去重的分支关系（重要修正）：
+
+> **关键修正**：分组和历史去重是**互斥**的分支关系，执行顺序如下：
+> 
+> 1. 先检查 `grouping.enabled`（`handlers.rs:851-964`）
+> 2. **如果分组启用**：
+>    - 计算指纹（复用去重的指纹算法）
+>    - 添加到批次（`add_to_batch()`）
+>    - **直接 return，不会执行后续的去重逻辑**
+> 3. **只有分组不启用时**，才会检查 `deduplication.enabled` 并执行去重
+
 #### 分组工作流程（`handlers.rs:851-964`）：
 
-1. 评估完成后检查分组是否启用
-2. 计算告警指纹（与去重共用指纹算法）
-3. 调用 `grouping::add_to_batch()` 添加到批次
-4. 批次满（达到 `max_group_size`）或超时（达到 `group_wait_seconds`）时触发发送
-5. 否则等待下一次评估或定时扫描
+```rust
+if grouping_enabled {
+    // 计算指纹（与去重共用算法）
+    let fingerprint = calculate_fingerprint(alert, first_row, ...);
+    
+    // 添加到批次
+    let batch_ready = add_to_batch(fingerprint, ...);
+    
+    if batch_ready {
+        // 批次满，立即发送
+        send_grouped_notification_sync(batch).await;
+    }
+    
+    // 标记分组状态
+    trigger_data_stream.grouped = Some(true);
+    
+    // 直接返回，不执行后续的去重和通知逻辑
+    return Ok(());
+}
+// 只有分组不启用，才会走到这里的去重逻辑
+```
 
 #### 待处理批次管理：
 
@@ -158,22 +199,74 @@ static PENDING_BATCHES: Lazy<Arc<DashMap<String, PendingBatch>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 ```
 
+#### 批次触发条件：
+
+1. **批次满**：添加新告警后达到 `max_group_size`，立即发送
+2. **超时**：通过定时任务扫描 `get_expired_batches()`，超过 `group_wait_seconds` 后发送
+
 ### 3.3 事件关联抑制（Incident Correlation）
 
 当 `alert.creates_incident = true` 时启用，位于 `handlers.rs:1051-1095`：
 
+#### 事故关联只取首条结果行的影响（重要修正）：
+
+> **关键修正**：`correlate_alert_to_incident()` 函数签名如下：
+> ```rust
+> pub async fn correlate_alert_to_incident(
+>     alert: &Alert,
+>     result_row: &Map<String, Value>,    // 只取 first_row
+>     notify_rows: &[Map<String, Value>], // 所有结果行
+>     triggered_at: i64,
+> ) -> Result<Option<IncidentCorrelationOutcome>, anyhow::Error>
+> ```
+
+**实际使用方式**（`handlers.rs:1051-1062`）：
+```rust
+let incident_handled_notification = if alert.creates_incident
+    && ...
+    && let Some(first_row) = data.first()  // 只取第一条结果行
+{
+    correlate_alert_to_incident(
+        &alert,
+        first_row,      // 只用第一行提取维度
+        &data,          // 所有行仅用于判断非空
+        triggered_at,
+    ).await
+}
+```
+
+**对结果行维度的处理**（`incidents.rs:489-500`）：
+```rust
+// 只从 first_row 提取标签用于关联
+let mut labels: HashMap<String, String> = result_row
+    .iter()
+    .filter_map(|(k, v)| {
+        // 转换为字符串...
+        Some((k.clone(), value_str))
+    })
+    .collect();
+```
+
+**业务影响**：
+1. **维度丢失风险**：一次评估返回多个结果行时，只有第一行的维度用于事故关联，其他行的维度被完全忽略
+2. **错误聚合风险**：如果不同结果行有不同的服务标签或语义维度，只有第一行的维度决定了事故归属
+3. **通知内容限制**：事故通知负载**不包含任何告警结果行数据**，只有事故元数据（severity, title, service_name 等）
+4. **`notify_rows` 参数的实际作用**：仅用于 `!notify_rows.is_empty()` 判断，从未用于内容提取或维度计算
+
 #### 抑制规则（`incidents.rs:630-656`）：
 
 ```rust
-match &outcome {
-    IncidentCorrelationOutcome::NewIncidentCreated { .. } |
-    IncidentCorrelationOutcome::NewAlertTypeJoined { .. } => {
-        // 新事故或新告警类型加入 → 发送通知
-        send_incident_notifications(...).await;
-    }
-    IncidentCorrelationOutcome::ExistingAlertRepeated { .. } => {
-        // 已有告警类型重复触发 → 抑制通知
-        log::debug!("Suppressing notification for repeated alert type");
+if !notify_rows.is_empty() {
+    match &outcome {
+        IncidentCorrelationOutcome::NewIncidentCreated { .. } |
+        IncidentCorrelationOutcome::NewAlertTypeJoined { .. } => {
+            // 新事故或新告警类型加入 → 发送通知
+            send_incident_notifications(...).await;
+        }
+        IncidentCorrelationOutcome::ExistingAlertRepeated { .. } => {
+            // 已有告警类型重复触发 → 抑制通知
+            log::debug!("Suppressing notification for repeated alert type");
+        }
     }
 }
 ```
@@ -351,12 +444,40 @@ pub struct Model {
     pub first_seen_at: i64,            // 首次出现时间（微秒）
     pub last_seen_at: i64,             // 最后出现时间（微秒）
     pub occurrence_count: i64,         // 出现次数
-    pub notification_sent: bool,       // 是否已发送通知
+    pub notification_sent: bool,       // 是否已发送通知（死字段，从未使用）
     pub created_at: i64,               // 创建时间
 }
 ```
 
-### 5.4 去重应用流程
+### 5.4 去重状态字段的实际使用（重要修正）：
+
+> **关键修正**：`notification_sent` 字段是**死字段**，从未被实际使用。
+
+**字段使用分析**：
+1. **`notification_sent`**：
+   - 新建时设置为 `false`（`deduplication.rs:92`）
+   - 读取时**从未被访问**（`get_dedup_state()` 只用于存在性检查和时间窗口判断）
+   - 更新时**从未被修改**（`save_dedup_state()` 只更新 `last_seen_at` 和 `occurrence_count`）
+   - 去重判断逻辑**完全不依赖此字段**
+
+2. **实际使用的字段**：
+   - `fingerprint`：主键，用于查询
+   - `last_seen_at`：用于时间窗口判断（`is_within_window()`）
+   - `occurrence_count`：记录出现次数，用于指标统计
+   - `alert_id`：用于区分同告警/跨告警去重类型
+
+**`save_dedup_state` 更新逻辑**（`deduplication.rs:76-81`）：
+```rust
+if let Some(existing) = get_dedup_state(db, params.fingerprint).await? {
+    let mut active: alert_dedup_state::ActiveModel = existing.clone().into();
+    active.last_seen_at = Set(params.last_seen_at);
+    active.occurrence_count = Set(params.occurrence_count);
+    // 注意：notification_sent 从未被更新！
+    active.update(db).await
+}
+```
+
+### 5.5 去重应用流程
 
 去重应用入口位于 `deduplication.rs:160-191` 的 `apply_deduplication`：
 
@@ -374,13 +495,13 @@ pub async fn apply_deduplication(
 对于每条结果行：
 1. 计算指纹 fingerprint
 2. 查询去重状态表
-3. 若存在且在时间窗口内：
+3. 若存在且在时间窗口内（通过 last_seen_at 判断）：
    - 更新 occurrence_count + 1
    - 更新 last_seen_at = now
    - 标记为抑制（不加入结果集）
    - 记录指标 ALERT_DEDUP_SUPPRESSED_TOTAL
 4. 若不存在或超出窗口：
-   - 创建新的去重状态记录
+   - 创建新的去重状态记录（notification_sent = false）
    - 加入结果集（发送通知）
    - 记录指标 ALERT_DEDUP_PASSED_TOTAL
 ```
@@ -391,13 +512,13 @@ pub async fn apply_deduplication(
 // deduplication.rs:100-105
 pub fn is_within_window(state: &Model, time_window_minutes: i64) -> bool {
     o2_enterprise::enterprise::alerts::dedup::is_within_time_window(
-        state.last_seen_at,
+        state.last_seen_at,  // 只使用 last_seen_at，不使用 notification_sent
         time_window_minutes,
     )
 }
 ```
 
-### 5.5 去重状态清理
+### 5.6 去重状态清理
 
 定时清理任务位于 `alert_manager.rs:100-185`：
 
@@ -405,7 +526,7 @@ pub fn is_within_window(state: &Model, time_window_minutes: i64) -> bool {
 - 清理超过24小时的去重状态记录
 - 企业版特性，OSS 版本为 no-op
 
-### 5.6 指标监控
+### 5.7 指标监控
 
 去重相关 Prometheus 指标：
 
@@ -518,7 +639,7 @@ async fn send_incident_notifications(
 #### 事故通知特点：
 
 1. **目的地合并**：收集事故中所有关联告警的目的地并去重
-2. **统一负载**：使用事故中心化的 JSON 格式，而非告警行模板
+2. **统一负载**：使用事故中心化的 JSON 格式，**不包含告警结果行数据**
 3. **事件类型**：
    - `new_incident_created`：新事故创建
    - `new_alert_correlated`：新告警类型关联
@@ -544,6 +665,8 @@ async fn send_incident_notifications(
 }
 ```
 
+> **注意**：事故通知负载中完全没有告警结果行的数据，只有事故和告警的元数据。
+
 ### 6.4 分组通知发送
 
 分组通知通过异步任务发送，位于 `src/job/alert_grouping.rs`（未在截取部分显示）：
@@ -553,7 +676,84 @@ async fn send_incident_notifications(
 
 ---
 
-## 7. 完整执行流程图
+## 7. 重试与延迟阈值的真实规则（重要修正）
+
+### 7.1 最大重试次数配置
+
+```rust
+// infra/src/scheduler/mod.rs:235-237
+pub fn get_scheduler_max_retries() -> (bool, i32) {
+    let max_retries = config::get_config().limit.scheduler_max_retries;
+    (max_retries > 0, max_retries.unsigned_abs() as i32)
+}
+```
+
+- 来自配置项 `limit.scheduler_max_retries`
+- 如果 `max_retries > 0`，第一个返回值为 `true` 表示启用重试
+
+### 7.2 评估失败时的重试逻辑（`handlers.rs:741-800`）
+
+```rust
+if result.is_err() {
+    let err = result.err().unwrap();
+    // ... 记录错误 ...
+    
+    if trigger.retries + 1 >= max_retries {
+        // 超过最大重试次数
+        if get_config().limit.pause_alerts_on_retries {
+            // 自动禁用告警
+            let mut alert_curr = get_by_id_db(&trigger.org, alert.id.unwrap()).await?;
+            alert_curr.enabled = false;
+            set_without_updating_trigger(&trigger.org, alert_curr).await?;
+        }
+        // 跳到下一个调度周期，重试计数清零
+        new_trigger.next_run_at = alert.trigger_condition.get_next_trigger_time(
+            true, alert.tz_offset, false, None
+        )?;
+        trigger_data.reset();
+        new_trigger.data = json::to_string(&trigger_data).unwrap();
+        db::scheduler::update_trigger(new_trigger, true, &query_trace_id).await?;
+    } else {
+        // 未超过最大重试次数，retries + 1，重新排队等待执行
+        db::scheduler::update_status(
+            &new_trigger.org,
+            new_trigger.module,
+            &new_trigger.module_key,
+            db::scheduler::TriggerStatus::Waiting,
+            trigger.retries + 1,  // 重试计数 +1
+            None,
+            true,
+            &query_trace_id,
+        ).await?;
+    }
+    
+    publish_triggers_usage(trigger_data_stream);
+    return Err(err);
+}
+```
+
+**重试规则总结**：
+1. 评估失败时，检查 `retries + 1 >= max_retries`
+2. **未超过**：`retries + 1`，状态改为 `Waiting`，重新排队
+3. **已超过**：
+   - 可选自动禁用告警（`pause_alerts_on_retries = true`）
+   - 计算下一个正常调度时间，重试计数清零
+   - 触发器数据重置（`trigger_data.reset()`）
+4. 成功时：重试计数自动清零（`trigger_data.reset()` 包含重试计数重置）
+
+### 7.3 延迟阈值的真实情况
+
+> **重要修正**：`_get_max_considerable_delay()` 函数定义了但**从未被调用**，是死代码。
+
+**实际的延迟处理逻辑**：
+- 没有基于阈值的智能跳过判断
+- 只要 `delay > frequency`，就会跳过所有中间的执行时间点
+- 跳过的时间戳会被记录到 `triggers` 流用于审计
+- 最终使用当前时间作为评估窗口的结束时间
+
+---
+
+## 8. 完整执行流程图（修正版）
 
 ```
 调度器触发 (handlers.rs:346)
@@ -563,15 +763,15 @@ async fn send_incident_notifications(
     │
     ├─ 告警不存在 → 删除触发器，记录失败
     ├─ 告警未启用 → 延后7天，设置静默
-    ├─ 超过最大重试 → 跳过，记录失败
+    ├─ 超过最大重试 → 跳过，记录失败（可选禁用告警）
     └─ 正常 → 继续
     │
     ▼
 计算评估窗口 (handlers.rs:629-702)
     │
-    ├─ 处理延迟跳过（> 最大可接受延迟）
+    ├─ 跳过积压执行点（delay > frequency 时）
     ├─ 计算 start_time = end_time - period
-    └─ 处理跳过的时间戳（告警积压）
+    └─ 记录 skipped_alerts_count 到 triggers 流
     │
     ▼
 执行告警评估 (handlers.rs:732-738 → alert.rs:1012)
@@ -582,7 +782,7 @@ async fn send_incident_notifications(
     ▼
 评估结果处理 (handlers.rs:803)
     │
-    ├─ 评估失败 → 更新重试，记录错误
+    ├─ 评估失败 → retries+1 重新排队，或超过最大重试则跳到下一周期
     └─ 评估成功 → 继续
     │
     ▼
@@ -599,9 +799,9 @@ async fn send_incident_notifications(
     ▼
 分组启用？(handlers.rs:851-964)
     │
-    ├─ 是 → 计算指纹 → add_to_batch()
-    │      ├─ 批次满/超时 → 立即发送
-    │      └─ 否则 → 等待，结束
+    ├─ 是 → 计算指纹（基于first_row）→ add_to_batch()
+    │      ├─ 批次满/超时 → 立即发送分组通知
+    │      └─ 否则 → 等待，直接 return（不执行去重！）
     │
     └─ 否 → 继续
     │
@@ -609,6 +809,8 @@ async fn send_incident_notifications(
 去重启用？(handlers.rs:968-1019 → deduplication.rs:160)
     │
     ├─ 是 → apply_deduplication()
+    │      ├─ 每条结果行计算指纹
+    │      ├─ 存在且在窗口内 → 更新 last_seen_at 和 count，抑制
     │      ├─ 全部被抑制 → 结束
     │      └─ 部分/全部通过 → 继续
     │
@@ -617,8 +819,9 @@ async fn send_incident_notifications(
     ▼
 事故关联启用？(handlers.rs:1051-1095 → incidents.rs:482)
     │
-    ├─ 是 → correlate_alert_to_incident()
-    │      ├─ 新事故/新告警类型 → 发送事故通知 → 结束
+    ├─ 是 → correlate_alert_to_incident(alert, first_row, &data, ...)
+    │      ├─ 只从 first_row 提取维度（其他行维度被忽略！）
+    │      ├─ 新事故/新告警类型 → 发送事故通知（无结果行数据）→ 结束
     │      ├─ 重复告警 → 抑制 → 结束
     │      └─ 关联失败 → 降级为直接通知
     │
@@ -638,62 +841,89 @@ async fn send_incident_notifications(
 
 ---
 
-## 8. 关键代码索引
+## 9. 关键代码索引
 
-### 8.1 评估窗口
+### 9.1 评估窗口
 - 窗口计算：`src/service/alerts/scheduler/handlers.rs:266-330`
-- 延迟处理：`src/service/alerts/scheduler/handlers.rs:333-344`
+- 延迟处理（死代码）：`src/service/alerts/scheduler/handlers.rs:333-344`
 - 评估入口：`src/service/alerts/alert.rs:1012-1040`
 
-### 8.2 抑制策略
+### 9.2 抑制策略
 - 静默期：`src/service/alerts/scheduler/handlers.rs:827-834`
-- 分组批处理：`src/service/alerts/grouping.rs`
+- 分组批处理（互斥分支）：`src/service/alerts/scheduler/handlers.rs:851-964`
+- 分组逻辑：`src/service/alerts/grouping.rs`
 - 分组配置：`src/config/src/meta/alerts/deduplication.rs:148-200`
 - 事故关联抑制：`src/service/alerts/incidents.rs:630-656`
+- 事故关联首行维度提取：`src/service/alerts/incidents.rs:489-500`
 
-### 8.3 模板渲染
+### 9.3 模板渲染
 - 行模板渲染：`src/service/alerts/alert.rs:1389-1511`
 - 目的地模板渲染：`src/service/alerts/alert.rs:1520`
 - 模板管理：`src/service/alerts/templates.rs`
 - 系统模板初始化：`src/service/alerts/templates.rs:108-189`
 
-### 8.4 历史去重
+### 9.4 历史去重
 - 去重配置：`src/config/src/meta/alerts/deduplication.rs:55-140`
 - 去重应用：`src/service/alerts/deduplication.rs:160-313`
 - 指纹计算：`src/service/alerts/deduplication.rs:34-48`
-- 去重状态实体：`src/infra/src/table/entity/alert_dedup_state.rs:20-40`
+- 去重状态实体（含死字段）：`src/infra/src/table/entity/alert_dedup_state.rs:20-40`
+- 去重状态保存（只更新两个字段）：`src/service/alerts/deduplication.rs:71-97`
 - 去重状态清理：`src/job/alert_manager.rs:100-185`
 
-### 8.5 通知投递
+### 9.5 通知投递
 - 通知入口：`src/service/alerts/alert.rs:1042-1141`
 - HTTP 通道：`src/service/alerts/alert.rs:1227-1321`
 - Email 通道：`src/service/alerts/alert.rs:1323-1355`
 - SNS 通道：`src/service/alerts/alert.rs:1357-1387`
-- 事故通知：`src/service/alerts/incidents.rs:298-416`
+- 事故通知（无结果行数据）：`src/service/alerts/incidents.rs:298-416`
+
+### 9.6 重试逻辑
+- 最大重试次数配置：`src/infra/src/scheduler/mod.rs:235-237`
+- 评估失败重试：`src/service/alerts/scheduler/handlers.rs:741-800`
 
 ---
 
-## 9. 注意事项与设计权衡
+## 10. 理解偏差修正汇总
 
-### 9.1 企业版 vs OSS 版本差异
+| 之前的理解 | 实际代码实现 | 业务影响 |
+|-----------|-------------|---------|
+| 分组和去重是顺序执行 | 分组和去重是**互斥**分支，分组启用时不执行去重 | 分组时无法享受到去重的历史抑制能力 |
+| 延迟阈值 `min(1h, 频率×20%)` 有效 | `_get_max_considerable_delay()` 是**死代码**，从未调用 | 只要延迟超过一个周期就会跳过所有积压点 |
+| 事故关联合并所有结果行维度 | 只使用 `first_row` 提取维度，其他行维度被**完全忽略** | 多结果行时可能导致错误的事故聚合 |
+| 事故通知包含结果行数据 | 事故通知只有**事故元数据**，不包含任何告警结果行 | 接收方无法从事故通知中获取具体的告警数据 |
+| `notification_sent` 字段控制通知发送 | 该字段是**死字段**，从未被读取或更新 | 去重判断完全依赖时间窗口，与通知状态无关 |
+| 评估失败时指数退避重试 | 评估失败时 `retries+1` 重新排队，超过最大重试则跳到下一周期 | 没有退避，重试间隔等于调度频率 |
+
+---
+
+## 11. 注意事项与设计权衡
+
+### 11.1 企业版 vs OSS 版本差异
 - 历史去重、分组批处理、事故关联均为企业版特性
 - OSS 版本仅保留基础的告警评估和通知发送功能
 - 代码中大量使用 `#[cfg(feature = "enterprise")]` 条件编译
 
-### 9.2 分布式环境考虑
+### 11.2 分布式环境考虑
 - 告警管理器角色选举（`LOCAL_NODE.is_alert_manager()`）
 - 超级集群支持（`super_cluster.enabled`）
 - 分布式锁保护模板初始化
 - 触发器状态持久化到数据库
 
-### 9.3 可观测性
+### 11.3 可观测性
 - 完整的指标埋点（Prometheus 格式）
 - 详细的日志分级（DEBUG/INFO/WARN/ERROR）
 - 触发记录写入 `triggers` 流用于审计
 - Trace ID 贯穿整个评估链路
 
-### 9.4 容错设计
+### 11.4 容错设计
 - 去重失败时降级为不过滤，避免丢失告警
 - 事故关联失败时降级为直接通知
 - 部分目的地失败不影响其他目的地
-- 指数退避重试机制
+- 重试机制：评估失败时 retries+1 重新排队，超过最大重试则跳到下一周期
+
+### 11.5 潜在改进点
+1. **死代码清理**：删除未使用的 `_get_max_considerable_delay()` 函数和 `notification_sent` 字段
+2. **事故关联维度**：考虑使用所有结果行的维度并集，而非仅第一行
+3. **分组与去重整合**：分组时也能应用去重逻辑，避免重复告警
+4. **事故通知内容**：在事故通知中可选包含关键的告警结果行数据
+5. **智能延迟处理**：实际启用最大可接受延迟逻辑，避免过度跳过
