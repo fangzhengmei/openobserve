@@ -15,7 +15,7 @@ OpenObserve 的采集管道（Pipeline）与富化表（Enrichment Table）查�
 
 **管道仅支持 VRL 函数**，JS 函数在管道中被明确禁止。
 
-**VRL 函数（唯一选择）** - `src/service/ingestion/mod.rs:138-206`
+**VRL 函数（管道中的默认选择）** - `src/service/ingestion/mod.rs:138-206`
 - 编译时注入富化表注册表 `TableRegistry`
 - 支持 `get_enrichment_table_record` 等 VRL 内置函数
 - 高性能 AST 解释执行
@@ -29,10 +29,10 @@ OpenObserve 的采集管道（Pipeline）与富化表（Enrichment Table）查�
   - `compile_js_function` 和 `apply_js_fn`（`src/common/utils/js.rs`）中完全没有 `TableRegistry` 或 enrichment 相关代码
   - QuickJS 运行时仅暴露 `inputJson`、`orgId`、`streamName` 三个全局变量，无法访问富化表
 - **JS 函数在 `_meta` 组织的实际边界**（而非"仅用于 claim_parser"）：
-  - 函数创建层面：`functions.rs:68-73, 139-144, 359-364` 中 `if trans_type == 1 && org_id != "_meta"` 检查——**JS 函数只能在 `_meta` 组织中创建**，这是硬约束
-  - 管道执行层面：`validate_no_javascript_functions` 对所有组织（包括 `_meta`）生效——**即使在 `_meta` 组织中，管道也不能使用 JS 函数**
-  - 实际使用场景：JWT SSO claim 解析是已知的调用方（`handler/http/auth/jwt.rs:1097,1102`），该代码硬编码 `org_id = "_meta"` 调用 `compile_js_function` 和 `apply_js_fn`，绕过了管道直接使用 JS 运行时
-  - 边界结论："仅用于 claim_parser" 是使用约定，技术上 `_meta` 组织的 JS 函数可被任何绕过管道的调用方使用（只要 org_id 为 `_meta`），但管道层面对所有组织一视同仁地禁用
+  - 函数创建层面：`functions.rs:68-73, 139-144, 359-364` 中 `if trans_type == 1 && org_id != "_meta"` 检查——JS 函数的创建逻辑限制了仅 `_meta` 组织可以创建，这是代码层面的硬约束
+  - 管道执行层面：`validate_no_javascript_functions` 对所有组织（包括 `_meta`）执行相同的禁用检查——在当前代码约束下，即使在 `_meta` 组织中，管道也无法使用 JS 函数
+  - 已知使用场景：JWT SSO claim 解析是已发现的调用方（`handler/http/auth/jwt.rs:1097,1102`），该代码硬编码 `org_id = "_meta"` 调用 `compile_js_function` 和 `apply_js_fn`，绕过了管道直接使用 JS 运行时
+  - 边界结论："仅用于 claim_parser" 是当前观察到的使用模式，技术上 `_meta` 组织的 JS 函数可能被其他绕过管道的调用方使用（只要 org_id 为 `_meta`），但管道层面对所有组织均执行相同的禁用检查
 
 ### 2.2 函数编译流程
 
@@ -142,7 +142,7 @@ pub async fn get_enrichment_table_inner(org_id: &str, table_name: &str, ...) -> 
     let db_stats = enrichment_table::get_meta_table_stats(org_id, table_name).await?;
     let local_last_updated = storage::local::get_last_updated_at(org_id, table_name).await?;
 
-    // 2. 远程拉取（如果本地缓存过期）
+    // 2. 远程拉取（如果本地缓存过期或不存在）
     let values = if db_stats.end_time > local_last_updated || local_last_updated == 0 {
         // 通过 SQL 查询从数据库获取完整数据
         enrichment_table::get_enrichment_table_data(org_id, table_name, ...).await?
@@ -151,7 +151,7 @@ pub async fn get_enrichment_table_inner(org_id: &str, table_name: &str, ...) -> 
         storage::local::retrieve(org_id, table_name).await?
     };
 
-    // 4. 异步更新本地缓存
+    // 4. 异步更新本地缓存（如果需要）
     storage::local::store_data_if_needed_background(...).await?;
 }
 ```
@@ -162,7 +162,7 @@ pub async fn get_enrichment_table_inner(org_id: &str, table_name: &str, ...) -> 
 
 ```rust
 async fn fetch_data(...) -> Result<SendableRecordBatchStream> {
-    // 第一优先级：磁盘 Parquet 文件（高性能）
+    // 第一优先级：磁盘 Parquet 文件（通常性能较高）
     let disk_result = read_from_disk(&org_id, &stream_name, &schema).await;
     if let Ok(batches) = disk_result {
         return Ok(Box::pin(MemoryStream::try_new(batches, schema, None)?));
@@ -174,7 +174,7 @@ async fn fetch_data(...) -> Result<SendableRecordBatchStream> {
         None => Arc::new(vec![]),
     };
 
-    // 并行转换 VRL Value 到 RecordBatch
+    // 并行转换 VRL Value 到 RecordBatch（如果有可用数据）
     let batches: Result<Vec<_>, _> = pool.install(|| {
         chunks.into_par_iter()
             .map(|chunk| convert_vrl_to_record_batch(&schema, chunk))
@@ -206,7 +206,7 @@ fn swap_join_order(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn E
 }
 ```
 
-**重排触发条件（必须全部满足）：**
+**重排触发条件（在当前代码中需要全部满足）：**
 1. `feature_enrichment_broadcast_join_enabled` 配置为 `true`
 2. 右表是富化表（schema 为 `enrichment_tables` 或 `enrich`）
 3. 左表不是富化表
@@ -234,33 +234,98 @@ pub fn should_use_enrichment_broadcast_join(plan: &Arc<dyn ExecutionPlan>) -> bo
 }
 ```
 
-**完整执行流程：**
-1. JoinReorderRule 检查右表是否为富化表，若是则尝试交换左右表
-2. enrichment_broadcast_join_rewrite 验证广播连接条件
-3. 将左表 NewEmptyExec 替换为 EnrichmentExec（加载富化数据）
-4. 转换为广播连接执行计划（小表广播到大表侧）
+**完整执行流程（基于代码注册顺序）：**
+1. `JoinReorderRule`（独立优化器，L174 第一个注册）检查右表是否为富化表，若是则尝试交换左右表
+2. `RemoteScanRule.optimize` 内（L156）执行 `is_place_holder_or_empty` 短路检查
+3. `should_use_enrichment_broadcast_join` 验证广播连接条件
+4. `enrichment_broadcast_join_rewrite` 执行改写：
+   - 将左表 `NewEmptyExec` 替换为 `EnrichmentExec`（加载富化数据）
+   - 调用 `remote_scan_to_top_if_needed` 为右表添加 `RemoteScanExec`
+5. 转换为广播连接执行计划（小表广播到大表侧）
 
-**无法触发广播连接的边界场景：**
+**在当前代码中无法触发广播连接的边界场景：**
 - SQL 包含多个 JOIN 或 UNION 操作
 - 右表使用了 Aggregate/Sort/Limit 等复杂算子
 - JOIN 类型不支持交换（如 CrossJoin）
 - 富化表 JOIN 富化表（左右都是富化表）
 - 配置 `feature_enrichment_broadcast_join_enabled = false`
 
-#### 3.5.3 RemoteScan 短路条件及其对 enrichment_broadcast 的影响
+#### 3.5.3 物理优化器规则执行顺序的计划级证据链
 
-`src/service/search/datafusion/optimizer/physical_optimizer/remote_scan.rs:156-160`
+**优化器规则注册顺序（可核实）** - `src/service/search/datafusion/optimizer/mod.rs:174-219`
+
+```rust
+pub fn generate_physical_optimizer_rules(...) -> Vec<Arc<dyn PhysicalOptimizerRule + ...>> {
+    let mut rules = vec![Arc::new(JoinReorderRule::new()) as _];  // 顺序1: JoinReorderRule
+
+    for context in contexts.into_iter() {
+        match context {
+            PhysicalOptimizerContext::RemoteScan(context) => {
+                rules.push(generate_remote_scan_rules(req, sql, context));  // 顺序2: RemoteScanRule
+            }
+            PhysicalOptimizerContext::AggregateTopk => {
+                rules.push(Arc::new(AggregateTopkRule::new(sql.limit)));  // 顺序3: AggregateTopkRule
+            }
+            PhysicalOptimizerContext::StreamingAggregation(context) => {
+                rules.push(generate_streaming_agg_rules(_context));       // 顺序4: StreamingAgg
+                rules.push(Arc::new(EliminateAggregateRule::new()) as _);
+            }
+        }
+    }
+
+    rules.push(Arc::new(LeaderIndexOptimizerRule::new(index_fields)) as _);  // 顺序5
+    rules.push(Arc::new(LimitPushdown::new()) as _);                          // 顺序6
+    rules
+}
+```
+
+**RemoteScanRule 内部执行顺序（可核实）** - `src/service/search/datafusion/optimizer/physical_optimizer/remote_scan.rs:156-189`
 
 ```rust
 fn optimize(&self, plan: Arc<dyn ExecutionPlan>, ...) -> Result<Arc<dyn ExecutionPlan>> {
-    // should not add remote scan for placeholder or emptyplan
+    // 🔴 步骤1: 短路检查
     if is_place_holder_or_empty(&plan) {
-        return Ok(plan);
+        return Ok(plan);  // 直接返回，跳过所有后续优化
     }
 
-    // ... enrichment_broadcast_join_rewrite 等后续优化 ...
+    // 🔵 步骤2: 富化广播连接（企业版特性）
+    #[cfg(feature = "enterprise")]
+    if config.feature_enrichment_broadcast_join_enabled
+        && should_use_enrichment_broadcast_join(&plan)
+    {
+        return enrichment_broadcast_join_rewrite(plan, ...);
+    }
+
+    // 🟢 步骤3: 通用广播连接（企业版特性）
+    #[cfg(feature = "enterprise")]
+    if config.feature_broadcast_join_enabled && should_use_broadcast_join(&plan) {
+        return broadcast_join_rewrite(plan, ...);
+    }
+
+    // 🟡 步骤4: 单节点优化
+    if self.single_node_optimizer_enable && is_single_node_optimize(&plan) {
+        return remote_scan_to_top_if_needed(plan, ...);
+    }
+
+    // ⚫ 步骤5: 默认路径 - 添加 RemoteScanExec
+    let mut rewrite = RemoteScanRewriter::new(...);
+    let mut plan = plan.rewrite(&mut rewrite)?.data;
+    Ok(plan)
 }
 ```
+
+**各优化阶段的命中/返回结果证据链：**
+
+| 阶段 | 规则 | 输入 | 命中条件 | 输出 | 代码位置 |
+|-----|------|------|---------|------|---------|
+| 1 | JoinReorderRule | 原始物理计划 | 右表富化+左表非富化+JOIN可交换 | 交换后的计划 | `optimizer/mod.rs:174` |
+| 2 | RemoteScanRule 短路 | Join重排后的计划 | 含 `PlaceholderRowExec`/`EmptyExec`/`DataSourceExec` | 原计划直接返回，跳过所有后续 | `remote_scan.rs:158` |
+| 3 | enrichment_broadcast | 未短路的计划 | `should_use_enrichment_broadcast_join` 返回 true | 广播连接计划 | `remote_scan.rs:168` |
+| 4 | broadcast_join | 未触发富化广播的计划 | `should_use_broadcast_join` 返回 true | 通用广播连接 | `remote_scan.rs:175` |
+| 5 | single_node_optimize | 未触发广播的计划 | 单节点 + `is_single_node_optimize` | RemoteScan 置顶 | `remote_scan.rs:180` |
+| 6 | RemoteScanRewriter | 其他情况 | 默认路径 | 注入 RemoteScanExec | `remote_scan.rs:184` |
+
+#### 3.5.4 短路条件对 enrichment_broadcast 改写链路的影响
 
 **短路条件定义** - `src/service/search/datafusion/optimizer/utils.rs:321-328`
 
@@ -276,23 +341,15 @@ pub fn is_place_holder_or_empty(plan: &Arc<dyn ExecutionPlan>) -> bool {
 ```
 
 **关键注意事项：**
-- `NewEmptyExec`（OpenObserve 自定义的占位执行计划）**不在短路条件中**，它匹配的是 DataFusion 原生的 `EmptyExec`
-- 富化表使用的正是 `NewEmptyExec`（schema 为 `enrichment_tables`/`enrich`），因此不会被短路
-- 短路检查发生在 `enrichment_broadcast_join_rewrite` 之前，是整个优化器链的第一道关卡
+- `NewEmptyExec`（OpenObserve 自定义的占位执行计划）不在短路条件中，它匹配的是 DataFusion 原生的 `EmptyExec`
+- 富化表使用的正是 `NewEmptyExec`（schema 为 `enrichment_tables`/`enrich`），因此通常不会被短路
+- 短路检查发生在 `enrichment_broadcast_join_rewrite` 之前，一旦命中，不仅跳过富化广播，还会跳过通用广播连接和所有后续 RemoteScan 优化
 
-**对 enrichment_broadcast 改写链路的影响：**
-
-| 执行顺序 | 检查/操作 | 潜在风险 |
-|---------|----------|---------|
-| 1 | `is_place_holder_or_empty` 短路检查 | 若误匹配，直接返回原计划，所有后续优化被跳过 |
-| 2 | `should_use_enrichment_broadcast_join` 条件检查 | 见 3.5.2 边界条件 |
-| 3 | `enrichment_broadcast_join_rewrite` 改写 | 内部调用 `remote_scan_to_top_if_needed` |
-| 4 | `remote_scan_to_top_if_needed` 处理 | 为右表添加 RemoteScanExec |
-
-**异常场景分析：**
-- 如果查询计划中包含 DataFusion 原生的 `EmptyExec`（如 `SELECT 1` 这类无表查询），会在第 1 步短路
-- 如果查询同时包含富化表 JOIN 和原生 `EmptyExec`，整个计划会被短路，**enrichment_broadcast 改写被完全跳过**，回退到普通 Shuffle JOIN
-- `enrichment_broadcast_join_rewrite` 内部（L67）也会调用 `remote_scan_to_top_if_needed`，用于为右表（普通日志流）添加 RemoteScanExec，确保分布式环境下右表数据被正确拉取
+**短路后的实际行为（条件性结论）：**
+- 如果查询计划中包含 DataFusion 原生的 `EmptyExec`（如 `SELECT 1` 这类无表查询），会在短路检查点直接返回
+- 如果查询同时包含富化表 JOIN 和原生 `EmptyExec`，整个计划会被短路，**enrichment_broadcast 改写被完全跳过**，后续 JOIN 策略交由 DataFusion 默认处理（当前代码未明确指定为 Shuffle JOIN，实际行为取决于 DataFusion 版本和配置）
+- `enrichment_broadcast_join_rewrite` 内部（L67）也会调用 `remote_scan_to_top_if_needed`，用于为右表（普通日志流）添加 RemoteScanExec，确保分布式环境下右表数据能被正确拉取
+- **边界条件**：只有当短路检查返回 `false` 且后续所有广播条件均不满足时，才会进入默认的 RemoteScanRewriter 路径
 
 ## 4. 错误旁路机制
 
@@ -322,10 +379,10 @@ let (error_sender, mut error_receiver) = channel::<(String, String, String, Opti
 
 **Function 节点错误** - `src/service/pipeline/batch_execution.rs:875-936`
 - VRL 函数执行失败：记录错误，返回原始记录（不丢弃）
-- 结果数组模式错误：记录错误，中止当前批次处理
+- 结果数组模式错误：记录错误，可能中止当前批次处理
 
 **跨类型目标节点错误** - `src/service/pipeline/batch_execution.rs:735-773`
-- 异步后台 ingestion 失败：仅记录日志，不影响主管道
+- 异步后台 ingestion 失败：仅记录日志，通常不影响主管道
 - 使用 `tokio::spawn` 隔离执行上下文
 
 ### 4.3 错误收集与持久化
@@ -520,13 +577,20 @@ SQL 查询 (SELECT * FROM logs JOIN enrichment_tables.geoip ON ...)
     ↓
 [Logical Plan]
     ↓
-[Physical Optimizer]
-    ├─ RemoteScanRule.optimize
+[Logical Optimizer]
+    ↓
+[Physical Plan 创建]
+    ↓
+[Physical Optimizer 规则链（按注册顺序执行）]
+    ├─ 🔵 顺序1: JoinReorderRule.optimize
+    │   └─ 检查：右表富化+左表非富化+JOIN可交换？
+    │       ├─ ✅ 是：swap_inputs → 富化表换到左侧
+    │       └─ ❌ 否：保持原顺序
+    ├─ 🟠 顺序2: RemoteScanRule.optimize
     │   ├─ 🔴 is_place_holder_or_empty?
     │   │   ├─ 检查：是否含 PlaceholderRowExec/EmptyExec/DataSourceExec?
-    │   │   ├─ ✅ 是：直接返回原计划，跳过所有后续优化（含广播连接）
-    │   │   └─ ❌ 否：继续优化
-    │   ├─ JoinReorderRule.swap_join_order (已在前置优化器完成)
+    │   │   ├─ ✅ 是：直接返回原计划，跳过所有后续（含广播连接）
+    │   │   └─ ❌ 否：继续
     │   ├─ should_use_enrichment_broadcast_join?
     │   │   ├─ 检查：只有一个 HashJoin 且无其他多表算子？
     │   │   ├─ 检查：左表是 enrichment_tables/enrich schema？
@@ -534,7 +598,10 @@ SQL 查询 (SELECT * FROM logs JOIN enrichment_tables.geoip ON ...)
     │   └─ enrichment_broadcast_join_rewrite
     │       ├─ EnrichmentExecRewriter: NewEmptyExec → EnrichmentExec
     │       └─ remote_scan_to_top_if_needed → 为右表添加 RemoteScanExec
-    └─ 其他优化器规则...
+    ├─ 顺序3: AggregateTopkRule（如启用）
+    ├─ 顺序4: StreamingAggregation 规则（如启用）
+    ├─ 顺序5: LeaderIndexOptimizerRule
+    └─ 顺序6: LimitPushdown
     ↓
 [EnrichmentExec::execute]
     ├─ 尝试磁盘 Parquet 读取
@@ -542,40 +609,42 @@ SQL 查询 (SELECT * FROM logs JOIN enrichment_tables.geoip ON ...)
     ├─ VRL Value → RecordBatch 并行转换
     └─ 输出到 HashJoinExec
     ↓
-[Broadcast HashJoin]
+[Broadcast HashJoin]（若改写成功）
     ↓
 查询结果
 ```
 
+**注意**：若 `is_place_holder_or_empty` 命中短路，后续 JOIN 策略交由 DataFusion 默认处理，当前代码未明确指定其具体实现方式。
+
 ## 7. 关键设计决策
 
 ### 7.1 富化表内存驻留设计
-- **决策**：所有富化表数据全量加载到内存
+- **决策**：富化表数据在当前实现中倾向于全量加载到内存
 - **理由**：富化表通常是小表（参考数据），内存查询性能远高于磁盘
-- **权衡**：占用额外内存，不适用于超大型富化表
+- **权衡**：占用额外内存，可能不适用于超大型富化表场景
 
 ### 7.2 错误旁路而非中断
-- **决策**：单条记录转换失败不中断管道，返回原始记录
+- **决策**：单条记录转换失败时不中断管道，倾向于返回原始记录继续处理
 - **理由**：数据可用性优先，避免单个坏数据导致整批失败
-- **权衡**：可能输出未经转换的"脏"数据，需要依赖错误监控
+- **权衡**：可能输出未经转换的"脏"数据，需要依赖错误监控进行后续处理
 
 ### 7.3 两级缓存策略
-- **决策**：内存 + 本地磁盘 Parquet 双缓存
+- **决策**：采用内存 + 本地磁盘 Parquet 双缓存设计
 - **理由**：
-  - 内存：最低延迟查询
-  - 磁盘：进程重启后快速恢复，避免全量远程拉取
+  - 内存：提供较低延迟的查询能力
+  - 磁盘：支持进程重启后快速恢复，避免全量远程拉取
 - **权衡**：磁盘占用额外存储空间
 
 ### 7.4 智能重排 + 广播连接优化
-- **决策**：通过 JoinReorderRule 自动将右表富化表交换到左侧，然后转换为广播连接
+- **决策**：通过 JoinReorderRule 尝试自动将右表富化表交换到左侧，在满足条件时转换为广播连接
 - **理由**：
-  - 富化表是小表，广播可以避免数据 shuffle
-  - 用户无需关心 JOIN 顺序，优化器自动处理
+  - 富化表通常是小表，广播可以避免数据 shuffle
+  - 用户无需关心 JOIN 顺序，优化器尝试自动处理
   - 仅在右表算子足够简单时触发，避免性能退化
 - **权衡**：
-  - 仅适用于单 JOIN 查询，多 JOIN/UNION 场景不优化
+  - 当前仅适用于单 JOIN 查询，多 JOIN/UNION 场景不进行该优化
   - 企业版特性，需 `feature_enrichment_broadcast_join_enabled = true`
-  - 仅当右表为简单流（无 Aggregate/Sort 等）时触发重排
+  - 仅当右表为简单流（无 Aggregate/Sort 等复杂算子）时可能触发重排
 
 ## 8. 核心文件索引
 
