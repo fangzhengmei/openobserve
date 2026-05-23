@@ -21,10 +21,18 @@ OpenObserve 的采集管道（Pipeline）与富化表（Enrichment Table）查�
 - 高性能 AST 解释执行
 
 **JS 函数的限制** - `src/service/pipeline/mod.rs:38-64`
-- **管道中完全禁用 JS 函数**：`validate_no_javascript_functions` 在保存/更新管道时强制检查
-- JS 运行时（QuickJS）**没有注入富化表查询能力**：`compile_js_function` 和 `apply_js_fn` 中完全没有 `TableRegistry` 或 enrichment 相关代码
-- JS 函数仅用于 `_meta` 组织的 SSO claim 解析，不参与管道执行
-- QuickJS 运行时仅暴露 `inputJson`、`orgId`、`streamName` 三个全局变量，无法访问富化表
+- **管道层面：仅保存/更新阶段的门禁，执行路径仍保留完整能力**：
+  - `validate_no_javascript_functions` 在 `save_pipeline`（L89）和 `update_pipeline`（L137）时被调用，作为创建/修改管道的前置检查
+  - 但 `batch_execution.rs` 中保留了完整的 JS 执行路径：`register_functions`（L143）有 `if transform.is_js()` 分支，`process_batch`（L953, L1058）有 `CompiledFunctionRuntime::JS` 的完整处理逻辑
+  - 即：如果绕过门禁（如直接修改数据库），JS 函数在管道执行时仍能正常工作，这是防御性检查而非能力移除
+- **技术层面：JS 运行时没有注入富化表查询能力**：
+  - `compile_js_function` 和 `apply_js_fn`（`src/common/utils/js.rs`）中完全没有 `TableRegistry` 或 enrichment 相关代码
+  - QuickJS 运行时仅暴露 `inputJson`、`orgId`、`streamName` 三个全局变量，无法访问富化表
+- **JS 函数在 `_meta` 组织的实际边界**（而非"仅用于 claim_parser"）：
+  - 函数创建层面：`functions.rs:68-73, 139-144, 359-364` 中 `if trans_type == 1 && org_id != "_meta"` 检查——**JS 函数只能在 `_meta` 组织中创建**，这是硬约束
+  - 管道执行层面：`validate_no_javascript_functions` 对所有组织（包括 `_meta`）生效——**即使在 `_meta` 组织中，管道也不能使用 JS 函数**
+  - 实际使用场景：JWT SSO claim 解析是已知的调用方（`handler/http/auth/jwt.rs:1097,1102`），该代码硬编码 `org_id = "_meta"` 调用 `compile_js_function` 和 `apply_js_fn`，绕过了管道直接使用 JS 运行时
+  - 边界结论："仅用于 claim_parser" 是使用约定，技术上 `_meta` 组织的 JS 函数可被任何绕过管道的调用方使用（只要 org_id 为 `_meta`），但管道层面对所有组织一视同仁地禁用
 
 ### 2.2 函数编译流程
 
@@ -238,6 +246,53 @@ pub fn should_use_enrichment_broadcast_join(plan: &Arc<dyn ExecutionPlan>) -> bo
 - JOIN 类型不支持交换（如 CrossJoin）
 - 富化表 JOIN 富化表（左右都是富化表）
 - 配置 `feature_enrichment_broadcast_join_enabled = false`
+
+#### 3.5.3 RemoteScan 短路条件及其对 enrichment_broadcast 的影响
+
+`src/service/search/datafusion/optimizer/physical_optimizer/remote_scan.rs:156-160`
+
+```rust
+fn optimize(&self, plan: Arc<dyn ExecutionPlan>, ...) -> Result<Arc<dyn ExecutionPlan>> {
+    // should not add remote scan for placeholder or emptyplan
+    if is_place_holder_or_empty(&plan) {
+        return Ok(plan);
+    }
+
+    // ... enrichment_broadcast_join_rewrite 等后续优化 ...
+}
+```
+
+**短路条件定义** - `src/service/search/datafusion/optimizer/utils.rs:321-328`
+
+```rust
+pub fn is_place_holder_or_empty(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.exists(|plan| {
+        Ok(plan.name() == "PlaceholderRowExec"
+            || plan.name() == "EmptyExec"
+            || plan.name() == "DataSourceExec")
+    })
+    .unwrap_or(true)
+}
+```
+
+**关键注意事项：**
+- `NewEmptyExec`（OpenObserve 自定义的占位执行计划）**不在短路条件中**，它匹配的是 DataFusion 原生的 `EmptyExec`
+- 富化表使用的正是 `NewEmptyExec`（schema 为 `enrichment_tables`/`enrich`），因此不会被短路
+- 短路检查发生在 `enrichment_broadcast_join_rewrite` 之前，是整个优化器链的第一道关卡
+
+**对 enrichment_broadcast 改写链路的影响：**
+
+| 执行顺序 | 检查/操作 | 潜在风险 |
+|---------|----------|---------|
+| 1 | `is_place_holder_or_empty` 短路检查 | 若误匹配，直接返回原计划，所有后续优化被跳过 |
+| 2 | `should_use_enrichment_broadcast_join` 条件检查 | 见 3.5.2 边界条件 |
+| 3 | `enrichment_broadcast_join_rewrite` 改写 | 内部调用 `remote_scan_to_top_if_needed` |
+| 4 | `remote_scan_to_top_if_needed` 处理 | 为右表添加 RemoteScanExec |
+
+**异常场景分析：**
+- 如果查询计划中包含 DataFusion 原生的 `EmptyExec`（如 `SELECT 1` 这类无表查询），会在第 1 步短路
+- 如果查询同时包含富化表 JOIN 和原生 `EmptyExec`，整个计划会被短路，**enrichment_broadcast 改写被完全跳过**，回退到普通 Shuffle JOIN
+- `enrichment_broadcast_join_rewrite` 内部（L67）也会调用 `remote_scan_to_top_if_needed`，用于为右表（普通日志流）添加 RemoteScanExec，确保分布式环境下右表数据被正确拉取
 
 ## 4. 错误旁路机制
 
@@ -466,19 +521,20 @@ SQL 查询 (SELECT * FROM logs JOIN enrichment_tables.geoip ON ...)
 [Logical Plan]
     ↓
 [Physical Optimizer]
-    ├─ JoinReorderRule.swap_join_order
-    │   ├─ 检查：feature_enrichment_broadcast_join_enabled?
-    │   ├─ 检查：右表是富化表且左表不是？
-    │   ├─ 检查：JOIN 类型支持交换？
-    │   ├─ ✅ 是：HashJoinExec::swap_inputs → 富化表换到左侧
-    │   └─ ❌ 否：保持原顺序
-    ├─ should_use_enrichment_broadcast_join?
-    │   ├─ 检查：只有一个 HashJoin 且无其他多表算子？
-    │   ├─ 检查：左表是 enrichment_tables/enrich schema？
-    │   └─ 检查：右表仅含安全算子（Filter/Repartition 等）？
-    └─ enrichment_broadcast_join_rewrite
-        ├─ EnrichmentExecRewriter: NewEmptyExec → EnrichmentExec
-        └─ remote_scan_to_top_if_needed → 广播连接执行计划
+    ├─ RemoteScanRule.optimize
+    │   ├─ 🔴 is_place_holder_or_empty?
+    │   │   ├─ 检查：是否含 PlaceholderRowExec/EmptyExec/DataSourceExec?
+    │   │   ├─ ✅ 是：直接返回原计划，跳过所有后续优化（含广播连接）
+    │   │   └─ ❌ 否：继续优化
+    │   ├─ JoinReorderRule.swap_join_order (已在前置优化器完成)
+    │   ├─ should_use_enrichment_broadcast_join?
+    │   │   ├─ 检查：只有一个 HashJoin 且无其他多表算子？
+    │   │   ├─ 检查：左表是 enrichment_tables/enrich schema？
+    │   │   └─ 检查：右表仅含安全算子（Filter/Repartition 等）？
+    │   └─ enrichment_broadcast_join_rewrite
+    │       ├─ EnrichmentExecRewriter: NewEmptyExec → EnrichmentExec
+    │       └─ remote_scan_to_top_if_needed → 为右表添加 RemoteScanExec
+    └─ 其他优化器规则...
     ↓
 [EnrichmentExec::execute]
     ├─ 尝试磁盘 Parquet 读取
@@ -532,9 +588,12 @@ SQL 查询 (SELECT * FROM logs JOIN enrichment_tables.geoip ON ...)
 | 富化表提供者 | `src/service/search/datafusion/table_provider/enrich_table.rs` | DataFusion TableProvider 实现 |
 | 广播连接优化 | `src/service/search/datafusion/optimizer/physical_optimizer/enrichment.rs` | 富化 JOIN 条件验证、广播连接重写 |
 | JOIN 重排优化 | `src/service/search/datafusion/optimizer/physical_optimizer/join_reorder.rs` | 右表富化表自动交换左右顺序 |
+| RemoteScan 优化 | `src/service/search/datafusion/optimizer/physical_optimizer/remote_scan.rs` | 短路检查、分布式执行计划生成 |
+| 优化器工具 | `src/service/search/datafusion/optimizer/utils.rs` | is_place_holder_or_empty 等公共工具 |
 | 函数编译 | `src/common/utils/functions.rs` | VRL 编译器配置、富化表注册表 |
 | JS 运行时 | `src/common/utils/js.rs` | QuickJS 运行时（无富化表访问能力，管道禁用） |
-| 函数执行 | `src/service/ingestion/mod.rs` | VRL 函数编译与执行 |
+| 函数执行 | `src/service/ingestion/mod.rs` | VRL/JS 函数编译与执行（管道仅用 VRL） |
+| JWT 认证 | `src/handler/http/auth/jwt.rs` | SSO claim 解析（已知 JS 函数调用方） |
 | 错误持久化 | `src/service/db/pipeline_errors.rs` | 管道错误存储与查询 |
 | 管道缓存 | `src/service/db/pipeline.rs` | ExecutablePipeline 缓存管理 |
 | 全局配置 | `src/common/infra/config.rs` | ENRICHMENT_TABLES 等全局缓存 |
