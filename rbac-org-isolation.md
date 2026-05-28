@@ -380,7 +380,220 @@ HTTP 请求到达
 4. Handler 执行（业务逻辑）
 ```
 
-### 2.2 认证中间件入口
+### 2.2 认证分流：oo_validator_internal 的四大分支路径
+
+**核心文件：`src/handler/http/auth/validator.rs:880`**
+
+这是整个认证系统的核心分流点，根据 `auth_info.auth` 的前缀进行四层分支判断：
+
+```rust
+async fn oo_validator_internal(
+    req_data: &RequestData,
+    auth_info: &AuthExtractor,
+    path_prefix: &str,
+) -> Result<AuthValidationResult, AuthError> {
+    // 第一步：Session:: 前缀检测
+    let (is_from_session, auth_str) = if let Some(rest) = auth_info.auth.strip_prefix("Session::") {
+        // 格式: "Session::<session_id>::<actual_token>"
+        if let Some((_session_id, token)) = rest.split_once("::") {
+            (true, token.to_string())
+        } else {
+            (false, auth_info.auth.clone())
+        }
+    } else {
+        (false, auth_info.auth.clone())
+    };
+
+    // 第二步：四大认证分支分流
+    if let Some(info) = auth_str.strip_prefix("Basic ").map(str::trim) {
+        // ════════════════════════════════════════════════
+        // 分支 1: Basic 认证 (用户名:密码 Base64 编码)
+        // ════════════════════════════════════════════════
+        let decoded = match base64::decode(info) {
+            Ok(val) => val,
+            Err(_) => return Err(AuthError::Unauthorized("Unauthorized Access".to_string())),
+        };
+        let (username, password) = match get_user_details(&decoded) {
+            Some(value) => value,
+            None => return Err(AuthError::Unauthorized("Unauthorized Access".to_string())),
+        };
+        // Session 认证会设置 bypass_check = true，绕过后续权限检查
+        let mut modified_auth_info = auth_info.clone();
+        modified_auth_info.bypass_check = is_from_session || auth_info.bypass_check;
+        validator(
+            req_data,
+            &username,
+            &password,
+            &modified_auth_info,
+            path_prefix,
+        )
+        .await
+    } else if auth_str.starts_with("Bearer") {
+        // ════════════════════════════════════════════════
+        // 分支 2: Bearer Token 认证 (JWT/OAuth)
+        // ════════════════════════════════════════════════
+        log::debug!("Bearer token found");
+        super::token::token_validator(req_data, auth_info).await
+    } else if let Ok(auth_tokens) = config::utils::json::from_str::<AuthTokensExt>(&auth_info.auth) {
+        // ════════════════════════════════════════════════
+        // 分支 3: Auth Ext Token 认证 (前端扩展 token)
+        // ════════════════════════════════════════════════
+        log::debug!("Auth ext token found");
+        if auth_tokens.has_expired() {
+            // 🔴 Token 过期直接返回未授权
+            Err(AuthError::Unauthorized("Unauthorized Access".to_string()))
+        } else {
+            log::debug!("Auth ext token found: decoding");
+            let decoded = match base64::decode(
+                auth_tokens
+                    .auth_ext
+                    .strip_prefix("auth_ext")
+                    .unwrap()
+                    .trim(),
+            ) {
+                Ok(val) => val,
+                Err(_) => return Err(AuthError::Unauthorized("Unauthorized Access".to_string())),
+            };
+            let (username, password) = match get_user_details(&decoded) {
+                Some(value) => value,
+                None => return Err(AuthError::Unauthorized("Unauthorized Access".to_string())),
+            };
+            log::info!("Auth ext token found: validating: {username}");
+            validator(req_data, &username, &password, auth_info, path_prefix).await
+        }
+    } else {
+        // ════════════════════════════════════════════════
+        // 分支 4: 无法识别的认证方式
+        // ════════════════════════════════════════════════
+        Err(AuthError::Unauthorized("Unauthorized Access".to_string()))
+    }
+}
+```
+
+#### 2.2.1 四大认证分支详解
+
+| 分支 | 触发条件 | 处理逻辑 | 适用场景 |
+|------|---------|---------|---------|
+| **Basic 认证** | `auth_str.starts_with("Basic ")` | Base64 解码 → 提取 username:password → 调用 `validator()` | API 调用、脚本集成 |
+| **Bearer 认证** | `auth_str.starts_with("Bearer")` | 调用 `token_validator()` (企业版 JWT 验证，社区版直接返回 Not Supported) | SSO/OAuth 登录、Dex 集成 |
+| **Auth Ext 认证** | JSON 可解析为 `AuthTokensExt` | 先检查 `has_expired()` → 再解码 auth_ext → 提取 username:password → 调用 `validator()` | 前端 Web 界面会话 |
+| **Session 前缀** | `auth_str.starts_with("Session::")` | 解析 `Session::<session_id>::<token>` → 设置 `bypass_check = true` → 走 Basic 分支 | 登录态会话，绕过权限检查 |
+
+#### 2.2.2 Session Token 绕过权限检查的触发条件
+
+**触发条件（同时满足）：**
+1. `auth_info.auth` 以 `Session::` 为前缀
+2. 格式为 `Session::<session_id>::<actual_token>`，其中 `<actual_token>` 以 `Basic ` 开头
+3. 解析成功后设置 `modified_auth_info.bypass_check = is_from_session || auth_info.bypass_check`
+
+**效果：**
+- 在 `validator()` 函数中，`if auth_info.bypass_check || check_permissions(...)` 判断短路
+- `bypass_check = true` 时直接跳过 `check_permissions()` 调用
+- 等同于 Session 认证的请求绕过了 OpenFGA 细粒度权限检查
+
+#### 2.2.3 Auth Ext Token 过期判定
+
+**核心文件：`src/common/meta/user.rs:473`**
+
+```rust
+pub struct AuthTokensExt {
+    pub auth_ext: String,        // Base64 编码的 Basic 认证信息
+    pub refresh_token: String,   // 刷新 token
+    pub request_time: i64,       // token 获取时间（Unix 时间戳，秒）
+    pub expires_in: i64,         // 有效期（秒）
+}
+
+impl AuthTokensExt {
+    /// 检查 token 是否已过期
+    pub fn has_expired(&self) -> bool {
+        // 当前时间 - 请求时间 > 有效期？
+        chrono::Utc::now().timestamp() - self.request_time > self.expires_in
+    }
+}
+```
+
+**过期判定逻辑：**
+- `has_expired()` 在认证分流的**最开始**就被调用
+- 一旦过期，直接返回 `AuthError::Unauthorized`，不进行后续验证
+- 这是第一道防线，防止过期 token 消耗验证资源
+
+#### 2.2.4 Bearer Token 验证：企业版 vs 社区版分岔
+
+**核心文件：`src/handler/http/auth/token.rs:27/234`**
+
+**企业版实现（JWT 验证）：**
+```rust
+#[cfg(feature = "enterprise")]
+pub async fn token_validator(
+    req_data: &RequestData,
+    auth_info: &AuthExtractor,
+) -> Result<AuthValidationResult, AuthError> {
+    let user;
+    let keys = get_dex_jwks().await;  // 获取 Dex JWKS 公钥
+    // ... 解析路径 ...
+    
+    // 1. JWT 验证和解码
+    match jwt::verify_decode_token(
+        auth_info.auth.strip_prefix("Bearer").unwrap().trim(),
+        &keys,
+        &get_dex_config().client_id,
+        false,
+        login_flow,
+    ) {
+        Ok(res) => {
+            let user_id = &res.0.user_email;
+            if res.0.is_valid {
+                // 2. 根据路径类型获取用户信息
+                // - organizations/clusters 端点：从 _meta org 查找
+                // - member_subscription/invites：特殊处理
+                // - 普通端点：从 URL 中的 org_id 查找
+                // ...
+                match user {
+                    Some(user) => {
+                        // 3. 权限检查
+                        if auth_info.bypass_check
+                            || check_permissions(
+                                &user_email,
+                                auth_info.clone(),
+                                user_role.clone(),
+                                is_external,
+                            )
+                            .await
+                        {
+                            Ok(AuthValidationResult { /* ... */ })
+                        } else {
+                            Err(AuthError::Forbidden("Forbidden".to_string()))
+                        }
+                    }
+                    // 特殊场景允许无 DB 用户
+                    None if (is_list_invite_call || is_member_subscription || ...) => {
+                        Ok(AuthValidationResult { user_email: res.0.user_email.clone(), ... })
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+**社区版实现（直接返回不支持）：**
+```rust
+#[cfg(not(feature = "enterprise"))]
+pub async fn token_validator(
+    _req_data: &RequestData,
+    _token: &AuthExtractor,
+) -> Result<AuthValidationResult, AuthError> {
+    // 🟥 社区版直接返回 "Not Supported"，不支持 Bearer/JWT 认证
+    Err(AuthError::Unauthorized("Not Supported".to_string()))
+}
+```
+
+**⚠️ 关键注意：**
+- 社区版的 Bearer 认证直接返回 `AuthError::Unauthorized("Not Supported")`
+- 这意味着社区版只能使用 Basic 认证（用户名:密码）或 Auth Ext Token
+- Bearer/JWT 是企业版专属功能，用于 Dex SSO 集成
+
+### 2.3 认证中间件入口
 
 **核心文件：`src/handler/http/router/mod.rs`**
 
@@ -1343,6 +1556,296 @@ Handler 调用 check_permissions(object_id, org_id, user_id, object_type, method
 数据库查询强制过滤 org_id
     └─ .filter(Column::OrgId.eq(org_id))
 ```
+
+### 5.4 真实资源列表入口：Folders 完整调用链分析
+
+我们以 **Folders**（Dashboard/Alert/Report 文件夹）作为真实入口，完整分析 `list_objects_for_user` 到 org 过滤生效的全过程。
+
+#### 5.4.1 调用入口：HTTP Handler → Service Layer
+
+**API 路由定义：**
+```
+GET /api/{org_id}/folders/{folder_type}
+```
+
+**Handler 层调用 Service 层：**
+```rust
+// 伪代码：HTTP Handler 中调用
+list_folders(org_id, Some(user_id), folder_type).await
+```
+
+#### 5.4.2 Service 层：list_folders 函数
+
+**核心文件：`src/service/folders.rs:182`**
+
+```rust
+#[tracing::instrument()]
+pub async fn list_folders(
+    org_id: &str,
+    user_id: Option<&str>,
+    folder_type: FolderType,
+) -> Result<Vec<Folder>, FolderError> {
+    // 第一步：从 OpenFGA 获取用户有权限的文件夹列表
+    let permitted_folders = permitted_folders(org_id, user_id, folder_type).await?;
+    
+    // 第二步：从数据库获取该 org 下所有文件夹
+    let folders = table::folders::list_folders(org_id, folder_type).await?;
+    
+    // 第三步：根据 folder_type 确定 OpenFGA 模型 key
+    #[cfg(feature = "enterprise")]
+    let folder_ofga_model = match folder_type {
+        FolderType::Dashboards => OFGA_MODELS.get("folders").unwrap().key,
+        FolderType::Alerts => OFGA_MODELS.get("alert_folders").unwrap().key,
+        FolderType::Reports => OFGA_MODELS.get("report_folders").unwrap().key,
+    };
+    #[cfg(not(feature = "enterprise"))]
+    let folder_ofga_model = "";
+
+    // 第四步：根据 permitted_folders 过滤结果
+    let filtered = match permitted_folders {
+        Some(permitted_folders) => {
+            // 特殊权限：用户对该 org 下所有文件夹都有权限
+            if permitted_folders.contains(&format!("{folder_ofga_model}:_all_{org_id}")) {
+                folders  // 直接返回所有，不过滤
+            } else {
+                // 逐一遍历，只保留用户有权限的文件夹
+                folders
+                    .into_iter()
+                    .filter(|folder_loc| {
+                        permitted_folders
+                            .contains(&format!("{folder_ofga_model}:{}", folder_loc.folder_id))
+                    })
+                    .collect::<Vec<_>>()
+            }
+        }
+        // permitted_folders = None 表示不过滤（社区版或 OpenFGA 未启用）
+        None => folders,
+    };
+    
+    Ok(filtered)
+}
+```
+
+#### 5.4.3 关键分支：permitted_folders 函数（企业版 vs 社区版）
+
+**社区版实现（直接返回 None，不过滤）：**
+**核心文件：`src/service/folders.rs:299`**
+```rust
+#[cfg(not(feature = "enterprise"))]
+async fn permitted_folders(
+    _org_id: &str,
+    _user_id: Option<&str>,
+    _folder_type: FolderType,
+) -> Result<Option<Vec<String>>, FolderError> {
+    Ok(None)  // 🟢 直接返回 None，表示不进行权限过滤
+}
+```
+
+**企业版实现（两次调用 list_objects_for_user）：**
+**核心文件：`src/service/folders.rs:308`**
+```rust
+#[cfg(feature = "enterprise")]
+async fn permitted_folders(
+    org_id: &str,
+    user_id: Option<&str>,
+    folder_type: FolderType,
+) -> Result<Option<Vec<String>>, FolderError> {
+    // 根据 folder_type 确定对应的 OpenFGA 模型 key
+    let (folder_ofga_model, child_ofga_model) = match folder_type {
+        FolderType::Dashboards => (
+            OFGA_MODELS.get("folders").unwrap().key,        // "folder"
+            OFGA_MODELS.get("dashboards").unwrap().key,     // "dashboard"
+        ),
+        FolderType::Alerts => (
+            OFGA_MODELS.get("alert_folders").unwrap().key,  // "alert_folder"
+            OFGA_MODELS.get("alerts").unwrap().key,         // "alert"
+        ),
+        FolderType::Reports => (
+            OFGA_MODELS.get("report_folders").unwrap().key, // "report_folder"
+            OFGA_MODELS.get("reports").unwrap().key,        // "report"
+        ),
+    };
+
+    let Some(user_id) = user_id else {
+        return Err(FolderError::PermittedFoldersMissingUser);
+    };
+
+    // ════════════════════════════════════════════════════════════════
+    // 第一次调用 list_objects_for_user：获取用户有 GET 权限的文件夹
+    // ════════════════════════════════════════════════════════════════
+    let mut folder_list = crate::handler::http::auth::validator::list_objects_for_user(
+        org_id,
+        user_id,
+        "GET",                    // 权限动作
+        folder_ofga_model,        // 对象类型：folder / alert_folder / report_folder
+    )
+    .await
+    .map_err(|err| FolderError::PermittedFoldersValidator(err.to_string()))?;
+
+    // ════════════════════════════════════════════════════════════════
+    // 第二次调用 list_objects_for_user：通过子资源反推文件夹权限
+    // ════════════════════════════════════════════════════════════════
+    // 场景：用户可能没有直接对 Folder 的 GET 权限，但对 Folder 下的某个 Dashboard 有权限
+    // 这种情况下也应该能看到该 Folder
+    let permitted_dashboards = crate::handler::http::auth::validator::list_objects_for_user(
+        org_id,
+        user_id,
+        "GET_INDIVIDUAL_FROM_ROLE",  // 特殊权限动作
+        child_ofga_model,            // 子对象类型：dashboard / alert / report
+    )
+    .await
+    .map_err(|err| FolderError::PermittedFoldersValidator(err.to_string()))?;
+
+    // 从 dashboard ID 中提取 folder ID
+    // dashboard ID 格式："dashboard:{folder_id}/{dashboard_id}"
+    if let Some(permitted_dashboards) = permitted_dashboards {
+        let mut folder_list_with_roles = vec![];
+        for dashboard in permitted_dashboards {
+            let Some((_, folder_id)) = dashboard.split_once(":") else {
+                continue;
+            };
+            // 从 "folder_id/dashboard_id" 中提取 folder_id
+            let Some((folder_id, _)) = folder_id.split_once("/") else {
+                continue;
+            };
+            folder_list_with_roles.push(format!("{folder_ofga_model}:{folder_id}"));
+        }
+        // 合并两次查询结果
+        if let Some(folder_list) = folder_list.as_mut() {
+            folder_list.extend(folder_list_with_roles);
+        } else {
+            folder_list = Some(folder_list_with_roles);
+        }
+    }
+
+    Ok(folder_list)
+}
+```
+
+#### 5.4.4 深入：list_objects_for_user 函数内部逻辑
+
+**核心文件：`src/handler/http/auth/validator.rs:1115`**
+
+```rust
+#[cfg(feature = "enterprise")]
+pub(crate) async fn list_objects_for_user(
+    org_id: &str,
+    user_id: &str,
+    permission: &str,      // e.g. "GET", "GET_INDIVIDUAL_FROM_ROLE"
+    object_type: &str,     // e.g. "folder", "dashboard"
+) -> Result<Option<Vec<String>>, AuthError> {
+    let openfga_config = get_openfga_config();
+    
+    // ════════════════════════════════════════════════════════════════
+    // 三大触发条件（同时满足才进行过滤）：
+    // 1. 用户不是 Root
+    // 2. OpenFGA 已启用
+    // 3. list_only_permitted 配置为 true
+    // ════════════════════════════════════════════════════════════════
+    if !is_root_user(user_id) && openfga_config.enabled && openfga_config.list_only_permitted {
+        // 获取用户在该 org 下的角色
+        let role = match users::get_user(Some(org_id), user_id).await {
+            Some(user) => user.role.to_string(),
+            None => "".to_string(),
+        };
+        
+        // 调用 OpenFGA list_objects API
+        match list_objects(user_id, permission, object_type, org_id, &role).await {
+            Ok(resp) => Ok(Some(resp)),  // 返回用户有权限的对象 ID 列表
+            Err(_) => Err(AuthError::Forbidden("Unauthorized Access".to_string())),
+        }
+    } else {
+        // 不满足过滤条件 → 返回 None，表示不进行权限过滤
+        Ok(None)
+    }
+}
+
+// 社区版空实现（永远返回 None）
+#[cfg(not(feature = "enterprise"))]
+pub(crate) async fn list_objects_for_user(
+    _org_id: &str,
+    _user_id: &str,
+    _permission: &str,
+    _object_type: &str,
+) -> Result<Option<Vec<String>>, AuthError> {
+    Ok(None)
+}
+```
+
+#### 5.4.5 数据库层：org_id 过滤生效
+
+**核心文件：`src/infra/src/table/folders.rs:235`**
+
+```rust
+async fn list_models(
+    db: &DatabaseConnection,
+    org_id: &str,
+    folder_type: FolderType,
+) -> Result<Vec<Model>, sea_orm::DbErr> {
+    Entity::find()
+        // 🟢 org 级隔离第一道防线：WHERE org = ?
+        .filter(Column::Org.eq(org_id))
+        // 🟢 类型过滤：WHERE type = ?
+        .filter(Column::Type.eq(folder_type_into_i16(folder_type)))
+        .order_by(Column::Id, sea_orm::Order::Asc)
+        .all(db)
+        .await
+}
+```
+
+#### 5.4.6 完整调用时序图
+
+```
+HTTP Request: GET /api/{org_id}/folders/dashboards
+    │
+    ├─ auth_middleware 验证通过
+    │   └─ user_id 插入请求头
+    │
+    ▼
+service::folders::list_folders(org_id, Some(user_id), Dashboards)
+    │
+    ├─ permitted_folders(org_id, user_id, Dashboards)
+    │   │
+    │   ├─ 【社区版】→ 返回 Ok(None)  ←───────┐
+    │   │                                       │
+    │   └─ 【企业版】                           │
+    │       ├─ 第 1 次 list_objects_for_user(  │
+    │       │    org_id, user_id,              │
+    │       │    "GET", "folder")              │
+    │       │   ├─ 三条件检查？                 │
+    │       │   │   ├─ !is_root_user(user_id)? │
+    │       │   │   ├─ openfga.enabled?        │
+    │       │   │   └─ list_only_permitted?    │
+    │       │   ├─ 全部满足？                   │
+    │       │   │   ├─ 是 → OpenFGA list_objects → 返回 Vec<String>
+    │       │   │   └─ 否 → 返回 Ok(None)  ────┘
+    │       │
+    │       └─ 第 2 次 list_objects_for_user(
+    │            org_id, user_id,
+    │            "GET_INDIVIDUAL_FROM_ROLE", "dashboard")
+    │            └─ 同上逻辑
+    │
+    ├─ table::folders::list_folders(org_id, Dashboards)
+    │   └─ list_models(db, org_id, folder_type)
+    │       └─ Entity::find()
+    │           ├─ .filter(Column::Org.eq(org_id))  ← org 级过滤
+    │           └─ .filter(Column::Type.eq(...))
+    │
+    └─ 结果过滤
+        ├─ permitted_folders = Some(list)？
+        │   ├─ 包含 "_all_{org_id}"？→ 全部返回
+        │   └─ 否则 → filter 只保留匹配的 folder_id
+        └─ permitted_folders = None？→ 全部返回
+```
+
+#### 5.4.7 过滤生效的四大关键节点
+
+| 节点 | 位置 | 过滤逻辑 | 说明 |
+|------|------|---------|------|
+| **节点 1** | `list_objects_for_user` 入口 | 三条件检查 | `!is_root && openfga.enabled && list_only_permitted` 必须同时为 true |
+| **节点 2** | OpenFGA `list_objects` | 返回用户有权限的对象 ID 列表 | 只有通过检查才会调用 OpenFGA |
+| **节点 3** | 数据库 `list_models` | `WHERE org = ?` | 无论权限如何，数据库层始终按 org_id 过滤 |
+| **节点 4** | Service 层 `filter()` | 匹配 folder_id | 将数据库结果与 OpenFGA 结果做交集 |
 
 ---
 
