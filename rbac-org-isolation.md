@@ -491,6 +491,93 @@ async fn oo_validator_internal(
 - `bypass_check = true` 时直接跳过 `check_permissions()` 调用
 - 等同于 Session 认证的请求绕过了 OpenFGA 细粒度权限检查
 
+#### 2.2.2.1 Session:: bypass_check 的实际应用范围
+
+**核心文件：`src/common/utils/auth.rs:1273-1335`**
+
+**Session Token 的生成场景：**
+
+Session:: 前缀的 token 是在 `extract_auth_str_from_headers` / `extract_auth_str_from_parts` 函数中生成的，用于从 session 存储中解析出的 token。
+
+```rust
+// 从 Cookie 或 Authorization 头中解析 "session <key>"
+if access_token.starts_with("session") {
+    let session_key = access_token.strip_prefix("session ").unwrap().to_string();
+    match crate::service::db::session::get(&session_key).await {
+        Ok(token) => {
+            // 检查 token 是否已有认证前缀
+            if token.starts_with("Basic ") || token.starts_with("Bearer ") {
+                // ⚠️ 关键：仅当 session 存储的 token 以 Basic 开头时，
+                // 才会包装成 Session:: 格式来触发 bypass_check
+                format!("Session::{}::{}", session_key, token)
+            } else {
+                // session 存储的是纯 JWT，加上 Bearer 前缀
+                // ⚠️ 这种情况不会触发 bypass_check！
+                format!("Bearer {}", token)
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to resolve session '{}': {}", session_key, e);
+            access_token
+        }
+    }
+}
+```
+
+**bypass_check 触发范围的关键限制：**
+
+| 场景 | 原始 token 格式 | 包装后格式 | 是否触发 bypass_check |
+|------|----------------|-----------|----------------------|
+| **Cookie Session + Basic** | `Basic dXNlcjpwYXNz` | `Session::<key>::Basic dXNlcjpwYXNz` | ✅ **是** |
+| **Cookie Session + Bearer** | `Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...` | `Session::<key>::Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...` | ❌ **否**（走 Bearer 分支） |
+| **Cookie Session + 纯 JWT** | `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...` | `Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...` | ❌ **否**（走 Bearer 分支） |
+| **Authorization: session ...** | 同上 | 同上 | 同上 |
+| **直接 Basic 认证** | `Basic dXNlcjpwYXNz` | 不变 | ❌ **否**（走 Basic 分支） |
+| **直接 Bearer 认证** | `Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...` | 不变 | ❌ **否**（走 Bearer 分支） |
+
+**代码分支验证：**
+
+```rust
+// 在 oo_validator_internal 中
+let (is_from_session, auth_str) = if let Some(rest) = auth_info.auth.strip_prefix("Session::") {
+    if let Some((_session_id, token)) = rest.split_once("::") {
+        (true, token.to_string())  // is_from_session = true
+    } else {
+        (false, auth_info.auth.clone())
+    }
+} else {
+    (false, auth_info.auth.clone())
+};
+
+// 然后根据 auth_str 的前缀进行分支
+if let Some(info) = auth_str.strip_prefix("Basic ").map(str::trim) {
+    // ═══════════════════════════════════════════
+    // Basic 分支：仅这里会使用 is_from_session
+    // ═══════════════════════════════════════════
+    let mut modified_auth_info = auth_info.clone();
+    modified_auth_info.bypass_check = is_from_session || auth_info.bypass_check;
+    validator(..., &modified_auth_info, ...).await
+} else if auth_str.starts_with("Bearer") {
+    // ═══════════════════════════════════════════
+    // Bearer 分支：完全忽略 is_from_session
+    // ═══════════════════════════════════════════
+    // 直接调用 token_validator，不传递 is_from_session
+    // bypass_check 保持 auth_info.bypass_check 的原始值
+    super::token::token_validator(req_data, auth_info).await
+} else if let Ok(auth_tokens) = ... {
+    // ═══════════════════════════════════════════
+    // Auth Ext 分支：完全忽略 is_from_session
+    // ═══════════════════════════════════════════
+    validator(..., auth_info, ...).await  // 使用原始 auth_info
+}
+```
+
+**⚠️ 关键结论：**
+1. **仅 Basic 分支会触发 bypass_check**：Bearer 和 Auth Ext 分支都忽略 `is_from_session` 标志
+2. **Session Token 类型决定**：只有 session 存储的是 `Basic ` 前缀的 token 时，才会触发 bypass_check
+3. **Bearer Token 走自己的权限检查**：即使来自 Session，Bearer Token 仍会经过 `token_validator` → `check_permissions` 的完整检查
+4. **设计意图**：Basic 认证通常用于服务账号或脚本，通过 Session 包装后绕过细粒度检查；Bearer 用于用户登录态，需要完整权限校验
+
 #### 2.2.3 Auth Ext Token 过期判定
 
 **核心文件：`src/common/meta/user.rs:473`**
@@ -592,6 +679,118 @@ pub async fn token_validator(
 - 社区版的 Bearer 认证直接返回 `AuthError::Unauthorized("Not Supported")`
 - 这意味着社区版只能使用 Basic 认证（用户名:密码）或 Auth Ext Token
 - Bearer/JWT 是企业版专属功能，用于 Dex SSO 集成
+
+#### 2.2.5 Bearer 特殊通路：MCP、member_subscription、invites
+
+**核心文件：`src/handler/http/auth/token.rs:47-177`**
+
+在 Bearer 认证流程中，有三个特殊场景会绕过常规的用户存在性检查和 org 绑定检查。这些是为了支持特定的业务流程而设计的权限旁路。
+
+##### 2.2.5.1 MCP (Model Context Protocol) 特殊通路
+
+**触发条件（满足任一即可）：**
+```rust
+// 条件 1：路径匹配 /api/{org_id}/mcp/...
+let is_mcp_endpoint = path_columns.get(1).map(|s| *s == "mcp").unwrap_or(false);
+
+// 条件 2：请求头包含 x-o2-mcp: true
+let has_mcp_header = req_data
+    .headers
+    .get("x-o2-mcp")
+    .and_then(|v| v.to_str().ok())
+    .map(|v| v == "true")
+    .unwrap_or_default();
+
+let is_mcp_request = is_mcp_endpoint || has_mcp_header;
+```
+
+**特殊处理：**
+1. **跳过 JWT audience 验证**：`login_flow = !is_mcp_request`，允许动态客户端的 MCP 请求
+2. **允许不存在的用户**：`allow_nonexistent_user = is_mcp_request`
+3. **用户不存在也放行**：在最终匹配中，`None if allow_nonexistent_user` 直接通过认证
+
+**Org 绑定边界：**
+- MCP 请求**不检查**用户是否属于 URL 路径中的 org
+- 只验证 JWT 签名有效，user_email 从 token 中提取
+- 实际的 org 权限检查需要在下游 Handler 中自行处理
+
+##### 2.2.5.2 member_subscription 特殊通路
+
+**触发条件：**
+```rust
+let is_member_subscription = path_columns
+    .get(1)
+    .is_some_and(|p| p.eq(&"member_subscription"));
+```
+
+**设计背景（代码注释）：**
+> for member sub i.e. invitation, we must check user directly from db, because
+> the else-arm here will check if user is present in given org. However before
+> accepting the invitation, user will not be added to the org,
+> hence getting unauthorized error. Thus we add a check that for
+> member_subscription, check the user directly from db users,
+> not particularly associated with any org
+
+**特殊处理：**
+1. **用户查找方式**：走 `organizations/clusters` 分支，直接查 `db::user::get_db_user(user_id)`
+2. **用户不存在也放行**：`None if is_member_subscription` 直接通过认证
+3. **不绑定特定 org**：用户可以在未加入组织的情况下访问成员订阅接口
+
+**Org 绑定边界：**
+- 完全绕过 org 绑定检查
+- 用户即使不属于任何组织也能访问
+- 用于处理邀请流程（用户接受邀请前还未加入组织）
+
+##### 2.2.5.3 invites 特殊通路
+
+**触发条件：**
+```rust
+let is_list_invite_call = path_columns.len() <= 2
+    && path_columns.first().is_some_and(|p| p.eq(&"invites"))
+    && (auth_info.method.eq("GET") || auth_info.method.eq("DELETE"));
+```
+
+**设计背景（代码注释）：**
+> this is for /invites call, which is only based on user, similar to
+> member subscription. Furthermore, because we are listing the invites of
+> that particular user only, we can skip other checks, and allow listing
+
+**特殊处理：**
+1. **路径限制**：仅 `/invites` 或 `/{org_id}/invites`（路径深度 ≤ 2）
+2. **方法限制**：仅 GET 和 DELETE 方法
+3. **用户查找方式**：走 `organizations/clusters` 分支
+4. **用户不存在也放行**：`None if is_list_invite_call` 直接通过认证
+
+**Org 绑定边界：**
+- 完全绕过 org 绑定检查
+- 新用户首次加入平台时，DB 中可能还没有用户记录
+- 仅根据 JWT 中的 user_email 进行邀请列表过滤
+
+##### 2.2.5.4 特殊通路放行汇总
+
+| 场景 | 触发条件 | 用户存在性检查 | Org 绑定检查 | 典型用途 |
+|------|---------|---------------|-------------|---------|
+| **MCP** | `x-o2-mcp` 头 或 `/mcp/` 路径 | ❌ 跳过 | ❌ 跳过 | AI Agent 模型上下文协议 |
+| **member_subscription** | 路径含 `/member_subscription` | ❌ 跳过 | ❌ 跳过 | 接受组织邀请 |
+| **invites** | `/invites` + GET/DELETE | ❌ 跳过 | ❌ 跳过 | 查看/删除邀请列表 |
+| **organizations LIST** | `/organizations` + LIST 方法 | ❌ 跳过 | ❌ 跳过 | 列出用户所属组织 |
+| **常规请求** | 其他所有路径 | ✅ 必须存在 | ✅ 必须绑定 | 普通 API 调用 |
+
+##### 2.2.5.5 特殊通路的权限返回
+
+所有特殊通路在用户不存在时返回的认证结果：
+```rust
+Ok(AuthValidationResult {
+    user_email: res.0.user_email.clone(),  // 从 JWT 提取的邮箱
+    user_role: None,                       // ⚠️ 角色为空
+    is_internal_user: false,               // ⚠️ 标记为外部用户
+})
+```
+
+**⚠️ 安全注意：**
+- 这些通路返回 `user_role: None`，下游 Handler 需要自行处理无角色的情况
+- `check_permissions` 函数在 `user_role = None` 时行为取决于具体实现
+- 建议在 Handler 层针对这些特殊端点做额外的安全校验
 
 ### 2.3 认证中间件入口
 
@@ -1397,23 +1596,93 @@ pub(crate) async fn list_objects_for_user(...) -> Result<Option<Vec<String>>, Au
 }
 ```
 
-#### 分岔点 6：扩展凭证验证
+#### 分岔点 6：扩展凭证验证（validate_credentials_ext）
 
-**文件：`src/handler/http/auth/validator.rs:453/630`**
+**文件：`src/handler/http/auth/validator.rs:453/629`**
 
+**企业版完整实现：**
 ```rust
-// 企业版完整实现
 #[cfg(feature = "enterprise")]
-pub async fn validate_credentials_ext(...) -> Result<TokenValidationResponse, AuthError> {
-    // 完整的 SSO/OAuth 验证逻辑
-}
+pub async fn validate_credentials_ext(
+    user_id: &str,
+    in_password: &str,      // 哈希后的密码
+    path: &str,
+    auth_token: AuthTokensExt,
+    method: &str,
+) -> Result<TokenValidationResponse, AuthError> {
+    let password_ext_salt = cfg.auth.ext_auth_salt.as_str();
+    
+    // 1. 根据路径确定用户查找方式
+    let user = if path_columns.last().unwrap_or(&"").eq(&"organizations") {
+        // organizations 端点：优先从 _meta org 查找
+        let db_user = db::user::get_db_user(user_id).await;
+        // ... 从 all_users 中找 _meta org 的用户
+    } else {
+        // 普通路径：从 URL 中的 org_id 查找
+        users::get_user(Some(org_id), user_id).await
+    };
 
-// 社区版空实现
-#[cfg(not(feature = "enterprise"))]
-pub async fn validate_credentials_ext(...) -> Result<TokenValidationResponse, AuthError> {
-    Err(AuthError::Unauthorized("Feature not available".to_string()))
+    // 2. 用户不存在直接返回
+    if user.is_none() {
+        return Ok(TokenValidationResponse::default());
+    }
+    let user = user.unwrap();
+
+    // 3. 密码哈希验证（双层哈希）
+    let hashed_pass = get_hash(
+        &format!(
+            "{}{}",
+            get_hash(
+                &format!("{}{}", user.password_ext.unwrap(), auth_token.request_time),
+                password_ext_salt
+            ),
+            auth_token.expires_in
+        ),
+        password_ext_salt,
+    );
+    if !hashed_pass.eq(&in_password) {
+        return Ok(TokenValidationResponse::default());
+    }
+
+    // 4. 用户管理端点权限检查
+    if !path.contains("/user")
+        || (path.contains("/user")
+            && (user.role.eq(&UserRole::Admin)
+                || user.role.eq(&UserRole::Root)
+                || user.email.eq(user_id)))
+    {
+        Ok(TokenValidationResponse {
+            is_valid: true,
+            user_email: user.email,
+            is_internal_user: !user.is_external,
+            user_role: Some(user.role),
+            // ...
+        })
+    } else {
+        Err(AuthError::Forbidden("Not allowed".to_string()))
+    }
 }
 ```
+
+**社区版实现（直接禁止）：**
+```rust
+#[cfg(not(feature = "enterprise"))]
+pub async fn validate_credentials_ext(
+    _user_id: &str,
+    _in_password: &str,
+    _path: &str,
+    _auth_token: AuthTokensExt,
+    _method: &str,
+) -> Result<TokenValidationResponse, AuthError> {
+    // 🟥 社区版直接返回 Forbidden，完全不支持扩展凭证
+    Err(AuthError::Forbidden("Not allowed".to_string()))
+}
+```
+
+**关键差异说明：**
+- 企业版使用 `password_ext` 字段进行双层哈希验证（配合 `request_time` 和 `expires_in`）
+- 社区版直接返回 Forbidden，不支持此认证方式
+- 扩展凭证主要用于前端 Web 界面的短期会话认证
 
 #### 分岔点 7：组织重命名权限
 
