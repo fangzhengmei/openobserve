@@ -80,32 +80,63 @@ pub struct UserRoleRequest {
 }
 ```
 
-**角色转换逻辑：**
+### 1.4 数据库持久层 - org_users 表（关键修正！）
+
+**数据库实体定义：`src/infra/src/table/entity/org_users.rs`**
+
 ```rust
-impl From<&UserRoleRequest> for UserOrgRole {
-    fn from(role: &UserRoleRequest) -> Self {
-        let standard_role = get_roles()
-            .into_iter()
-            .find(|user_role| user_role.to_string().eq_ignore_ascii_case(&role.role));
-
-        let custom_role = if let Some(role) = role.custom.as_ref() {
-            Some(role.clone())
-        } else if standard_role.is_none() {
-            Some(vec![role.role.clone()])
-        } else {
-            None
-        };
-
-        let base_role = standard_role.unwrap_or_else(get_default_user_role);
-
-        UserOrgRole { base_role, custom_role }
-    }
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
+#[sea_orm(table_name = "org_users")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: String,              // 主键：KSUID (27字符)
+    pub email: String,           // 用户邮箱
+    pub org_id: String,          // 组织 ID
+    pub role: i16,               // 角色编码
+    pub token: String,           // 访问 token
+    pub rum_token: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub allow_static_token: bool,
 }
 ```
 
-### 1.4 数据库持久层 - org_users 表
+**数据库迁移文件：`src/infra/src/table/migration/m20241227_000300_create_org_users_table.rs`**
 
-**核心文件：`src/infra/src/table/org_users.rs`**
+**⚠️ 重要修正：主键与唯一性约束的真实实现**
+
+```sql
+-- 1. 主键：单独的 id 字段（KSUID，27字符），不是复合主键
+CREATE TABLE IF NOT EXISTS "org_users" (
+    "id" char(27) NOT NULL PRIMARY KEY,    -- 主键：KSUID
+    "email" varchar(100) NOT NULL,
+    "org_id" varchar(256) NOT NULL,
+    "role" smallint NOT NULL,
+    "token" varchar(256) NOT NULL,
+    "rum_token" varchar(256),
+    "created_at" bigint NOT NULL,
+    "updated_at" bigint NOT NULL,
+    -- 外键约束
+    CONSTRAINT "org_users_org_id_fk" FOREIGN KEY ("org_id") REFERENCES "organizations" ("identifier"),
+    CONSTRAINT "org_users_user_email_fk" FOREIGN KEY ("email") REFERENCES "users" ("email")
+);
+
+-- 2. 唯一性约束：通过唯一索引实现，注意顺序是 (email, org_id)！
+CREATE UNIQUE INDEX IF NOT EXISTS "org_users_id_email_idx" ON "org_users" ("email", "org_id");
+
+-- 3. rum_token 普通索引（非唯一）
+CREATE INDEX IF NOT EXISTS "org_users_rum_token_idx" ON "org_users" ("rum_token");
+```
+
+**主键 ID 生成逻辑：`src/config/src/ider.rs:65`**
+
+```rust
+pub fn uuid() -> String {
+    Ksuid::new(None, None).to_string()  // 生成 27 字符的 KSUID
+}
+```
+
+**数据库记录结构：`src/infra/src/table/org_users.rs`**
 
 ```rust
 #[derive(Debug, Clone)]
@@ -120,29 +151,136 @@ pub struct OrgUserRecord {
 }
 ```
 
-**数据库操作（核心文件：`src/service/db/org_users.rs`）：**
+### 1.5 数据库操作 - CRUD 实现
+
+**核心文件：`src/infra/src/table/org_users.rs`**
+
+#### 1.5.1 添加用户到组织（add_with_flags）
 
 ```rust
-// 添加用户到组织
-pub async fn add(org_id: &str, user_email: &str, role: UserRole, token: &str, rum_token: Option<String>) -> Result<(), anyhow::Error>
+pub async fn add_with_flags(
+    org_id: &str,
+    user_email: &str,
+    role: UserRole,
+    token: &str,
+    rum_token: Option<String>,
+    allow_static_token: bool,
+) -> Result<(), errors::Error> {
+    let now = chrono::Utc::now().timestamp_micros();
+    let role: i16 = role.into();
+    let record = ActiveModel {
+        org_id: Set(org_id.to_string()),
+        email: Set(user_email.to_string()),
+        role: Set(role),
+        token: Set(token.to_string()),
+        rum_token: Set(rum_token),
+        created_at: Set(now),
+        updated_at: Set(now),
+        id: Set(ider::uuid()),  // 生成 KSUID 作为主键
+        allow_static_token: Set(allow_static_token),
+    };
 
-// 更新用户在组织中的角色
-pub async fn update(org_id: &str, user_email: &str, role: UserRole, token: &str, rum_token: Option<String>) -> Result<(), anyhow::Error>
+    let _lock = get_lock().await;  // SQLite 写入锁
+    let client = ORM_CLIENT.get_or_init(connect_to_orm).await;
 
-// 从组织中移除用户
-pub async fn remove(org_id: &str, user_email: &str) -> Result<(), anyhow::Error>
-
-// 获取用户在组织中的记录
-pub async fn get(org_id: &str, user_email: &str) -> Result<OrgUserRecord, anyhow::Error>
-
-// 列出用户所属的所有组织
-pub async fn list_orgs_by_user(user_email: &str) -> Result<Vec<UserOrgExpandedRecord>, anyhow::Error>
-
-// 列出组织中的所有用户
-pub async fn list_users_by_org(org_id: &str) -> Result<Vec<OrgUserRecord>, anyhow::Error>
+    match Entity::insert(record).exec(client).await {
+        Ok(_) => Ok(()),
+        Err(e) => match e.sql_err() {
+            // ⚠️ 幂等性处理：唯一约束冲突时静默成功
+            Some(SqlErr::UniqueConstraintViolation(_)) => Ok(()),
+            _ => Err(Error::DbError(DbError::SeaORMError(e.to_string()))),
+        },
+    }
+}
 ```
 
-### 1.5 缓存层设计
+#### 1.5.2 更新用户在组织中的角色（update）
+
+```rust
+pub async fn update(
+    org_id: &str,
+    email: &str,
+    role: UserRole,
+    token: &str,
+    rum_token: Option<String>,
+) -> Result<(), errors::Error> {
+    let client = ORM_CLIENT.get_or_init(connect_to_orm).await;
+    // 注释明确说明：There can be only one record with one org_id and email.
+    Entity::update_many()
+        .col_expr(Column::Role, Expr::value(role as i16))
+        .col_expr(Column::Token, Expr::value(token.to_string()))
+        .col_expr(Column::RumToken, Expr::value(rum_token))
+        .col_expr(Column::UpdatedAt, Expr::value(chrono::Utc::now().timestamp_micros()))
+        .filter(Column::OrgId.eq(org_id))
+        // email 大小写不敏感匹配
+        .filter(Expr::expr(Func::lower(Expr::col(Column::Email))).eq(email.to_lowercase()))
+        .exec(client)
+        .await
+        .map_err(|e| Error::DbError(DbError::SeaORMError(e.to_string())))?;
+    Ok(())
+}
+```
+
+#### 1.5.3 按组织和用户查询（get）
+
+```rust
+pub async fn get(org_id: &str, email: &str) -> Result<OrgUserRecord, errors::Error> {
+    let client = ORM_CLIENT.get_or_init(connect_to_orm).await;
+    let record = Entity::find()
+        .filter(Column::OrgId.eq(org_id))
+        .filter(Expr::expr(Func::lower(Expr::col(Column::Email))).eq(email.to_lowercase()))
+        .one(client)
+        .await
+        .map_err(|e| Error::DbError(DbError::SeaORMError(e.to_string())))?
+        .ok_or_else(|| Error::DbError(DbError::SeaORMError("User not found".to_string())))?;
+    Ok(OrgUserRecord::from(record))
+}
+```
+
+#### 1.5.4 列出用户所属的所有组织（list_orgs_by_user）
+
+```rust
+pub async fn list_orgs_by_user(email: &str) -> Result<Vec<UserOrgExpandedRecord>, errors::Error> {
+    let client = ORM_CLIENT.get_or_init(connect_to_orm).await;
+    let records = Entity::find()
+        .filter(Expr::expr(Func::lower(Expr::col((Entity, Column::Email)))).eq(email.to_lowercase()))
+        .order_by(Column::CreatedAt, Order::Desc)
+        .inner_join(super::entity::organizations::Entity)  // JOIN 组织表获取 org_name
+        .select_only()
+        .column(Column::Email)
+        .column(Column::OrgId)
+        .column(Column::Role)
+        .column(Column::Token)
+        .column(Column::RumToken)
+        .column(Column::CreatedAt)
+        .column(organizations::Column::OrgName)
+        .column(organizations::Column::OrgType)
+        .column(Column::AllowStaticToken)
+        .into_model::<UserOrgExpandedRecord>()
+        .all(client)
+        .await
+        .map_err(|e| Error::DbError(DbError::SeaORMError(e.to_string())))?;
+    Ok(records)
+}
+```
+
+#### 1.5.5 按 org_id 删除用户（remove）
+
+```rust
+pub async fn remove(org_id: &str, email: &str) -> Result<(), errors::Error> {
+    let _lock = get_lock().await;
+    let client = ORM_CLIENT.get_or_init(connect_to_orm).await;
+    Entity::delete_many()
+        .filter(Column::OrgId.eq(org_id))
+        .filter(Expr::expr(Func::lower(Expr::col(Column::Email))).eq(email.to_lowercase()))
+        .exec(client)
+        .await
+        .map_err(|e| Error::DbError(DbError::SeaORMError(e.to_string())))?;
+    Ok(())
+}
+```
+
+### 1.6 缓存层设计
 
 **核心文件：`src/service/db/org_users.rs`**
 
@@ -182,7 +320,67 @@ pub fn get_cached_user_org(org_id: &str, user_email: &str) -> Option<User> {
 
 ## 二、API 层权限上下文切换实现
 
-### 2.1 认证中间件入口
+### 2.1 完整调用链路（按代码执行顺序）
+
+```
+HTTP 请求到达
+    ↓
+1. auth_middleware (router/mod.rs)
+   ├─ 提取 RequestData（同步，确保 Future Send）
+   └─ AuthExtractor::from_request_parts
+       ├─ 从 Authorization 头提取凭证
+       ├─ 从 URL 路径提取 org_id（如 /api/{org_id}/streams）
+       ├─ 解析资源类型（streams/dashboards/alerts 等）
+       └─ 解析 HTTP 方法（GET/POST/PUT/DELETE）
+    ↓
+2. oo_validator (auth/validator.rs:1011)
+   └─ oo_validator_internal (auth/validator.rs:120)
+       ├─ 提取 user_id 和 password
+       ├─ 调用 validate_credentials (auth/validator.rs:227)
+       │   ├─ 从 URL 解析 org_id
+       │   ├─ is_root_user(user_id)？Root 用户用 DEFAULT_ORG 查询
+       │   ├─ users::get_user(Some(org_id), user_id)
+       │   │   ├─ get_cached_user_org(org_id, user_id)（先查缓存）
+       │   │   └─ db::user::get(Some(org_id), user_id)（缓存未命中查 DB）
+       │   ├─ 用户不存在？尝试 license 特殊处理
+       │   ├─ ServiceAccount token 验证（检查 allow_static_token）
+       │   ├─ Token 验证（token == password）
+       │   ├─ 【企业版分岔点1】native_login_enabled / root_only_login 检查
+       │   └─ 密码验证（get_hash + 比对）
+       │
+       ├─ 凭证验证通过？→ 调用 check_and_create_org (auth/validator.rs:579)
+       │   ├─ 解析 URL，跳过 node/profile 前缀
+       │   ├─ org 已存在？直接通过
+       │   ├─ org 不存在？
+       │   │   ├─ create_org_through_ingestion 未开启？→ 返回 404
+       │   │   ├─ 是 Root 用户 + POST + 摄入端点？
+       │   │   │   └─ service::organization::check_and_create_org(org_id)
+       │   │   │       ├─ organizations::add() 写入数据库
+       │   │   │       ├─ put_into_db_coordinator 同步
+       │   │   │       └─ 【企业版分岔点2】save_org_tuples(org_id) → OpenFGA
+       │   │   └─ 其他情况 → 返回 404
+       │   └─ org 存在或创建成功 → 继续
+       │
+       ├─ 【企业版分岔点3】Viewer 角色自我更新特殊处理
+       │
+       └─ 调用 check_permissions (auth/validator.rs:1035/1092)
+           ├─ auth_info.bypass_check？直接通过
+           ├─ 【企业版】
+           │   ├─ OpenFGA 未启用？直接通过
+           │   ├─ block_feature_for_report_failure？直接通过
+           │   ├─ role == Root？直接通过
+           │   ├─ 创建组织场景？用 META_ORG 检查
+           │   └─ o2_openfga::authorizer::authz::is_allowed(
+           │          org_id, user_id, method, obj_str, parent_id, role)
+           └─ 【社区版】
+               └─ 直接返回 true（所有认证用户都有权限）
+    ↓
+3. 权限验证通过 → user_id 插入请求头
+    ↓
+4. Handler 执行（业务逻辑）
+```
+
+### 2.2 认证中间件入口
 
 **核心文件：`src/handler/http/router/mod.rs`**
 
@@ -218,74 +416,252 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
 }
 ```
 
-### 2.2 认证信息提取器
+### 2.3 认证信息提取器
 
 **核心文件：`src/common/utils/auth.rs`**
 
 ```rust
 #[derive(Clone, Debug)]
 pub struct AuthExtractor {
-    pub auth: String,
-    pub method: String,
-    pub o2_type: String,
-    pub org_id: String,
-    pub bypass_check: bool,
-    pub parent_id: String,
+    pub auth: String,           // Authorization 头内容
+    pub method: String,         // HTTP 方法: GET/POST/PUT/DELETE
+    pub o2_type: String,        // 资源类型: streams:default/logs
+    pub org_id: String,         // 组织 ID（从 URL 提取）
+    pub bypass_check: bool,     // 是否绕过权限检查
+    pub parent_id: String,      // 父资源 ID
 }
 ```
 
-**提取逻辑：**
-- 从 HTTP 头 `Authorization`、`X-Forwarded-User` 等提取认证信息
-- 从 URL 路径中提取 `org_id`（如 `/api/{org_id}/...`）
-- 从 URL 路径中提取资源类型（如 `streams`、`dashboards` 等）
-- 解析 HTTP 方法（GET/POST/PUT/DELETE）
-
-### 2.3 认证验证器
+### 2.4 认证验证器
 
 **核心文件：`src/handler/http/auth/validator.rs`**
 
 ```rust
-pub async fn validator(
+pub async fn oo_validator_internal(
     req_data: &RequestData,
-    user_id: &str,
-    password: &str,
     auth_info: &AuthExtractor,
     path_prefix: &str,
 ) -> Result<AuthValidationResult, AuthError> {
-    // 1. 验证凭证
-    let res = validate_credentials(user_id, password.trim(), path, auth_info.bypass_check).await?;
+    // ... 提取 user_id 和 password ...
 
-    if res.is_valid {
-        // 2. 检查并创建组织（如果需要）
-        check_and_create_org(user_id, &req_data.method, path).await?;
+    match validate_credentials(user_id, password.trim(), path, auth_info.bypass_check).await {
+        Ok(res) => {
+            if res.is_valid {
+                // 检查并创建组织（如果需要）
+                check_and_create_org(user_id, &req_data.method, path).await?;
 
-        // 3. 权限检查
-        if auth_info.bypass_check
-            || check_permissions(
-                &res.user_email,
-                auth_info.clone(),
-                res.user_role.clone().unwrap_or(get_default_user_role()),
-                !res.is_internal_user,
-            )
-            .await
-        {
-            Ok(AuthValidationResult {
-                user_email: res.user_email,
-                user_role: res.user_role,
-                is_internal_user: res.is_internal_user,
-            })
-        } else {
-            Err(AuthError::Forbidden("Unauthorized Access".to_string()))
+                #[cfg(feature = "enterprise")]
+                { /* Viewer 角色自我更新特殊处理 */ }
+
+                if auth_info.bypass_check
+                    || check_permissions(
+                        &res.user_email,
+                        auth_info.clone(),
+                        res.user_role.clone().unwrap_or(get_default_user_role()),
+                        !res.is_internal_user,
+                    )
+                    .await
+                {
+                    Ok(AuthValidationResult {
+                        user_email: res.user_email,
+                        user_role: res.user_role,
+                        is_internal_user: res.is_internal_user,
+                    })
+                } else {
+                    Err(AuthError::Forbidden("Unauthorized Access".to_string()))
+                }
+            } else {
+                Err(AuthError::Unauthorized("Unauthorized Access".to_string()))
+            }
         }
-    } else {
-        Err(AuthError::Unauthorized("Invalid Credentials".to_string()))
+        Err(err) => Err(err),
     }
 }
 ```
 
-### 2.4 权限检查 - 企业版（OpenFGA 集成）
+### 2.5 凭证验证（validate_credentials）
 
-**核心文件：`src/handler/http/auth/validator.rs`**
+**核心文件：`src/handler/http/auth/validator.rs:227`**
+
+```rust
+pub async fn validate_credentials(
+    user_id: &str,
+    user_password: &str,
+    path: &str,
+    from_session: bool,
+) -> Result<TokenValidationResponse, AuthError> {
+    // 1. 从 URL 路径解析 org_id
+    let path_columns = path.split('/').collect::<Vec<&str>>();
+
+    // 2. 根据 org_id 获取用户信息
+    let user = if path_columns.last().unwrap_or(&"").eq(&"organizations") {
+        // organizations 端点特殊处理：优先从 _meta org 查找
+        db::user::get_db_user(user_id).await.ok().and_then(|db_user| {
+            let all_users = db_user.get_all_users();
+            all_users.iter()
+                .find(|u| u.org == config::META_ORG_ID)
+                .cloned()
+                .or_else(|| all_users.first().cloned())
+        })
+    } else {
+        match path.find('/') {
+            Some(index) => {
+                let org_id = if path_columns.len() > 1 && path_columns[0].eq(V2_API_PREFIX) {
+                    path_columns[1]
+                } else {
+                    &path[0..index]
+                };
+                if is_root_user(user_id) {
+                    users::get_user(Some(DEFAULT_ORG), user_id).await
+                } else {
+                    users::get_user(Some(org_id), user_id).await
+                }
+            }
+            None => users::get_user(None, user_id).await,
+        }
+    };
+
+    // 3. ServiceAccount token 验证
+    if user.role.is_service_account() && user.token.eq(&user_password) {
+        if !config.auth.service_account_enabled {
+            return Ok(TokenValidationResponse { is_valid: false, .. });
+        }
+        // 检查 allow_static_token（非会话 token）
+        if !from_session
+            && let Ok(org_user) = db::org_users::get(&user.org, &user.email).await
+            && !org_user.allow_static_token
+        {
+            return Ok(TokenValidationResponse { is_valid: false, .. });
+        }
+        return Ok(build_token_validation_response(&user));
+    }
+
+    // 4. 普通 token 验证
+    if (path_columns.len() == 1 || INGESTION_EP.iter().any(|s| path_columns.contains(s)))
+        && user.token.eq(&user_password)
+    {
+        return Ok(build_token_validation_response(&user));
+    }
+
+    // 5. 【企业版分岔点】原生登录限制
+    #[cfg(feature = "enterprise")]
+    {
+        if !get_dex_config().native_login_enabled && !user.is_external {
+            return Ok(TokenValidationResponse { is_valid: false, .. });
+        }
+        if get_dex_config().root_only_login && !is_root_user(user_id) {
+            return Ok(TokenValidationResponse { is_valid: false, .. });
+        }
+    }
+
+    // 6. 密码验证
+    let in_pass = get_hash(user_password, &user.salt);
+    if !user.password.eq(&in_pass)
+        && !user.password_ext.unwrap_or("".to_string()).eq(&user_password)
+    {
+        return Ok(TokenValidationResponse { is_valid: false, .. });
+    }
+
+    // 7. 用户管理端点权限检查
+    if !path.contains("/user")
+        || (path.contains("/user")
+            && (user.role.eq(&UserRole::Admin)
+                || user.role.eq(&UserRole::Root)
+                || user.email.eq(user_id)))
+    {
+        Ok(TokenValidationResponse { is_valid: true, .. })
+    } else {
+        Err(AuthError::Forbidden("Not allowed".to_string()))
+    }
+}
+```
+
+### 2.6 自动创建组织（check_and_create_org）
+
+**核心文件：`src/handler/http/auth/validator.rs:579`**
+
+```rust
+async fn check_and_create_org(user_id: &str, method: &Method, path: &str) -> Result<(), AuthError> {
+    let cfg = get_config();
+    let path_columns = path.split('/').collect::<Vec<&str>>();
+
+    // 跳过 node/profile 前缀
+    if path_columns[0].eq("node") || path_columns[0].eq("profile") {
+        return Ok(());
+    }
+
+    // 解析 org_id
+    let org_id = if path_columns.len() > 2 && path_columns[0].eq("v2") {
+        path_columns[1]
+    } else {
+        path_columns[0]
+    };
+
+    // 检查 org 是否已存在
+    match get_org(org_id).await {
+        Ok(_) => Ok(()),  // org 存在，直接通过
+        Err(_) => {
+            if !cfg.common.create_org_through_ingestion {
+                Err(AuthError::NotFound("Organization not found".to_string()))
+            } else if is_root_user(user_id)
+                && method.eq(&Method::POST)
+                && INGESTION_EP.contains(&path_columns[url_len - 1])
+                && crate::service::organization::check_and_create_org(org_id).await.is_ok()
+            {
+                Ok(())  // Root 用户通过摄入端点自动创建 org
+            } else {
+                Err(AuthError::NotFound("Organization not found".to_string()))
+            }
+        }
+    }
+}
+```
+
+**组织创建服务层：`src/service/organization.rs:555`**
+
+```rust
+pub async fn check_and_create_org(org_id: &str) -> Result<Organization, anyhow::Error> {
+    if let Some(org) = get_org(org_id).await {
+        return Ok(org);
+    }
+
+    let org = &Organization {
+        identifier: org_id.to_owned(),
+        name: org_id.to_owned(),
+        org_type: if org_id.eq(DEFAULT_ORG) { DEFAULT_ORG } else { CUSTOM }.to_owned(),
+        service_account: None,
+    };
+
+    match db::organization::save_org(org).await {
+        Ok(_) => {
+            save_org_tuples(&org.identifier).await;  // 【企业版】同步到 OpenFGA
+            #[cfg(feature = "cloud")]
+            enqueue_cloud_event(CloudEvent { /* ... */ }).await;
+            Ok(org.clone())
+        }
+        Err(e) => Err(anyhow::anyhow!("Error creating org: {}", e)),
+    }
+}
+```
+
+**社区版无 OFGA 版本：**
+
+```rust
+pub async fn check_and_create_org_without_ofga(org_id: &str) -> Result<Organization, anyhow::Error> {
+    if let Some(org) = get_org(org_id).await {
+        return Ok(org);
+    }
+    let org = &Organization { /* ... */ };
+    match db::organization::save_org(org).await {
+        Ok(_) => Ok(org.clone()),  // 不调用 save_org_tuples
+        Err(e) => Err(anyhow::anyhow!("Error creating org: {}", e)),
+    }
+}
+```
+
+### 2.7 权限检查 - 企业版（OpenFGA 集成）
+
+**核心文件：`src/handler/http/auth/validator.rs:1035`**
 
 ```rust
 #[cfg(feature = "enterprise")]
@@ -295,50 +671,65 @@ pub(crate) async fn check_permissions(
     role: UserRole,
     _is_external: bool,
 ) -> bool {
-    // 如果 OpenFGA 未启用，直接通过
+    // 1. OpenFGA 未启用？直接通过
     if !get_openfga_config().enabled {
         return true;
     }
 
-    // Root 用户绕过检查
-    if role.eq(&UserRole::Root) {
+    // 2. 报表失败时临时绕过
+    if block_feature_for_report_failure().await {
         return true;
     }
 
-    // 处理特殊场景：创建组织时使用 META_ORG 进行检查
-    let org_id = if auth_info.org_id.eq("organizations") {
-        if auth_info.method.eq("POST") {
-            config::META_ORG_ID
-        } else {
-            user_id
-        }
-    } else {
-        &auth_info.org_id
-    };
-
-    // 替换资源 ID 中的占位符
+    // 3. 替换资源 ID 中的占位符
     let obj_str = if auth_info.o2_type.contains("##user_id##") {
         auth_info.o2_type.replace("##user_id##", user_id)
     } else {
         auth_info.o2_type
     };
 
-    // 调用 OpenFGA 进行细粒度权限检查
+    // 4. Root 用户绕过所有检查
+    if role.eq(&UserRole::Root) {
+        return true;
+    }
+
+    // 5. 创建组织场景：用 _meta org 检查
+    let role_str = if auth_info.org_id.eq("organizations") && auth_info.method.eq("POST") {
+        match ORG_USERS.get(&format!("{}/{user_id}", config::META_ORG_ID)) {
+            Some(user) => format!("{}", user.role),
+            None => "".to_string(),
+        }
+    } else {
+        format!("{role}")
+    };
+
+    // 6. 确定检查用的 org_id
+    let org_id = if auth_info.org_id.eq("organizations") {
+        if auth_info.method.eq("POST") {
+            config::META_ORG_ID  // 创建组织用 _meta 检查
+        } else {
+            user_id  // 其他组织操作用 user_id 检查
+        }
+    } else {
+        &auth_info.org_id
+    };
+
+    // 7. 调用 OpenFGA 进行细粒度权限检查
     o2_openfga::authorizer::authz::is_allowed(
         org_id,
         user_id,
         &auth_info.method,
         &obj_str,
         &auth_info.parent_id,
-        &role.to_string(),
+        &role_str,
     )
     .await
 }
 ```
 
-### 2.5 权限检查 - 社区版
+### 2.8 权限检查 - 社区版
 
-**核心文件：`src/handler/http/auth/validator.rs`**
+**核心文件：`src/handler/http/auth/validator.rs:1092`**
 
 ```rust
 #[cfg(not(feature = "enterprise"))]
@@ -352,7 +743,36 @@ pub(crate) async fn check_permissions(
 }
 ```
 
-### 2.6 细粒度权限检查工具函数
+### 2.9 资源列表权限过滤
+
+**核心文件：`src/handler/http/auth/validator.rs:1115`**
+
+```rust
+#[cfg(feature = "enterprise")]
+pub(crate) async fn list_objects_for_user(
+    org_id: &str,
+    user_id: &str,
+    permission: &str,
+    object_type: &str,
+) -> Result<Option<Vec<String>>, AuthError> {
+    let openfga_config = get_openfga_config();
+    // 非 Root 用户 + OpenFGA 启用 + list_only_permitted 开启 → 过滤
+    if !is_root_user(user_id) && openfga_config.enabled && openfga_config.list_only_permitted {
+        let role = match users::get_user(Some(org_id), user_id).await {
+            Some(user) => user.role.to_string(),
+            None => "".to_string(),
+        };
+        match list_objects(user_id, permission, object_type, org_id, &role).await {
+            Ok(resp) => Ok(Some(resp)),  // 返回用户有权限的对象 ID 列表
+            Err(_) => Err(AuthError::Forbidden("Unauthorized Access".to_string())),
+        }
+    } else {
+        Ok(None)  // 返回 None 表示不过滤（显示所有）
+    }
+}
+```
+
+### 2.10 细粒度权限检查工具函数
 
 **核心文件：`src/common/utils/auth.rs`**
 
@@ -379,7 +799,9 @@ pub async fn check_permissions(
             AuthExtractor {
                 auth: "".to_string(),
                 method: method.to_string(),
-                o2_type: format!("{}:{}", OFGA_MODELS.get(object_type).map_or(object_type, |model| model.key), object_id),
+                o2_type: format!("{}:{}",
+                    OFGA_MODELS.get(object_type).map_or(object_type, |model| model.key),
+                    object_id),
                 org_id: org_id.to_string(),
                 bypass_check: false,
                 parent_id: parent_id.unwrap_or("").to_string(),
@@ -390,35 +812,6 @@ pub async fn check_permissions(
         .await;
     }
     true
-}
-```
-
-### 2.7 资源列表权限过滤
-
-**核心文件：`src/handler/http/auth/validator.rs`**
-
-```rust
-#[cfg(feature = "enterprise")]
-pub(crate) async fn list_objects_for_user(
-    org_id: &str,
-    user_id: &str,
-    permission: &str,
-    object_type: &str,
-) -> Result<Option<Vec<String>>, AuthError> {
-    let openfga_config = get_openfga_config();
-    if !is_root_user(user_id) && openfga_config.enabled && openfga_config.list_only_permitted {
-        let role = match users::get_user(Some(org_id), user_id).await {
-            Some(user) => user.role.to_string(),
-            None => "".to_string(),
-        };
-        // 从 OpenFGA 获取用户有权限访问的对象列表
-        match list_objects(user_id, permission, object_type, org_id, &role).await {
-            Ok(resp) => Ok(Some(resp)),
-            Err(_) => Err(AuthError::Forbidden("Unauthorized Access".to_string())),
-        }
-    } else {
-        Ok(None)  // 返回 None 表示不过滤（显示所有）
-    }
 }
 ```
 
@@ -440,7 +833,7 @@ pub struct Organization {
     #[serde(alias = "label")]
     pub name: String,             // 组织显示名称
     #[serde(default)]
-    pub org_type: String,
+    pub org_type: String,         // default / custom
     #[serde(default)]
     pub service_account: Option<String>,
 }
@@ -453,7 +846,7 @@ pub struct Organization {
 ```rust
 #[derive(Debug, Clone)]
 pub struct OrganizationRecord {
-    pub identifier: String,       // org_id
+    pub identifier: String,       // org_id（主键）
     pub org_name: String,
     pub org_type: OrganizationType,
     pub created_at: i64,
@@ -461,12 +854,67 @@ pub struct OrganizationRecord {
     #[cfg(feature = "cloud")]
     pub trial_ends_at: i64,
 }
+```
 
-// 数据库操作
-pub async fn add(org_id: &str, org_name: &str, org_type: OrganizationType) -> Result<(), errors::Error>
-pub async fn get(org_id: &str) -> Result<OrganizationRecord, errors::Error>
-pub async fn list(filter: ListFilter) -> Result<Vec<OrganizationRecord>, errors::Error>
-pub async fn delete(org_id: &str) -> Result<(), errors::Error>
+#### 3.2.1 添加组织
+
+```rust
+pub async fn add(
+    org_id: &str,
+    org_name: &str,
+    org_type: OrganizationType,
+) -> Result<(), errors::Error> {
+    let now = chrono::Utc::now().timestamp_micros();
+    let record = ActiveModel {
+        identifier: Set(org_id.to_string()),  // 主键：用户指定的 org_id
+        org_name: Set(org_name.to_string()),
+        org_type: Set(org_type.into()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        #[cfg(feature = "cloud")]
+        trial_ends_at: Set(now + day_micros(15)),
+    };
+
+    let _lock = get_lock().await;
+    let client = ORM_CLIENT.get_or_init(connect_to_orm).await;
+
+    match Entity::insert(record).exec(client).await {
+        Ok(_) => {
+            let mut cache = CACHE.write().await;
+            cache.insert(org_id.to_string(), org);
+            Ok(())
+        }
+        Err(e) => match e.sql_err() {
+            // 幂等性：唯一约束冲突时静默成功
+            Some(SqlErr::UniqueConstraintViolation(_)) => Ok(()),
+            _ => Err(Error::DbError(DbError::SeaORMError(e.to_string()))),
+        },
+    }
+}
+```
+
+#### 3.2.2 获取组织
+
+```rust
+pub async fn get(org_id: &str) -> Result<OrganizationRecord, errors::Error> {
+    // 先查缓存
+    if let Some(v) = CACHE.read().await.get(org_id) {
+        return Ok(v.clone());
+    }
+    // 缓存未命中查数据库
+    let client = ORM_CLIENT.get_or_init(connect_to_orm).await;
+    let model = Entity::find()
+        .filter(Column::Identifier.eq(org_id))  // 按 org_id 过滤
+        .one(client)
+        .await
+        .map_err(|e| Error::DbError(DbError::SeaORMError(e.to_string())))?
+        .ok_or_else(|| Error::DbError(DbError::SeaORMError("Org not found".to_string())))?;
+
+    let record = OrganizationRecord::from(model);
+    // 更新缓存
+    CACHE.write().await.insert(org_id.to_string(), record.clone());
+    Ok(record)
+}
 ```
 
 ### 3.3 组织设置隔离
@@ -529,49 +977,41 @@ pub async fn get_user(org_id: Option<&str>, name: &str) -> Option<User> {
 }
 ```
 
-### 3.5 数据库查询的组织过滤
+### 3.5 数据库查询的组织过滤（通用模式）
 
-**核心文件：`src/infra/src/table/org_users.rs`**
+所有数据库查询都必须带上 org_id 条件，以下是典型模式：
 
 ```rust
-// 按组织和用户查询（双条件过滤）
-pub async fn get(org_id: &str, user_email: &str) -> Result<OrgUserRecord, Error> {
-    let client = ORM_CLIENT.get_or_init(connect_to_orm).await;
-    let model = Entity::find()
-        .filter(Column::OrgId.eq(org_id))       // org_id 过滤
-        .filter(Column::Email.eq(user_email))   // user_email 过滤
-        .one(client)
-        .await
-        .map_err(|e| Error::DbError(DbError::SeaORMError(e.to_string())))?;
-    // ...
-}
+// 模式1：按 org_id 过滤
+Entity::find()
+    .filter(Column::OrgId.eq(org_id))
+    .all(client)
 
-// 列出用户所属的所有组织
-pub async fn list_orgs_by_user(user_email: &str) -> Result<Vec<UserOrgExpandedRecord>, Error> {
-    let client = ORM_CLIENT.get_or_init(connect_to_orm).await;
-    // JOIN org_users 和 organizations 表
-    let records: Vec<UserOrgExpandedRecord> = Entity::find()
-        .filter(Column::Email.eq(user_email))  // 按用户过滤
-        .join(JoinType::InnerJoin, super::organizations::Entity::belongs_to(Entity).into())
-        .select_also(super::organizations::Entity)
-        .into_model::<UserOrgExpandedRecord>()
-        .all(client)
-        .await
-        .map_err(|e| Error::DbError(DbError::SeaORMError(e.to_string())))?;
-    Ok(records)
-}
+// 模式2：按 org_id + email 过滤（大小写不敏感）
+Entity::find()
+    .filter(Column::OrgId.eq(org_id))
+    .filter(Expr::expr(Func::lower(Expr::col(Column::Email))).eq(email.to_lowercase()))
+    .one(client)
 
-// 列出组织中的所有用户
-pub async fn list_users_by_org(org_id: &str) -> Result<Vec<OrgUserRecord>, Error> {
-    let client = ORM_CLIENT.get_or_init(connect_to_orm).await;
-    let models = Entity::find()
-        .filter(Column::OrgId.eq(org_id))       // 按组织过滤
-        .order_by_asc(Column::Email)
-        .all(client)
-        .await
-        .map_err(|e| Error::DbError(DbError::SeaORMError(e.to_string())))?;
-    // ...
-}
+// 模式3：更新时按 org_id 过滤
+Entity::update_many()
+    .col_expr(Column::Role, Expr::value(role as i16))
+    .filter(Column::OrgId.eq(org_id))
+    .filter(Expr::expr(Func::lower(Expr::col(Column::Email))).eq(email.to_lowercase()))
+    .exec(client)
+
+// 模式4：删除时按 org_id 过滤
+Entity::delete_many()
+    .filter(Column::OrgId.eq(org_id))
+    .filter(Expr::expr(Func::lower(Expr::col(Column::Email))).eq(email.to_lowercase()))
+    .exec(client)
+
+// 模式5：JOIN 查询时按 org_id 过滤
+Entity::find()
+    .filter(Column::OrgId.eq(org_id))
+    .inner_join(other::Entity)
+    .select_also(other::Entity)
+    .all(client)
 ```
 
 ### 3.6 资源所有权与层级关系
@@ -593,25 +1033,30 @@ pub struct Authz {
 #[cfg(feature = "enterprise")]
 pub async fn set_ownership(org_id: &str, obj_type: &str, obj: Authz) {
     if get_openfga_config().enabled {
-        let obj_str = format!("{}:{}", OFGA_MODELS.get(obj_type).unwrap().key, obj.obj_id);
+        let obj_str = format!("{}:{}",
+            OFGA_MODELS.get(obj_type).unwrap().key, obj.obj_id);
         let parent_type = if obj.parent_type.is_empty() {
             ""
         } else {
             OFGA_MODELS.get(obj.parent_type.as_str()).unwrap().key
         };
         // 检查父文件夹是否存在（确保层级完整性）
-        if obj_type.eq("folders") && authorizer::authz::check_folder_exists(org_id, &obj.obj_id).await {
+        if obj_type.eq("folders")
+            && authorizer::authz::check_folder_exists(org_id, &obj.obj_id).await
+        {
             return;
         } else if obj.parent_type.eq("folders") {
             authorizer::authz::check_folder_exists(org_id, &obj.parent).await;
         }
         // 在 OpenFGA 中设置所有权关系
-        authorizer::authz::set_ownership(org_id, &obj_str, &obj.parent, parent_type).await;
+        authorizer::authz::set_ownership(
+            org_id, &obj_str, &obj.parent, parent_type
+        ).await;
     }
 }
 ```
 
-### 3.7 组织创建时的初始化
+### 3.7 组织创建与删除时的元数据同步
 
 **核心文件：`src/common/utils/auth.rs`**
 
@@ -622,11 +1067,7 @@ pub async fn save_org_tuples(org_id: &str) {
         o2_openfga::authorizer::authz::save_org_tuples(org_id).await
     }
 }
-```
 
-**组织删除时的清理：**
-
-```rust
 #[cfg(feature = "enterprise")]
 pub async fn delete_org_tuples(org_id: &str) {
     if get_openfga_config().enabled {
@@ -637,106 +1078,352 @@ pub async fn delete_org_tuples(org_id: &str) {
 
 ---
 
-## 四、完整调用链路
+## 四、企业版与社区版分岔点汇总
 
-### 4.1 用户认证与权限检查链路
+### 4.1 功能分岔点总览
 
-```
-HTTP 请求
-    ↓
-auth_middleware (router/mod.rs:160)
-    ├─ 提取 RequestData（同步）
-    ├─ AuthExtractor::from_request_parts（提取 auth/org_id/资源类型）
-    │   └─ 从 URL 路径解析 org_id
-    │   └─ 从 Authorization 头提取凭证
-    └─ oo_validator (auth/validator.rs)
-        ├─ validate_credentials（验证用户名密码/token）
-        │   └─ get_user(org_id, user_id)（按组织上下文获取用户）
-        │       ├─ get_cached_user_org(org_id, user_email)
-        │       └─ db::user::get(Some(org_id), name)
-        ├─ check_and_create_org（自动创建组织）
-        └─ check_permissions（权限检查）
-            ├─ 企业版：调用 OpenFGA is_allowed(org_id, user_id, method, obj_str, parent_id, role)
-            └─ 社区版：直接返回 true
-    ↓
-处理器 handler（user_id 已在请求头中）
-```
+| 功能模块 | 企业版 (`feature = "enterprise"`) | 社区版 |
+|---------|---------------------------------|--------|
+| **权限检查** | 集成 OpenFGA 细粒度权限控制 | 所有认证用户直接通过 |
+| **资源列表过滤** | `list_only_permitted` 开启时只返回有权限的资源 | 不过滤，返回所有资源 |
+| **组织元数据** | 创建/删除组织时同步到 OpenFGA | 不同步 |
+| **原生登录限制** | 支持 `native_login_enabled`、`root_only_login` 配置 | 无此限制 |
+| **资源所有权** | 通过 `Authz` 结构在 OpenFGA 中维护层级关系 | 不维护 |
+| **扩展凭证验证** | `validate_credentials_ext` 完整实现 | 空实现，返回错误 |
+| **组织重命名** | OpenFGA 启用时允许非 Root 用户重命名 | 仅 Root 用户可重命名 |
+| **集群同步** | `super_cluster` 模块同步组织变更 | 不启用 |
 
-### 4.2 角色存储链路
+### 4.2 分岔点代码位置详情
 
-```
-创建/更新用户角色请求
-    ↓
-UserRoleRequest → UserOrgRole（common/meta/user.rs:418）
-    ├─ 解析 base_role（标准角色）
-    └─ 解析 custom_role（企业版自定义角色）
-    ↓
-org_users::add/update (service/db/org_users.rs)
-    ├─ 写入数据库（org_users 表，包含 org_id, email, role, token）
-    ├─ put_into_db_coordinator（触发 watch 事件）
-    └─ 企业版：super_cluster 同步
-    ↓
-watch() 监听到事件（service/db/org_users.rs:314）
-    ├─ 更新 ORG_USERS 缓存（key: "{org_id}/{user_email}"）
-    ├─ 更新 USERS_RUM_TOKEN 缓存
-    └─ 更新 ROOT_USER 缓存（如果是 Root 用户）
+#### 分岔点 1：原生登录限制（validate_credentials）
+
+**文件：`src/handler/http/auth/validator.rs:389`**
+
+```rust
+#[cfg(feature = "enterprise")]
+{
+    if !get_dex_config().native_login_enabled && !user.is_external {
+        return Ok(TokenValidationResponse { is_valid: false, .. });
+    }
+    if get_dex_config().root_only_login && !is_root_user(user_id) {
+        return Ok(TokenValidationResponse { is_valid: false, .. });
+    }
+}
 ```
 
-### 4.3 资源访问隔离链路
+#### 分岔点 2：组织创建同步 OpenFGA（check_and_create_org）
 
+**文件：`src/service/organization.rs:573`**
+
+```rust
+match db::organization::save_org(org).await {
+    Ok(_) => {
+        save_org_tuples(&org.identifier).await;  // 仅企业版
+        #[cfg(feature = "cloud")]
+        enqueue_cloud_event(CloudEvent { /* ... */ }).await;
+        Ok(org.clone())
+    }
+    // ...
+}
 ```
-访问资源请求（如 GET /api/{org_id}/streams/{stream_name}）
-    ↓
-auth_middleware 提取 org_id
-    ↓
-handler 中调用 check_permissions(object_id, org_id, user_id, object_type, method, parent_id)
-    ├─ is_root_user(user_id)？Root 用户绕过
-    ├─ get_user(Some(org_id), user_id)（获取用户在该组织的角色）
-    └─ 构造 OpenFGA 请求：is_allowed(org_id, user_email, method, "stream:{stream_name}", parent_id, role)
-    ↓
-企业版 list_objects_for_user（列表查询时）
-    └─ OpenFGA list_objects(user_id, "read", "stream", org_id, role)
-    └─ 只返回用户有权限的 stream_id 列表
-    ↓
-数据库查询时过滤 org_id
-    └─ 所有查询都带上 org_id 条件
+
+#### 分岔点 3：Viewer 角色自我更新（oo_validator_internal）
+
+**文件：`src/handler/http/auth/validator.rs:168`**
+
+```rust
+#[cfg(feature = "enterprise")]
+if let Some(role) = &res.user_role
+    && role.eq(&UserRole::Viewer)
+    && req_data.method.eq(&Method::PUT)
+    && path.ends_with(&format!("users/{}", res.user_email))
+{
+    // Viewer 可以更新自己的信息
+    return Ok(AuthValidationResult { /* ... */ });
+}
+```
+
+#### 分岔点 4：权限检查核心逻辑
+
+**文件：`src/handler/http/auth/validator.rs:1035/1092`**
+
+```rust
+// 企业版
+#[cfg(feature = "enterprise")]
+pub(crate) async fn check_permissions(...) -> bool {
+    if !get_openfga_config().enabled { return true; }
+    if role.eq(&UserRole::Root) { return true; }
+    // ... OpenFGA 检查逻辑 ...
+    o2_openfga::authorizer::authz::is_allowed(...).await
+}
+
+// 社区版
+#[cfg(not(feature = "enterprise"))]
+pub(crate) async fn check_permissions(...) -> bool {
+    true  // 直接通过
+}
+```
+
+#### 分岔点 5：资源列表过滤
+
+**文件：`src/handler/http/auth/validator.rs:1115`**
+
+```rust
+#[cfg(feature = "enterprise")]
+pub(crate) async fn list_objects_for_user(...) -> Result<Option<Vec<String>>, AuthError> {
+    let openfga_config = get_openfga_config();
+    if !is_root_user(user_id) && openfga_config.enabled && openfga_config.list_only_permitted {
+        let role = /* ... */;
+        match list_objects(user_id, permission, object_type, org_id, &role).await {
+            Ok(resp) => Ok(Some(resp)),  // 返回过滤后的列表
+            Err(_) => Err(AuthError::Forbidden("Unauthorized Access".to_string())),
+        }
+    } else {
+        Ok(None)  // 不过滤
+    }
+}
+```
+
+#### 分岔点 6：扩展凭证验证
+
+**文件：`src/handler/http/auth/validator.rs:453/630`**
+
+```rust
+// 企业版完整实现
+#[cfg(feature = "enterprise")]
+pub async fn validate_credentials_ext(...) -> Result<TokenValidationResponse, AuthError> {
+    // 完整的 SSO/OAuth 验证逻辑
+}
+
+// 社区版空实现
+#[cfg(not(feature = "enterprise"))]
+pub async fn validate_credentials_ext(...) -> Result<TokenValidationResponse, AuthError> {
+    Err(AuthError::Unauthorized("Feature not available".to_string()))
+}
+```
+
+#### 分岔点 7：组织重命名权限
+
+**文件：`src/service/organization.rs:626`**
+
+```rust
+#[cfg(not(feature = "enterprise"))]
+let is_allowed = false;
+#[cfg(feature = "enterprise")]
+let is_allowed = if get_openfga_config().enabled {
+    true  // OpenFGA 已处理权限检查
+} else {
+    false
+};
+if !is_allowed && !is_root_user(user_email) {
+    return Err(anyhow::anyhow!("Not allowed to rename org"));
+}
+```
+
+#### 分岔点 8：集群同步
+
+**文件：`src/service/db/organization.rs:298/316`**
+
+```rust
+// save_org 中
+#[cfg(feature = "enterprise")]
+super_cluster::organization_add(&key, entry).await?;
+
+// rename_org 中
+#[cfg(feature = "enterprise")]
+super_cluster::organization_rename(&key, &org).await?;
 ```
 
 ---
 
-## 五、关键设计要点
+## 五、完整调用链路（时序图风格）
 
-### 5.1 角色独立性设计
+### 5.1 认证与权限检查链路
+
+```
+HTTP Request
+    │
+    ▼
+auth_middleware (router/mod.rs)
+    ├─ RequestData { uri, method, headers }  ── 同步提取
+    ├─ AuthExtractor::from_request_parts
+    │   ├─ auth = Authorization header
+    │   ├─ org_id = /api/{org_id}/...
+    │   ├─ method = GET/POST/PUT/DELETE
+    │   └─ o2_type = 资源类型 (streams:default/logs)
+    │
+    ▼
+oo_validator (validator.rs:1011)
+    └─ oo_validator_internal (validator.rs:120)
+        ├─ 解析 user_id / password
+        │
+        ├─ validate_credentials (validator.rs:227)
+        │   ├─ 从 URL 解析 org_id
+        │   ├─ users::get_user(Some(org_id), user_id)
+        │   │   ├─ get_cached_user_org(org_id, user_id)
+        │   │   └─ db::user::get(Some(org_id), user_id)
+        │   ├─ ServiceAccount token 验证
+        │   │   └─ 检查 allow_static_token 标志
+        │   ├─ Token 验证 (token == password)
+        │   ├─ 【企业版】native_login_enabled / root_only_login
+        │   └─ 密码验证 (get_hash + 比对)
+        │
+        ├─ check_and_create_org (validator.rs:579)
+        │   ├─ org 已存在？→ ✅
+        │   ├─ org 不存在？
+        │   │   ├─ !create_org_through_ingestion → ❌ 404
+        │   │   ├─ is_root + POST + 摄入端点
+        │   │   │   └─ service::organization::check_and_create_org(org_id)
+        │   │   │       ├─ db::organization::save_org(org)
+        │   │   │       ├─ put_into_db_coordinator
+        │   │   │       └─ 【企业版】save_org_tuples(org_id) → OpenFGA
+        │   │   └─ 其他 → ❌ 404
+        │
+        ├─ 【企业版】Viewer 自我更新检查
+        │
+        └─ check_permissions (validator.rs:1035/1092)
+            ├─ bypass_check？→ ✅
+            ├─ 【企业版】
+            │   ├─ !openfga.enabled → ✅
+            │   ├─ block_feature_for_report_failure → ✅
+            │   ├─ role == Root → ✅
+            │   └─ o2_openfga::is_allowed(org_id, user_id, ...)
+            └─ 【社区版】→ ✅ (直接返回 true)
+    │
+    ▼
+user_id 插入请求头 → 下游 Handler
+```
+
+### 5.2 角色存储链路
+
+```
+创建/更新用户角色请求
+    │
+    ▼
+UserRoleRequest → UserOrgRole (common/meta/user.rs:418)
+    ├─ base_role = 解析标准角色 (Root/Admin/...)
+    └─ custom_role = 企业版自定义角色
+    │
+    ▼
+org_users::add_with_flags (infra/table/org_users.rs:222)
+    ├─ id = ider::uuid()  ── 生成 KSUID 主键
+    ├─ 构造 ActiveModel
+    ├─ Entity::insert(record)
+    │   └─ 唯一约束冲突？→ 静默成功
+    ├─ put_into_db_coordinator (触发 watch 事件)
+    └─ 【企业版】super_cluster 同步
+    │
+    ▼
+watch() 监听到事件 (service/db/org_users.rs:314)
+    ├─ ORG_USERS 缓存更新 (key: "{org_id}/{user_email_lower}")
+    ├─ USERS_RUM_TOKEN 缓存更新
+    └─ ROOT_USER 缓存更新 (如果是 Root)
+```
+
+### 5.3 资源访问隔离链路
+
+```
+访问资源请求 (GET /api/{org_id}/streams/{stream_name})
+    │
+    ▼
+auth_middleware → 提取 org_id
+    │
+    ▼
+Handler 调用 check_permissions(object_id, org_id, user_id, object_type, method, parent_id)
+    ├─ is_root_user(user_id)？→ ✅ 绕过
+    ├─ get_user(Some(org_id), user_id)  ── 获取该组织下的用户角色
+    └─ 构造 OpenFGA 请求:
+       is_allowed(org_id, user_email, method, "stream:{stream_name}", parent_id, role)
+    │
+    ▼
+【企业版】列表查询 → list_objects_for_user(org_id, user_id, "read", "stream")
+    └─ OpenFGA list_objects(...) → 返回用户有权限的 stream_id 列表
+    │
+    ▼
+数据库查询强制过滤 org_id
+    └─ .filter(Column::OrgId.eq(org_id))
+```
+
+---
+
+## 六、关键设计要点
+
+### 6.1 角色独立性设计
+
 - **多组织角色分离**：一个用户在不同组织可以有不同角色，通过 `Vec<UserOrg>` 实现
-- **缓存隔离**：`ORG_USERS` 缓存使用 `"{org_id}/{user_email}"` 作为键，确保组织隔离
-- **数据库级隔离**：`org_users` 表使用 `(org_id, email)` 作为复合主键
+- **缓存隔离**：`ORG_USERS` 缓存使用 `"{org_id}/{user_email_lower}"` 作为键，确保组织隔离
+- **数据库级隔离**：
+  - 主键：`id char(27)` (KSUID)
+  - 唯一索引：`(email, org_id)` 保证一个用户在一个组织中只有一条记录
+  - 注意：唯一索引顺序是 `(email, org_id)`，不是 `(org_id, email)`！
+- **幂等性处理**：`add` 操作遇到唯一约束冲突时静默成功，不返回错误
 
-### 5.2 权限上下文切换
+### 6.2 权限上下文切换
+
 - **URL 驱动**：org_id 从 URL 路径中提取，无需额外参数
 - **中间件透传**：user_id 通过请求头传递给下游 handler
 - **企业/社区双模式**：通过 `#[cfg(feature = "enterprise")]` 实现两种权限模型
 - **OpenFGA 集成**：企业版使用 OpenFGA 实现细粒度 ABAC（基于属性的访问控制）
+- **Root 用户豁免**：Root 角色绕过所有权限检查
 
-### 5.3 资源组织级隔离
+### 6.3 资源组织级隔离
+
 - **查询强制过滤**：所有数据库查询必须带上 org_id 条件
 - **所有权层级**：通过 `Authz` 结构体定义资源父子关系，支持文件夹级权限继承
 - **组织设置隔离**：每个组织有独立的 `OrganizationSetting`，互不影响
 - **列表过滤**：企业版支持 `list_only_permitted`，只返回用户有权限的资源
+- **email 大小写不敏感**：所有查询使用 `lower(email)` 进行匹配
 
 ---
 
-## 六、核心文件索引
+## 七、核心文件索引
 
 | 模块 | 文件路径 | 主要职责 |
 |------|---------|---------|
 | 角色定义 | `src/config/src/meta/user.rs` | `UserRole` 枚举、`DBUser`、`UserOrg` 定义 |
 | API 角色模型 | `src/common/meta/user.rs` | `UserOrgRole`、`UserRoleRequest`、角色转换 |
+| ID 生成 | `src/config/src/ider.rs` | `uuid()` 生成 KSUID |
 | 认证中间件 | `src/handler/http/router/mod.rs` | `auth_middleware` 入口 |
-| 认证验证器 | `src/handler/http/auth/validator.rs` | `oo_validator`、`check_permissions`、`list_objects_for_user` |
-| 权限工具 | `src/common/utils/auth.rs` | `AuthExtractor`、`check_permissions`（对外 API）、`set_ownership` |
+| 认证验证器 | `src/handler/http/auth/validator.rs` | `oo_validator`、`validate_credentials`、`check_permissions`、`check_and_create_org`、`list_objects_for_user` |
+| 权限工具 | `src/common/utils/auth.rs` | `AuthExtractor`、`check_permissions`（对外 API）、`set_ownership`、`save_org_tuples` |
 | 组织定义 | `src/common/meta/organization.rs` | `Organization`、`OrganizationSetting` |
-| 组织数据库 | `src/infra/src/table/organizations.rs` | 组织表 ORM 操作 |
-| 组织服务 | `src/service/db/organization.rs` | 组织设置 CRUD、缓存管理 |
-| 用户-组织表 | `src/infra/src/table/org_users.rs` | `OrgUserRecord`、ORM 查询 |
-| 用户-组织服务 | `src/service/db/org_users.rs` | CRUD、缓存 watch、cache 初始化 |
+| 组织数据库表 | `src/infra/src/table/entity/organizations.rs` | 组织表实体定义 |
+| 组织数据库操作 | `src/infra/src/table/organizations.rs` | 组织表 ORM 操作 |
+| 组织服务层 | `src/service/db/organization.rs` | 组织设置 CRUD、缓存管理 |
+| org_users 表实体 | `src/infra/src/table/entity/org_users.rs` | `org_users` 表实体定义 |
+| org_users 表迁移 | `src/infra/src/table/migration/m20241227_000300_create_org_users_table.rs` | 建表语句、唯一索引定义 |
+| org_users 表操作 | `src/infra/src/table/org_users.rs` | `OrgUserRecord`、ORM CRUD 查询 |
+| org_users 服务层 | `src/service/db/org_users.rs` | CRUD、缓存 watch、cache 初始化 |
 | 用户服务 | `src/service/users.rs` | `get_user`、`get_user_by_token` |
+| 组织服务 | `src/service/organization.rs` | `check_and_create_org`、`rename_org` |
+
+---
+
+## 八、常见误区修正
+
+### 8.1 org_users 主键不是复合主键
+
+❌ 错误：`org_users` 表使用 `(org_id, email)` 作为复合主键
+
+✅ 正确：
+- 主键是单独的 `id char(27)` 字段，值为 KSUID（由 `ider::uuid()` 生成）
+- 唯一性是通过 `(email, org_id)` 上的**唯一索引**保证的
+- 注意唯一索引的列顺序是 `(email, org_id)`，不是 `(org_id, email)`
+
+### 8.2 add 操作的幂等性
+
+`add_with_flags` 遇到唯一约束冲突时不会返回错误，而是静默成功（`Ok(())`），这意味着：
+- 重复添加同一个用户到同一个组织不会报错
+- 如果需要检测"用户已存在"，需要先调用 `get` 进行检查
+
+### 8.3 email 匹配是大小写不敏感的
+
+所有查询都使用 `lower(email) = lower(input)` 进行匹配，这意味着：
+- `User@Example.com` 和 `user@example.com` 被视为同一个用户
+- 但数据库存储的是原始大小写的 email
+
+### 8.4 Root 用户的特殊处理
+
+- Root 用户查询时使用 `DEFAULT_ORG` 作为 org_id，而不是 URL 中的 org_id
+- Root 用户绕过所有 OpenFGA 权限检查
+- 只有 Root 用户可以通过摄入端点自动创建新组织
