@@ -438,9 +438,11 @@ async fn oo_validator_internal(
         // ════════════════════════════════════════════════
         // 分支 3: Auth Ext Token 认证 (前端扩展 token)
         // ════════════════════════════════════════════════
+        // ⚠️ 重要说明：这里只做 JSON 解析、过期检查、auth_ext 解码
+        // 实际的凭证验证在 validator() 函数内通过 validate_credentials_ext 完成
         log::debug!("Auth ext token found");
         if auth_tokens.has_expired() {
-            // 🔴 Token 过期直接返回未授权
+            // 🔴 Token 过期直接返回未授权（第一道防线）
             Err(AuthError::Unauthorized("Unauthorized Access".to_string()))
         } else {
             log::debug!("Auth ext token found: decoding");
@@ -459,6 +461,7 @@ async fn oo_validator_internal(
                 None => return Err(AuthError::Unauthorized("Unauthorized Access".to_string())),
             };
             log::info!("Auth ext token found: validating: {username}");
+            // 调用 validator，内部会检测 auth_info.auth 的前缀再次分流
             validator(req_data, &username, &password, auth_info, path_prefix).await
         }
     } else {
@@ -704,6 +707,37 @@ let has_mcp_header = req_data
 let is_mcp_request = is_mcp_endpoint || has_mcp_header;
 ```
 
+**⚠️ 路径匹配规则详解：**
+
+`path_columns.get(1)` 取的是路径**第二个元素**：
+```
+完整 URL: /api/default/mcp/tools
+strip_prefix: default/mcp/tools
+split: ["default", "mcp", "tools"]
+path_columns.get(1) = "mcp" ✅
+
+完整 URL: /api/org123/mcp/agents
+strip_prefix: org123/mcp/agents
+split: ["org123", "mcp", "agents"]
+path_columns.get(1) = "mcp" ✅
+
+完整 URL: /api/mcp/tools  ← ⚠️ 不会命中路径条件！
+strip_prefix: mcp/tools
+split: ["mcp", "tools"]
+path_columns.get(1) = "tools" ❌
+```
+
+**最小反例说明：**
+
+| URL | x-o2-mcp 头 | path_columns | 命中？ | 说明 |
+|-----|------------|-------------|-------|------|
+| `/api/default/mcp/tools` | 未设置 | `["default", "mcp", "tools"]` | ✅ **是** | 路径匹配 |
+| `/api/org123/mcp/agents` | 未设置 | `["org123", "mcp", "agents"]` | ✅ **是** | 路径匹配 |
+| `/api/default/streams` | `true` | `["default", "streams"]` | ✅ **是** | header 匹配，路径无关 |
+| `/api/mcp/tools` | 未设置 | `["mcp", "tools"]` | ❌ **否** | 缺少 org 前缀，get(1) 是 "tools" |
+| `/api/default/MCP/tools` | 未设置 | `["default", "MCP", "tools"]` | ❌ **否** | 大小写敏感，必须小写 |
+| `/api/default/mcp` | 未设置 | `["default", "mcp"]` | ✅ **是** | 路径匹配 |
+
 **特殊处理：**
 1. **跳过 JWT audience 验证**：`login_flow = !is_mcp_request`，允许动态客户端的 MCP 请求
 2. **允许不存在的用户**：`allow_nonexistent_user = is_mcp_request`
@@ -722,6 +756,37 @@ let is_member_subscription = path_columns
     .get(1)
     .is_some_and(|p| p.eq(&"member_subscription"));
 ```
+
+**⚠️ 路径匹配规则详解：**
+
+`path_columns.get(1)` 取的是路径**第二个元素**（索引从 0 开始）：
+```
+完整 URL: /api/default/member_subscription/accept
+strip_prefix: default/member_subscription/accept
+split: ["default", "member_subscription", "accept"]
+path_columns.get(1) = "member_subscription" ✅
+
+完整 URL: /api/invite/member_subscription/abc123
+strip_prefix: invite/member_subscription/abc123
+split: ["invite", "member_subscription", "abc123"]
+path_columns.get(1) = "member_subscription" ✅
+
+完整 URL: /api/member_subscription  ← ⚠️ 不会命中！
+strip_prefix: member_subscription
+split: ["member_subscription"]
+path_columns.get(1) = None ❌
+```
+
+**最小反例说明：**
+
+| URL | path_columns | 命中？ | 说明 |
+|-----|-------------|-------|------|
+| `/api/default/member_subscription/accept` | `["default", "member_subscription", "accept"]` | ✅ **是** | 接受邀请 |
+| `/api/org123/member_subscription` | `["org123", "member_subscription"]` | ✅ **是** | 成员订阅 |
+| `/api/invite/member_subscription/abc123` | `["invite", "member_subscription", "abc123"]` | ✅ **是** | 邀请流程 |
+| `/api/member_subscription` | `["member_subscription"]` | ❌ **否** | 缺少 org 前缀，get(1) 返回 None |
+| `/api/default/subscription/member` | `["default", "subscription", "member"]` | ❌ **否** | 第二个元素是 "subscription" |
+| `/api/default/Member_Subscription` | `["default", "Member_Subscription"]` | ❌ **否** | 大小写敏感，必须小写 |
 
 **设计背景（代码注释）：**
 > for member sub i.e. invitation, we must check user directly from db, because
@@ -750,13 +815,60 @@ let is_list_invite_call = path_columns.len() <= 2
     && (auth_info.method.eq("GET") || auth_info.method.eq("DELETE"));
 ```
 
+**⚠️ 关键修正：路径匹配规则详解**
+
+`path_columns` 是 URL 去掉 `/api/` 前缀后按 `/` 分割的结果：
+```
+完整 URL: /api/invites
+strip_prefix: invites
+split: ["invites"]
+path_columns.first() = "invites" ✅
+len = 1 <= 2 ✅
+
+完整 URL: /api/invites/abc123
+strip_prefix: invites/abc123
+split: ["invites", "abc123"]
+path_columns.first() = "invites" ✅
+len = 2 <= 2 ✅
+
+完整 URL: /api/invites/abc123/accept
+strip_prefix: invites/abc123/accept
+split: ["invites", "abc123", "accept"]
+len = 3 > 2 ❌
+
+完整 URL: /api/default/invites  ← ⚠️ 不会命中！
+strip_prefix: default/invites
+split: ["default", "invites"]
+path_columns.first() = "default" ❌ 不是 "invites"
+```
+
+**真实触发条件（修正后）：**
+1. **路径深度**：≤ 2 级（`path_columns.len() <= 2`）
+2. **路径前缀**：**第一个元素必须是 "invites"**（`path_columns.first() == "invites"`）
+3. **HTTP 方法**：仅 GET 和 DELETE
+4. **Base URI 影响**：如果配置了 `base_uri = "/oo"`，则需要 `/oo/api/invites` 才会命中
+
+**最小反例说明（命中 vs 不命中）：**
+
+| URL | HTTP 方法 | path_columns | 命中？ | 说明 |
+|-----|----------|-------------|-------|------|
+| `/api/invites` | GET | `["invites"]` | ✅ **是** | 标准列表查询 |
+| `/api/invites` | DELETE | `["invites"]` | ✅ **是** | 删除所有邀请 |
+| `/api/invites/invite_123` | GET | `["invites", "invite_123"]` | ✅ **是** | 查询单个邀请详情 |
+| `/api/invites/invite_123` | DELETE | `["invites", "invite_123"]` | ✅ **是** | 删除单个邀请 |
+| `/api/invites` | POST | `["invites"]` | ❌ **否** | 方法不匹配（POST 不在允许列表） |
+| `/api/invites/invite_123/accept` | POST | `["invites", "invite_123", "accept"]` | ❌ **否** | 路径深度 > 2 |
+| `/api/default/invites` | GET | `["default", "invites"]` | ❌ **否** | 第一个元素是 "default"，不是 "invites" |
+| `/api/invite/invite_123` | GET | `["invite", "invite_123"]` | ❌ **否** | 拼写错误，少了 "s" |
+| `/api/INVITES` | GET | `["INVITES"]` | ❌ **否** | 大小写敏感，必须小写 |
+
 **设计背景（代码注释）：**
 > this is for /invites call, which is only based on user, similar to
 > member subscription. Furthermore, because we are listing the invites of
 > that particular user only, we can skip other checks, and allow listing
 
 **特殊处理：**
-1. **路径限制**：仅 `/invites` 或 `/{org_id}/invites`（路径深度 ≤ 2）
+1. **路径限制**：仅 `/api/invites` 和 `/api/invites/{id}`（路径深度 ≤ 2）
 2. **方法限制**：仅 GET 和 DELETE 方法
 3. **用户查找方式**：走 `organizations/clusters` 分支
 4. **用户不存在也放行**：`None if is_list_invite_call` 直接通过认证
@@ -770,11 +882,14 @@ let is_list_invite_call = path_columns.len() <= 2
 
 | 场景 | 触发条件 | 用户存在性检查 | Org 绑定检查 | 典型用途 |
 |------|---------|---------------|-------------|---------|
-| **MCP** | `x-o2-mcp` 头 或 `/mcp/` 路径 | ❌ 跳过 | ❌ 跳过 | AI Agent 模型上下文协议 |
-| **member_subscription** | 路径含 `/member_subscription` | ❌ 跳过 | ❌ 跳过 | 接受组织邀请 |
-| **invites** | `/invites` + GET/DELETE | ❌ 跳过 | ❌ 跳过 | 查看/删除邀请列表 |
-| **organizations LIST** | `/organizations` + LIST 方法 | ❌ 跳过 | ❌ 跳过 | 列出用户所属组织 |
+| **MCP** | `x-o2-mcp` 头 或 `/api/{org_id}/mcp/` 路径 | ❌ 跳过 | ❌ 跳过 | AI Agent 模型上下文协议 |
+| **member_subscription** | `/{org_id}/member_subscription/...（路径第 2 个元素是 `member_subscription`） | ❌ 跳过 | ❌ 跳过 | 接受组织邀请 |
+| **invites** | `/api/invites` + GET/DELETE（路径第 1 个元素是 `invites`，深度 ≤ 2） | ❌ 跳过 | ❌ 跳过 | 查看/删除邀请列表 |
+| **organizations LIST** | `/{org_id}/organizations（路径最后元素是 `organizations`） | ❌ 跳过 | ✅ 绑定 | 列出用户所属组织 |
+| **clusters LIST** | `/{org_id}/clusters（路径最后元素是 `clusters`） | ❌ 跳过 | ✅ 绑定 | 列出集群 |
 | **常规请求** | 其他所有路径 | ✅ 必须存在 | ✅ 必须绑定 | 普通 API 调用 |
+
+**⚠️ 注意：organizations 和 clusters 虽然走相同分支，但仍需用户必须存在于某个 org（只是不检查当前 URL 的 org）**
 
 ##### 2.2.5.5 特殊通路的权限返回
 
@@ -1664,7 +1779,38 @@ pub async fn validate_credentials_ext(
 }
 ```
 
-**社区版实现（直接禁止）：**
+**社区版实现（完整返回路径）：**
+
+**⚠️ 关键修正：社区版 Auth Ext 有两层拦截，完整调用链如下：**
+
+```
+HTTP Request with Auth Ext token
+    │
+    ▼
+oo_validator_internal (validator.rs:921)
+    ├─ JSON 解析为 AuthTokensExt
+    ├─ has_expired() 检查
+    │   └─ 过期 → 返回 AuthError::Unauthorized
+    ├─ auth_ext 字段 Base64 解码
+    └─ 调用 validator(req_data, &username, &password, auth_info, path_prefix)
+        │
+        ▼
+validator (validator.rs:155)
+    └─ if auth_info.auth.starts_with("{\"auth_ext\":")
+        // 仍然成立！因为 auth_info.auth 还是原始 JSON
+        └─ 调用 validate_credentials_ext(...)
+            │
+            ▼
+            社区版 validate_credentials_ext (validator.rs:629)
+                └─ Err(AuthError::Forbidden("Not allowed".to_string()))
+                    │
+                    ▼
+                    validator 第 206-209 行：match Err(err) → Err(err)
+                        │
+                        ▼
+                        oo_validator_internal 冒泡返回 Err(err)
+```
+
 ```rust
 #[cfg(not(feature = "enterprise"))]
 pub async fn validate_credentials_ext(
@@ -1678,6 +1824,11 @@ pub async fn validate_credentials_ext(
     Err(AuthError::Forbidden("Not allowed".to_string()))
 }
 ```
+
+**社区版 Auth Ext 响应说明：**
+- 过期 token 返回 `401 Unauthorized`（在 oo_validator_internal 第 924 行拦截）
+- 未过期 token 返回 `403 Forbidden`（在 validate_credentials_ext 返回）
+- 社区版完全不支持 Auth Ext 认证方式，前端应使用 Basic 认证
 
 **关键差异说明：**
 - 企业版使用 `password_ext` 字段进行双层哈希验证（配合 `request_time` 和 `expires_in`）
