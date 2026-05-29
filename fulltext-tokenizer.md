@@ -1488,3 +1488,518 @@ match_all('keyword')
 **误解 4**："缓存的结果总是可以信任的"
 
 **事实**：当 `has_skipped_conditions = true` 时，结果不会被缓存，因为它是基于部分条件的不完整结果。缓存命中时返回 `has_skipped_conditions = false` 是因为缓存的是之前完整的搜索结果。但如果有新的索引字段被添加，旧的缓存结果可能遗漏了新字段的过滤，这是需要关注的边界情况。
+
+## 12. fuzzy_match_all 与 match_all_hash 的重写、UDF 签名及回退协作
+
+### 12.1 三种 match UDF 的签名对比
+
+#### 12.1.1 UDF 定义
+
+| UDF | 名称 | 签名 | 返回类型 | 定义文件 |
+|-----|------|------|---------|---------|
+| `match_all` | `MATCH_ALL_UDF_NAME = "match_all"` | `exact([Utf8])` | Boolean | `match_all_udf.rs:34-44` |
+| `fuzzy_match_all` | `FUZZY_MATCH_ALL_UDF_NAME = "fuzzy_match_all"` | `exact([Utf8, Int64])` | Boolean | `match_all_udf.rs:73-87` |
+| `match_all_hash` | `MATCH_ALL_HASH_UDF_NAME = "match_all_hash"` | `exact([Utf8])` | Boolean | `match_all_hash_udf.rs:29-39` |
+
+关键代码对比：
+
+```rust
+// match_all: 1 个字符串参数
+struct MatchAllUdf {
+    signature: Signature,
+}
+impl MatchAllUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+// fuzzy_match_all: 1 个字符串 + 1 个 Int64 距离参数
+struct FuzzyMatchAllUdf {
+    signature: Signature,
+}
+impl FuzzyMatchAllUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::exact(
+                vec![DataType::Utf8, DataType::Int64],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+// match_all_hash: 1 个字符串参数
+pub(crate) static MATCH_ALL_HASH_UDF: Lazy<ScalarUDF> = Lazy::new(|| {
+    create_udf(
+        MATCH_ALL_HASH_UDF_NAME,
+        vec![DataType::Utf8],
+        DataType::Boolean,
+        Volatility::Immutable,
+        Arc::new(match_all_hash_expr_impl),
+    )
+});
+```
+
+#### 12.1.2 UDF invoke 行为
+
+三种 UDF 的 `invoke_with_args` / 实现函数都**不执行实际计算**，而是直接返回错误：
+
+```rust
+// match_all
+fn invoke_with_args(&self, _args) -> Result<ColumnarValue> {
+    Err(DataFusionError::Internal(
+        "match_all function don't support sql with multiple streams".to_string(),
+    ))
+}
+
+// fuzzy_match_all
+fn invoke_with_args(&self, _args) -> Result<ColumnarValue> {
+    Err(DataFusionError::Internal(
+        "fuzzy_match_all function don't support sql with multiple streams".to_string(),
+    ))
+}
+
+// match_all_hash
+pub fn match_all_hash_expr_impl(_args: &[ColumnarValue]) -> Result<ColumnarValue> {
+    Err(DataFusionError::Internal(
+        "match_all_hash function don't support sql with multiple streams".to_string(),
+    ))
+}
+```
+
+**设计意图**：这些 UDF 是**占位符（placeholder）**，实际匹配逻辑由两个路径分别实现：
+1. **Tantivy 索引路径**：`Condition::MatchAll/FuzzyMatchAll` → `to_tantivy_query()`
+2. **DataFusion 回退路径**：`RewriteMatchPhysical` 优化器将 UDF 重写为原生表达式
+
+### 12.2 IndexCondition 对三种 UDF 的处理差异
+
+#### 12.2.1 from_physical_expr 中的解析
+
+在 `src/service/search/index.rs:255-320` 中，`Condition::from_physical_expr()` 将物理表达式转换为 Condition 枚举：
+
+```rust
+// match_all → Condition::MatchAll(String)
+MATCH_ALL_UDF_NAME => Condition::MatchAll(get_physical_value(&expr.args()[0])),
+
+// fuzzy_match_all → Condition::FuzzyMatchAll(String, u8)
+FUZZY_MATCH_ALL_UDF_NAME => {
+    let value = get_physical_value(&expr.args()[0]);
+    let distance = get_physical_value(&expr.args()[1]).parse().unwrap_or(1);
+    Condition::FuzzyMatchAll(value, distance)
+}
+```
+
+**关键发现：`match_all_hash` 没有对应的 Condition 变体**。
+
+在 `Condition` 枚举定义中（`src/service/search/index.rs:198-219`）：
+
+```rust
+pub enum Condition {
+    Equal(String, String),
+    NotEqual(String, String),
+    StrMatch(String, String, bool),
+    In(String, Vec<String>, bool),
+    Regex(String, String),
+    MatchAll(String),           // ← 对应 match_all
+    FuzzyMatchAll(String, u8),  // ← 对应 fuzzy_match_all
+    All(),
+    Or(Box<Condition>, Box<Condition>),
+    And(Box<Condition>, Box<Condition>),
+    Not(Box<Condition>),
+}
+// 注意：没有 MatchAllHash 变体！
+```
+
+这意味着 `match_all_hash` **不参与 Tantivy 索引搜索路径**，它仅由 `RewriteMatchPhysical` 重写为 DataFusion 的 LIKE 表达式。
+
+#### 12.2.2 is_expr_valid_for_index 中的过滤
+
+在 `src/service/search/datafusion/optimizer/physical_optimizer/index.rs:258-314`：
+
+```rust
+fn is_expr_valid_for_index(expr: &Arc<dyn PhysicalExpr>, index_fields: &HashSet<String>) -> bool {
+    // ...
+    } else if let Some(expr) = expr.as_any().downcast_ref::<ScalarFunctionExpr>() {
+        let name = expr.name();
+        return match name {
+            MATCH_ALL_UDF_NAME => {
+                // 验证参数为 1 个且分词结果非空
+                expr.args().len() == 1
+                    && extract_string_literal(&expr.args()[0])
+                        .map(|s| !o2_collect_search_tokens(&s).is_empty())
+                        .unwrap_or(false)
+            }
+            FUZZY_MATCH_ALL_UDF_NAME => expr.args().len() == 2,  // 只验证参数数量
+            // 注意：没有 MATCH_ALL_HASH_UDF_NAME 的分支！
+            _ => false,  // match_all_hash 会走到这里，返回 false
+        };
+    }
+    // ...
+}
+```
+
+**结论**：
+- `match_all`：被 `IndexRule` 提取为 `Condition::MatchAll`，走 Tantivy 索引路径
+- `fuzzy_match_all`：被 `IndexRule` 提取为 `Condition::FuzzyMatchAll`，走 Tantivy 索引路径
+- `match_all_hash`：**不被 `IndexRule` 提取**，留在 `other_conditions` 中，走 `RewriteMatchPhysical` 重写路径
+
+### 12.3 RewriteMatchPhysical 中三种 UDF 的重写逻辑
+
+#### 12.3.1 重写触发条件
+
+`is_match_all_physical` 函数（`rewrite_match.rs:400-409`）识别三种 UDF：
+
+```rust
+fn is_match_all_physical(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    if let Some(scalar_fn) = expr.as_any().downcast_ref::<ScalarFunctionExpr>() {
+        let name = scalar_fn.name();
+        name.to_lowercase() == MATCH_ALL_UDF_NAME
+            || name == FUZZY_MATCH_ALL_UDF_NAME
+            || name == MATCH_ALL_HASH_UDF_NAME
+    } else {
+        false
+    }
+}
+```
+
+#### 12.3.2 match_all 重写
+
+```rust
+// rewrite_match.rs:225-266
+if name == MATCH_ALL_UDF_NAME {
+    let item = extract_string_literal(item_expr)?;
+    let item = item
+        .trim_start_matches("re:")
+        .trim_start_matches('*')
+        .trim_end_matches('*')
+        .to_string();
+
+    for (field, data_type) in fields.iter() {
+        let term = Arc::new(Literal::new(ScalarValue::Utf8(Some(format!("%{item}%")))));
+        let new_expr = create_like_expr_with_not_null_physical(schema, field, term);
+        expr_list.push(new_expr);
+    }
+    Ok(disjunction(expr_list))  // field1 LIKE '%item%' OR field2 LIKE '%item%' OR ...
+}
+```
+
+**重写结果**：`match_all('error')` → `(field1 IS NOT NULL AND field1 ILIKE '%error%') OR (field2 IS NOT NULL AND field2 ILIKE '%error%') OR ...`
+
+#### 12.3.3 fuzzy_match_all 重写
+
+```rust
+// rewrite_match.rs:267-314
+else if name == FUZZY_MATCH_ALL_UDF_NAME {
+    let item_expr = &args[0];
+    let item = extract_column(item_expr)?;     // ← 注意：提取的是 Column，不是 Literal！
+    let distance_expr = &args[1];
+    let distance = extract_int64_literal(distance_expr)?;
+    let fuzzy_expr = Arc::new(fuzzy_match_udf::FUZZY_MATCH_UDF.clone());
+
+    for (field, data_type) in fields.iter() {
+        let term = Arc::new(Literal::new(ScalarValue::Utf8(Some(format!("%{item}%")))));
+        let new_expr = Arc::new(ScalarFunctionExpr::try_new(
+            fuzzy_expr.clone(),
+            vec![
+                Arc::new(Column::new(field, schema.index_of(field).unwrap())),
+                term,
+                Arc::new(Literal::new(ScalarValue::Int64(Some(distance)))),
+            ],
+            schema.as_ref(),
+            Arc::new(ConfigOptions::default()),
+        )?) as Arc<dyn PhysicalExpr>;
+        expr_list.push(new_expr);
+    }
+    Ok(disjunction(expr_list))
+}
+```
+
+**重写结果**：`fuzzy_match_all('error', 2)` → `fuzzy_match(field1, '%error%', 2) OR fuzzy_match(field2, '%error%', 2) OR ...`
+
+**关键差异**：
+1. `match_all` 重写为 **LIKE 表达式**（DataFusion 原生操作符）
+2. `fuzzy_match_all` 重写为 **fuzzy_match UDF 调用**（自定义标量函数）
+3. `fuzzy_match_all` 重写后使用了 `fuzzy_match_udf::FUZZY_MATCH_UDF`，这是一个**可执行的 UDF**（有实际计算逻辑）
+
+#### 12.3.4 match_all_hash 重写
+
+```rust
+// rewrite_match.rs:315-362
+else if name == MATCH_ALL_HASH_UDF_NAME {
+    let item_expr = &args[0];
+    let item = extract_string_literal(item_expr)?;
+
+    // Hash the input string using MD5
+    let digest = md5::compute(item.as_bytes());
+    let hash_value = format!("{digest:x}");
+
+    for (field, data_type) in fields.iter() {
+        let term = Arc::new(Literal::new(ScalarValue::Utf8(Some(format!("%{hash_value}%")))));
+        let new_expr = create_like_expr_with_not_null_physical(schema, field, term);
+        expr_list.push(new_expr);
+    }
+    Ok(disjunction(expr_list))
+}
+```
+
+**重写结果**：`match_all_hash('some_value')` → 计算 MD5 哈希 → `(field1 IS NOT NULL AND field1 ILIKE '%<md5_hash>%') OR ...`
+
+**设计意图**：`match_all_hash` 用于搜索包含特定哈希值的字段。当原始值经过 MD5 哈希后存储在日志中，用户可以通过哈希值搜索而不暴露原始值。
+
+### 12.4 参数形态一致性分析
+
+#### 12.4.1 UDF 签名 vs from_physical_expr 解析
+
+| UDF | UDF 签名参数 | from_physical_expr 解析 | 一致性 |
+|-----|-------------|------------------------|--------|
+| `match_all` | `[Utf8]` | `args[0]` → String | ✅ 一致 |
+| `fuzzy_match_all` | `[Utf8, Int64]` | `args[0]` → String, `args[1]` → parse as u8 | ✅ 一致 |
+| `match_all_hash` | `[Utf8]` | 无对应 Condition 变体 | ⚠️ 不参与索引路径 |
+
+#### 12.4.2 UDF 签名 vs rewrite_match 重写参数提取
+
+| UDF | UDF 签名参数 | 重写时提取方式 | 一致性 |
+|-----|-------------|--------------|--------|
+| `match_all` | `[Utf8]` | `extract_string_literal(args[0])` | ✅ 一致 |
+| `fuzzy_match_all` | `[Utf8, Int64]` | `extract_column(args[0])` + `extract_int64_literal(args[1])` | ⚠️ 第一个参数用 extract_column |
+| `match_all_hash` | `[Utf8]` | `extract_string_literal(args[0])` | ✅ 一致 |
+
+**`fuzzy_match_all` 的参数提取异常**：
+
+在 `from_physical_expr` 中（`index.rs:299-302`）：
+```rust
+FUZZY_MATCH_ALL_UDF_NAME => {
+    let value = get_physical_value(&expr.args()[0]);  // 提取为值
+    let distance = get_physical_value(&expr.args()[1]).parse().unwrap_or(1);
+    Condition::FuzzyMatchAll(value, distance)
+}
+```
+
+在 `rewrite_match_all_physical` 中（`rewrite_match.rs:274-278`）：
+```rust
+let item_expr = &args[0];
+let item = extract_column(item_expr)?;  // 提取为列引用！
+let distance_expr = &args[1];
+let distance = extract_int64_literal(distance_expr)?;
+```
+
+**这是一个有意的差异**：
+- `from_physical_expr` 将第一个参数解析为**字面值**（字符串常量），因为 Tantivy 的 `FuzzyTermQuery` 需要具体的词项
+- `rewrite_match_all_physical` 将第一个参数解析为**列引用**，因为 `fuzzy_match` UDF 的第一个参数是字段列而非字面值
+
+这意味着在 SQL 中 `fuzzy_match_all('error', 2)` 的 `'error'` 在两个路径中有不同语义：
+- **索引路径**：`'error'` 是搜索词，直接传给 Tantivy 做模糊匹配
+- **回退路径**：`'error'` 被当作列名引用，然后构造 `fuzzy_match(field, '%error%', 2)` — 这里 `%error%` 是 LIKE 模式传给 fuzzy_match UDF
+
+**注意**：实际上 `extract_column` 在此处可能失败（因为 `'error'` 是字面值而非列引用），这种情况下重写会报错。这是 `fuzzy_match_all` 回退路径的一个潜在问题。
+
+### 12.5 与 DataFusion 回退过滤的协作影响
+
+#### 12.5.1 三种 UDF 的完整路径对比
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        三种 match UDF 的查询路径                             │
+├────────────────────┬────────────────────┬────────────────────────────────────┤
+│                    │ match_all           │ fuzzy_match_all  │ match_all_hash │
+├────────────────────┼────────────────────┼──────────────────┼────────────────┤
+│ IndexRule 提取     │ ✅ → MatchAll      │ ✅ → FuzzyMatch  │ ❌ 不提取      │
+│ to_tantivy_query   │ ✅ TermQuery/      │ ✅ FuzzyTerm     │ —              │
+│                    │   ContainsQuery    │   Query          │                │
+│ can_remove_filter  │ is_alphanumeric()  │ ❌ 永远 false    │ —              │
+│ RewriteMatch 重写  │ LIKE '%val%'       │ fuzzy_match(     │ LIKE '%hash%'  │
+│                    │                    │   field,'%val%', │                │
+│                    │                    │   distance)      │                │
+│ 回退过滤精度       │ 子串匹配           │ Levenshtein 距离 │ MD5 子串匹配   │
+│                    │                    │   + O2Tokenizer  │                │
+└────────────────────┴────────────────────┴──────────────────┴────────────────┘
+```
+
+#### 12.5.2 fuzzy_match_all 的双重执行语义
+
+`fuzzy_match_all` 在两个路径中的匹配行为有本质差异：
+
+**Tantivy 路径**（`index.rs:424-437`）：
+```rust
+Condition::FuzzyMatchAll(value, distance) => {
+    let default_field = default_field.ok_or_else(|| { ... })?;
+    let term = Term::from_field_text(default_field, value);
+    Box::new(FuzzyTermQuery::new(term, *distance, false))
+}
+```
+- 在 `INDEX_FIELD_NAME_FOR_ALL` 的**分词结果**中做模糊匹配
+- Tantivy 的 `FuzzyTermQuery` 使用 Levenshtein 自动机匹配词项
+- 例如：写入 "HelloWorld" → 分词为 "helloworld", "hello", "world" → 搜索 "helo"(distance=1) 匹配 "hello"
+
+**DataFusion 回退路径**（`fuzzy_match_udf.rs:51-89`）：
+```rust
+pub fn fuzzy_match_expr_impl() -> ScalarFunctionImplementation {
+    Arc::new(move |args: &[ColumnarValue]| {
+        let haystack = as_string_array(&args[0])?;
+        let needle = as_string_array(&args[1])?;
+        let distance = as_int64_array(&args[2])?;
+        let array = zip(haystack.iter(), zip(needle.iter(), distance.iter()))
+            .map(|(haystack, (needle, distance))| {
+                match (haystack, needle, distance) {
+                    (Some(haystack), Some(needle), Some(dis)) => Some({
+                        let terms = o2_collect_search_tokens(haystack);
+                        terms.iter().any(|term| levenshtein(term, needle) as i64 <= dis)
+                    }),
+                    _ => None,
+                }
+            })
+            .collect::<BooleanArray>();
+        Ok(ColumnarValue::from(Arc::new(array) as ArrayRef))
+    })
+}
+```
+- 对 Parquet 行数据中的字段值先用 `o2_collect_search_tokens` 分词
+- 对每个分词结果与 needle 做 Levenshtein 距离比较
+- 任何一个分词结果距离 ≤ distance 则匹配
+
+**两个路径的语义对齐**：Tantivy 路径和 DataFusion 回退路径都基于分词后的词项做模糊匹配，语义基本一致。
+
+#### 12.5.3 fuzzy_match_all 回退时的 IndexCondition.to_physical_expr
+
+在 `index.rs:617-656` 中，当 `is_add_filter_back = true` 时：
+
+```rust
+Condition::FuzzyMatchAll(value, distance) => {
+    let fuzzy_expr = Arc::new(fuzzy_match_udf::FUZZY_MATCH_UDF.clone());
+    let term = Arc::new(Literal::new(ScalarValue::Utf8(Some(value.to_string()))));
+    let distance = Arc::new(Literal::new(ScalarValue::Int64(Some(*distance as i64))));
+    for field in fst_fields.iter() {
+        let new_expr = Arc::new(ScalarFunctionExpr::try_new(
+            fuzzy_expr.clone(),
+            vec![
+                Arc::new(Column::new(field, schema.index_of(field).unwrap())),
+                term.clone(),
+                distance.clone(),
+            ],
+            schema,
+            Arc::new(ConfigOptions::default()),
+        )?);
+        expr_list.push(new_expr);
+    }
+    Ok(disjunction(expr_list))
+}
+```
+
+**对比 RewriteMatchPhysical 中的重写**：
+
+| 维度 | to_physical_expr（回退过滤） | RewriteMatchPhysical（优化器重写） |
+|------|---------------------------|----------------------------------|
+| 触发场景 | `is_add_filter_back = true` | 任何含 match_all 函数的 FilterExec |
+| 第二个参数 | `value.to_string()`（原始字符串） | `format!("%{item}%")`（LIKE 模式） |
+| 搜索范围 | `fst_fields`（全文搜索字段） | `fields`（同 fst_fields） |
+| UDF 实例 | `fuzzy_match_udf::FUZZY_MATCH_UDF` | 同左 |
+
+**关键差异**：`to_physical_expr` 直接传原始值给 `fuzzy_match` UDF，而 `RewriteMatchPhysical` 传的是 `%value%` 格式。但 `fuzzy_match` UDF 内部会使用 `o2_collect_search_tokens` 对 haystack 分词后逐词比较，所以 `%` 通配符实际上不影响匹配结果——`fuzzy_match` 不做 LIKE 匹配，而是做 Levenshtein 距离比较。
+
+#### 12.5.4 match_all_hash 不参与索引路径的影响
+
+由于 `match_all_hash` 不被 `IndexRule` 提取，它在查询中的行为完全由 `RewriteMatchPhysical` 决定：
+
+1. **永远走 DataFusion 扫描路径**：不经过 Tantivy 索引过滤，不影响 `is_add_filter_back` 标志
+2. **不减少 Parquet 文件扫描**：不会利用倒排索引缩小搜索范围
+3. **重写为 LIKE**：计算 MD5 哈希后，对每个 FTS 字段做 `ILIKE '%<hash>%'`
+4. **与其他索引条件组合**：如果同一 SQL 中有 `match_all`，`match_all` 走索引路径，`match_all_hash` 留在 `other_conditions` 中随 DataFusion 扫描执行
+
+```
+SQL: WHERE match_all('error') AND match_all_hash('sensitive_value')
+
+分解:
+├── match_all('error')
+│   → is_expr_valid_for_index = true
+│   → Condition::MatchAll("error")
+│   → Tantivy 索引搜索 → 缩小文件范围
+│
+└── match_all_hash('sensitive_value')
+    → is_expr_valid_for_index = false
+    → other_conditions（保留在 DataFusion 过滤器中）
+    → RewriteMatchPhysical 重写为:
+      field1 ILIKE '%<md5_hash>%' OR field2 ILIKE '%<md5_hash>%' OR ...
+    → 在 DataFusion 扫描 Parquet 时逐行求值
+```
+
+#### 12.5.5 回退过滤协作的完整决策树
+
+```
+SQL: WHERE match_all('A') AND fuzzy_match_all('B', 2) AND match_all_hash('C')
+    ↓
+IndexRule 提取
+    ├── match_all('A') → Condition::MatchAll("A")      ✅ 索引条件
+    ├── fuzzy_match_all('B', 2) → Condition::FuzzyMatchAll("B", 2) ✅ 索引条件
+    └── match_all_hash('C') → other_conditions          ❌ 非索引条件
+    ↓
+can_remove_filter()?
+    ├── MatchAll("A") → is_alphanumeric("A") = true
+    └── FuzzyMatchAll("B", 2) → false                   ← Fuzzy 永远 false
+    → 结果：can_remove_filter = false，必须保留回退过滤器
+    ↓
+Tantivy 索引搜索
+    ├── MatchAll → o2_collect_search_tokens → TermQuery
+    └── FuzzyMatchAll → FuzzyTermQuery
+    → 返回 BitVec + has_skipped_conditions
+    ↓
+is_add_filter_back?
+    ├── true → 保留 index_condition + fst_fields
+    └── false → 清空
+    ↓
+RewriteMatchPhysical 重写（始终执行）
+    ├── match_all('A') → LIKE '%A%'
+    ├── fuzzy_match_all('B', 2) → fuzzy_match(field, '%B%', 2)
+    └── match_all_hash('C') → LIKE '%<md5(C)>%'
+    ↓
+DataFusion 执行
+    ├── 如果 is_add_filter_back = true:
+    │   先用 BitVec 过滤行 → 再用回退过滤器精确匹配
+    └── 如果 is_add_filter_back = false:
+       仅用 BitVec 过滤行 → 不需要额外过滤
+       （但 match_all_hash 仍在 other_conditions 中，DataFusion 会处理）
+```
+
+#### 12.5.6 三种 UDF 回退匹配精度与性能特征
+
+| 维度 | match_all | fuzzy_match_all | match_all_hash |
+|------|-----------|-----------------|----------------|
+| **索引路径匹配** | 词项精确 + 通配符 | Levenshtein 自动机 | 无 |
+| **回退路径匹配** | LIKE 子串（大小写不敏感） | Levenshtein + O2Tokenizer 分词 | LIKE 子串（MD5 哈希） |
+| **can_remove_filter** | `is_alphanumeric(value)` | 永远 `false` | 不适用（不走索引） |
+| **索引路径精度** | 可能假阳性（通配符时） | 可能假阳性 | 不适用 |
+| **回退路径精度** | 精确（子串匹配） | 精确（距离计算） | 精确（哈希子串） |
+| **性能** | 最快（索引 + LIKE） | 中等（索引 + UDF 计算） | 最慢（无索引 + LIKE 全量扫描） |
+| **Tokenizer 参与** | 索引写入 + 查询分词 | 索引写入 + 查询分词 + 回退分词 | 仅索引写入（查询不匹配分词结果） |
+
+### 12.6 关键边界与注意事项
+
+#### 12.6.1 fuzzy_match_all 的 extract_column 陷阱
+
+在 `RewriteMatchPhysical` 中，`fuzzy_match_all` 的第一个参数使用 `extract_column` 提取，这意味着它期望参数是一个**列引用**而非字面值。然而 SQL 语法 `fuzzy_match_all('error', 2)` 传入的是字符串字面值。
+
+当 `RewriteMatchPhysical` 执行 `extract_column(item_expr)` 时，如果参数是字面值而非列引用，会返回错误。但实际上这个错误场景在正常流程中**不会发生**，因为：
+
+1. `fuzzy_match_all` 被 `IndexRule` 提取后，从原始过滤器中移除
+2. 如果 `can_remove_filter = true`（不可能，因为 FuzzyMatchAll 永远 false），或 `is_add_filter_back = false`，则过滤器被重构时不包含 `fuzzy_match_all`
+3. 只有 `is_add_filter_back = true` 时，过滤器才保留，此时 `fuzzy_match_all` 已被 `Condition::FuzzyMatchAll.to_physical_expr()` 转换为 `fuzzy_match(field, value, distance)` 格式，不再包含原始 UDF 调用
+
+因此 `RewriteMatchPhysical` 中的 `fuzzy_match_all` 分支实际上**很少被执行**——它只在 `IndexRule` 未提取 `fuzzy_match_all` 时（例如没有 FTS 字段的 stream）才触发。
+
+#### 12.6.2 match_all_hash 不走索引的设计原因
+
+`match_all_hash` 不参与 Tantivy 索引路径，可能原因：
+1. **哈希不可逆**：MD5 是单向函数，无法从哈希值反推原文，Tantivy 的词项匹配无法利用
+2. **索引中的值**：索引存储的是原始值的分词结果，而非哈希值，直接用哈希搜索索引无意义
+3. **使用场景**：`match_all_hash` 适用于搜索预计算哈希值（如 `_original` 字段中的哈希摘要），此时哈希值作为子串存在于原始数据中
+
+#### 12.6.3 回退路径中 fuzzy_match UDF 与 LIKE 的混用
+
+当 `is_add_filter_back = true` 时，回退过滤器可能同时包含：
+- `match_all` → `LIKE` 表达式
+- `fuzzy_match_all` → `fuzzy_match` UDF 调用
+- `Equal`/`In` → 二元比较表达式
+
+这些不同类型的表达式由 DataFusion 统一求值，确保最终结果的精确性。但由于 `can_remove_filter` 对 `FuzzyMatchAll` 永远返回 `false`，使用 `fuzzy_match_all` 的查询**总是**会保留回退过滤器，即使索引搜索没有跳过任何条件。
