@@ -1656,3 +1656,358 @@ pub async fn update(
 | process_node 执行 JS | `src/service/pipeline/batch_execution.rs` | 953-999 |
 | watch() 监听重建缓存 | `src/service/db/pipeline.rs` | 393-499 |
 | L1: JS 组织限制 | `src/service/functions.rs` | 360-364 |
+
+---
+
+## 七、脚本限制与缓存行为的精确语义
+
+### 7.1 编译失败后实时 Pipeline 缓存是否保留旧值
+
+#### 7.1.1 关键问题
+
+当 `ExecutablePipeline::new` 编译失败（例如函数语法错误、VRL 禁止函数等），实时 Pipeline 的内存缓存是保留旧的编译结果，还是被清空？
+
+#### 7.1.2 代码实证：缓存不保留旧值
+
+**场景 1: update_function 触发的缓存重建**
+
+`update_function` 的级联更新路径：
+
+```
+update_function (functions.rs:341)
+    └─ db::pipeline::update(&pipeline, None)      ← prev_source_stream = None
+         │
+         ├─ prev_source_stream.is_some() → false   ← 不执行 Remove
+         │
+         ├─ infra_pipeline::put()                  ← 写入新 Pipeline 到 DB
+         └─ update_cache(PipelineTableEvent::Add)  ← 触发 Put 事件
+              └─ watch() 收到 Put 事件
+                   │
+                   ├─ 获取 pipeline_stream_mapping_cache 的写锁
+                   ├─ 获取 stream_exec_pl 的写锁
+                   │
+                   ├─ ExecutablePipeline::new()     ← 尝试编译
+                   │   ├─ Err(e) → log::error!     ← 仅记录日志
+                   │   │            不执行任何缓存写入
+                   │   │            不执行任何缓存删除
+                   │   │            **旧缓存中的值仍保留！**
+                   │   └─ Ok(exec_pl) →
+                   │        pipeline_stream_mapping_cache.insert()
+                   │        stream_exec_pl.insert()    ← 覆盖旧值
+                   │
+                   └─ 释放写锁
+```
+
+**关键发现**: `watch()` 中编译失败时，代码逻辑如下 (`db/pipeline.rs:422-442`)：
+
+```rust
+if pipeline.enabled {
+    match ExecutablePipeline::new(&pipeline).await {
+        Err(e) => {
+            log::error!(...);
+            // ← 没有 remove 操作！
+            // ← 旧缓存中的 ExecutablePipeline 仍然存在！
+        }
+        Ok(exec_pl) => {
+            pipeline_stream_mapping_cache
+                .insert(pipeline_id.to_string(), stream_params.clone());
+            stream_exec_pl.insert(stream_params.clone(), exec_pl);
+        }
+    };
+}
+```
+
+**结论: 编译失败时，旧缓存值保留。**
+
+#### 7.1.3 缓存语义完整矩阵
+
+| 场景 | 触发方式 | 缓存操作 | 旧值是否保留 |
+|-----|---------|---------|-----------|
+| 新 Pipeline 保存 | save_pipeline → set → Add 事件 | 编译成功 → insert；编译失败 → 无操作 | N/A (新 Pipeline 无旧值) |
+| Pipeline 更新 | update_pipeline → update → Add 事件 | 编译成功 → insert (覆盖)；编译失败 → 无操作 | ✅ **旧值保留** |
+| 函数更新 → 级联 | update_function → update → Add 事件 | 编译成功 → insert (覆盖)；编译失败 → 无操作 | ✅ **旧值保留** |
+| Pipeline 禁用 | update_pipeline → update → Add 事件 | pipeline.enabled = false → remove | ❌ 旧值被删除 |
+| Pipeline 删除 | delete_pipeline → Remove 事件 | remove | ❌ 旧值被删除 |
+| 源 Stream 变更 | update_pipeline → update → Remove + Add | 先 remove 再 insert | ❌ 旧值被删除 |
+| 节点启动/重启 | cache() 全量加载 | clear → 逐个编译 | ❌ 旧值被清除 |
+
+#### 7.1.4 对 ingest 字段改写的实际影响
+
+**影响 1: 函数更新失败时不影响已有数据流**
+
+当 `update_function` 将函数改坏了，编译失败后：
+- 旧缓存中的 `ExecutablePipeline` 仍包含**旧版本的编译后函数**
+- Ingest 请求继续使用旧的编译结果
+- **结果**: 数据仍然被旧函数转换，不中断
+
+**影响 2: 函数更新成功时的无过渡切换**
+
+编译成功后：
+- `stream_exec_pl.insert()` 原子替换旧的 `ExecutablePipeline`
+- 正在执行的 `process_batch` 持有旧 `ExecutablePipeline` 的 `clone()`
+- 新的 `process_batch` 调用获取新的 `ExecutablePipeline`
+- **结果**: 无缝切换，无中间态
+
+**影响 3: 启动时的全量加载无旧值可用**
+
+`cache()` 中先 `clear()` 再逐个编译，若某个 Pipeline 编译失败：
+- 该 Pipeline 不会被缓存
+- **没有旧值可用**（已被 clear）
+- Ingest 走无 Pipeline 路径
+
+### 7.2 _meta 组织限制的精确绕过条件
+
+#### 7.2.1 L1 限制的校验矩阵
+
+| 操作 | 校验代码位置 | 条件 | _meta 是否放行 |
+|-----|-----------|------|-------------|
+| `save_function` (创建函数) | `functions.rs:69` | `trans_type == 1 && org_id != "_meta"` | ✅ 放行 |
+| `test_run_function` (测试函数) | `functions.rs:140` | `trans_type == 1 && org_id != "_meta"` | ✅ 放行 |
+| `update_function` (更新函数) | `functions.rs:360` | `trans_type == 1 && org_id != "_meta"` | ✅ 放行 |
+| `save_pipeline` (创建管道) | `pipeline/mod.rs:89` | `validate_no_javascript_functions` | ❌ **拒绝 JS** |
+| `update_pipeline` (更新管道) | `pipeline/mod.rs:137` | `validate_no_javascript_functions` | ❌ **拒绝 JS** |
+
+#### 7.2.2 精确绕过条件
+
+**绕过需要同时满足以下条件**:
+
+1. **组织条件**: `org_id == "_meta"`（否则 L1 在 `update_function` 阶段就拒绝）
+2. **操作序列**:
+   - 先创建 VRL 函数 → 被 Pipeline 引用 → 校验通过
+   - 后将同一函数改为 JS → `update_function` 在 `_meta` 中放行
+   - 级联的 `db::pipeline::update` 无 L2 校验
+3. **缓存路径**: watch() → `register_functions()` 不检查 JS 限制 → 编译成功 → JS 进入缓存
+
+**非 _meta 组织无法绕过**: 因为 `update_function` 中 L1 拦截拒绝将函数改为 JS，请求在函数更新阶段就被拒绝，不会触发 Pipeline 缓存重建。
+
+#### 7.2.3 绕过路径的执行流验证
+
+```
+仅 _meta 组织可绕过:
+═══════════════════
+
+非 _meta 组织:
+  update_function(trans_type=1)
+      └─ L1 检查: org_id != "_meta" → ❌ 拒绝 (functions.rs:360)
+                    函数更新失败，Pipeline 缓存不变
+
+_meta 组织:
+  update_function(trans_type=1)
+      └─ L1 检查: org_id == "_meta" → ✅ 通过
+      └─ 编译 JS → ✅ 通过
+      └─ db::functions::set() → 函数类型已变为 JS
+      └─ 遍历关联 Pipeline:
+           db::pipeline::update(&pipeline, None)
+              └─ 无 L2 校验
+              └─ update_cache(Add) → watch() → register_functions()
+                   └─ transform.is_js() == true
+                   └─ compile_js_function() → ✅ 编译成功
+                   └─ CompiledFunctionRuntime::JS → 存入缓存
+```
+
+### 7.3 实时路径与调度路径的校验/执行时机差异
+
+#### 7.3.1 两路径的架构对比
+
+```
+实时路径 (Realtime Pipeline):
+═════════════════════════════
+
+  Ingest 请求 → get_executable_pipeline() → process_batch()
+                     │
+                     └─ STREAM_EXECUTABLE_PIPELINES 缓存
+                        (预编译的 ExecutablePipeline, 含 function_map)
+
+  特点:
+  ├─ 缓存构建时机: save/update_pipeline 触发, watch() 监听
+  ├─ 校验时机: 仅在 save/update_pipeline HTTP API 中
+  ├─ 编译时机: 缓存构建时一次性编译, Ingest 时直接使用
+  ├─ 执行频率: 每个 Ingest 请求
+  └─ 缓存生命周期: 长驻内存, 直到 Pipeline 变更/禁用/删除
+```
+
+```
+调度路径 (Scheduled Pipeline):
+═════════════════════════════
+
+  定时触发 → scheduler handler → get_scheduled_pipeline_from_cache()
+                │
+                ├─ 缓存命中: 使用 Pipeline 原始定义
+                └─ 缓存未命中: get_by_id() → cache_scheduled_pipeline()
+                     │
+                     └─ SCHEDULED_PIPELINES 缓存
+                        (仅存 Pipeline 原始定义, 不含编译后函数)
+            │
+            ▼
+  ExecutablePipeline::new(&pipeline)   ← 每次调度执行时实时编译!
+      │
+      └─ process_batch()
+
+  特点:
+  ├─ 缓存构建时机: watch() 监听, 存原始 Pipeline 定义
+  ├─ 校验时机: 同实时路径, 仅在 save/update_pipeline HTTP API 中
+  ├─ 编译时机: 每次调度执行时实时编译 (非预编译!)
+  ├─ 执行频率: 按调度周期 (cron/固定间隔)
+  └─ 缓存生命周期: Pipeline 定义长驻, ExecutablePipeline 每次新建
+```
+
+#### 7.3.2 关键差异详表
+
+| 维度 | 实时路径 (Realtime) | 调度路径 (Scheduled) |
+|-----|-------------------|--------------------|
+| **缓存内容** | `ExecutablePipeline` (编译后) | `Pipeline` (原始定义) |
+| **编译时机** | 缓存构建时 (一次) | 每次执行时 (每次) |
+| **缓存查找方式** | `StreamParams` → `ExecutablePipeline` | `pipeline_id` → `Pipeline` |
+| **缓存不命中** | Ingest 走无 Pipeline 路径 | 从 DB 获取 → 缓存 → 继续执行 |
+| **函数编译位置** | `register_functions()` | `ExecutablePipeline::new()` (handlers.rs:2173) |
+| **JS 校验** | 缓存构建时无 L2 校验 | 执行时无 L2 校验 |
+| **编译失败处理** | 旧缓存保留, Ingest 用旧值 | 本次调度失败, 5 分钟后重试 |
+| **执行触发** | 每个 Ingest 请求 | 定时调度器 |
+
+#### 7.3.3 调度路径的编译失败处理
+
+`handlers.rs:2173-2207`:
+
+```rust
+match ExecutablePipeline::new(&pipeline).await {
+    Err(e) => {
+        let err_msg = format!(
+            "Pipeline org/name({org_id}/{pipeline_name}) \
+             failed to initialize to ExecutablePipeline. Caused by: {e}"
+        );
+        log::error!("{err_msg}");
+        ingestion_error_msg = Some(err_msg);
+        // ← 不重试, 本次调度结束
+        // ← 数据不被处理, 不被写入目标流
+    }
+    Ok(exec_pl) => match exec_pl.process_batch(&org_id, local_val, None).await {
+        // ...
+    }
+}
+```
+
+**关键差异**: 调度路径编译失败时，**没有任何旧值可用**（因为每次都是重新编译），查询结果直接被丢弃。
+
+### 7.4 两条路径差异对 Ingest 字段改写与错误副作用的影响
+
+#### 7.4.1 字段改写的一致性保证
+
+| 场景 | 实时路径 | 调度路径 |
+|-----|---------|---------|
+| 正常执行 | 用缓存的编译后函数改写字段 | 每次编译后改写字段 |
+| 函数更新后编译失败 | 用**旧函数**改写（缓存保留） | 编译失败 → 数据**不被处理** |
+| 函数更新后编译成功 | 用**新函数**改写（缓存替换） | 用**新函数**改写 |
+| Pipeline 禁用 | 缓存被删除 → 无改写 | 缓存被删除 → 跳过调度 |
+
+**实时路径的隐式降级**: 函数更新编译失败时，Ingest 仍使用旧函数。用户预期数据用新函数处理，但实际仍在用旧函数，且无明确告警。这是一种**静默降级**。
+
+**调度路径的显式失败**: 函数更新编译失败时，本次调度直接失败，数据不被处理。错误被记录到 `TriggerData`，用户可以通过 self_reporting 看到。这是一种**显式失败**。
+
+#### 7.4.2 _meta 绕过对两条路径的不同影响
+
+| 影响维度 | 实时路径 | 调度路径 |
+|---------|---------|---------|
+| JS 编译后缓存 | JS 存入 `STREAM_EXECUTABLE_PIPELINES`, 长驻内存 | JS 不缓存, 每次编译 |
+| JS 执行频率 | 每个 Ingest 请求 | 每次调度 |
+| JS 对内存的影响 | `thread_local!` 的 JS 上下文被高频使用 | 低频使用 |
+| JS 错误的影响范围 | 每个 Ingest 请求都受影响 | 仅本次调度受影响 |
+| JS 错误副作用控制 | `apply_js_fn` 返回原始 row → 数据写入源流 | `process_batch` 错误 → 数据不写入目标流 |
+
+#### 7.4.3 缓存语义对错误判断的影响
+
+**核心问题**: 运维人员如何判断 Pipeline 是否正在正常工作？
+
+| 判断依据 | 实时路径 | 调度路径 |
+|---------|---------|---------|
+| `publish_error` | 仅编译失败时发布 | 编译失败 + 执行失败都发布 |
+| `INGEST_ERRORS` 指标 | 每次函数执行失败上报 | 不适用（非 Ingest 路径） |
+| `TriggerData` | 不适用 | 编译/执行失败均记录 |
+| 缓存中有值 | 不代表使用最新函数 | 每次重新编译, 值一定是最新的 |
+| 缓存中无值 | 代表 Pipeline 不执行 | 仅代表缓存未命中, 可从 DB 恢复 |
+
+**实时路径的判断盲区**:
+- 缓存中存在 `ExecutablePipeline` ≠ Pipeline 使用最新函数
+- 函数更新后编译失败 → 缓存中仍是旧值 → 运维无法通过缓存状态判断是否在使用旧函数
+- 唯一判断方式: 检查 `publish_error` 的 self_reporting 数据
+
+**调度路径的判断清晰**:
+- 每次执行都重新编译 → 编译结果一定反映当前函数状态
+- 失败有明确的 `TriggerData` 记录 → 可追溯
+
+#### 7.4.4 完整行为总结图
+
+```
+                          函数更新后的系统行为
+                          ════════════════════
+
+  update_function(func_a: VRL→JS, org="_meta")
+      │
+      ├─ L1 检查通过 (org == "_meta")
+      ├─ JS 编译通过
+      ├─ db::functions::set() → DB 中 func_a 已变为 JS
+      │
+      └─ 级联 Pipeline 更新
+           │
+           ├─ db::pipeline::update() → 无 L2 校验
+           └─ watch() → 缓存重建
+                │
+                ├─ register_functions()
+                │   ├─ get_transforms() → DB 查询: func_a 是 JS
+                │   ├─ compile_js_function() → 编译成功
+                │   └─ CompiledFunctionRuntime::JS → 存入 function_map
+                │
+                ├─ 实时路径:
+                │   └─ stream_exec_pl.insert() → 新 ExecutablePipeline
+                │        ├─ 含 JS 编译结果
+                │        └─ 下一个 Ingest 请求使用 JS 函数
+                │
+                └─ 调度路径:
+                     └─ SCHEDULED_PIPELINES.insert() → Pipeline 原始定义
+                          ├─ 不含编译结果
+                          └─ 下次调度时 ExecutablePipeline::new()
+                               ├─ register_functions() → JS 编译
+                               └─ process_batch() → JS 执行
+```
+
+```
+                          函数更新编译失败后的系统行为
+                          ══════════════════════════════
+
+  update_function(func_a: VRL→语法错误)
+      │
+      ├─ 编译失败 → HTTP 400 返回
+      ├─ db::functions::set() 不执行 → DB 中 func_a 仍是旧 VRL
+      │
+      └─ 级联 Pipeline 更新不触发
+           │
+           └─ Pipeline 缓存不变 → 继续使用旧 VRL 函数
+
+  ─── 对比: Pipeline 直接更新编译失败 ───
+
+  update_pipeline → watch() → ExecutablePipeline::new() 失败
+      │
+      ├─ 实时路径:
+      │   ├─ stream_exec_pl 中的旧值保留
+      │   ├─ Ingest 继续使用旧 ExecutablePipeline
+      │   └─ 用户无感知, 数据仍被旧函数处理
+      │
+      └─ 调度路径:
+           ├─ SCHEDULED_PIPELINES 中的旧值保留 (Pipeline 定义)
+           ├─ 下次调度时 ExecutablePipeline::new() 再次尝试编译
+           ├─ 如果函数已被修复 → 编译成功 → 正常执行
+           └─ 如果函数未修复 → 编译再次失败 → 调度失败
+```
+
+### 7.5 缓存与限制语义关键代码索引
+
+| 功能 | 文件位置 | 行号 |
+|-----|---------|-----|
+| watch() 编译失败保留旧缓存 | `src/service/db/pipeline.rs` | 422-442 |
+| db::pipeline::update 无 L2 校验 | `src/service/db/pipeline.rs` | 73-86 |
+| update_function L1 检查 (_meta 放行) | `src/service/functions.rs` | 360-364 |
+| 实时路径: Ingest 获取缓存 | `src/service/db/pipeline.rs` | 97-103 |
+| 调度路径: 获取 Pipeline 定义 | `src/service/db/pipeline.rs` | 158-159 |
+| 调度路径: 每次执行编译 | `src/service/alerts/scheduler/handlers.rs` | 2173 |
+| 调度路径: 编译失败处理 | `src/service/alerts/scheduler/handlers.rs` | 2174-2179 |
+| 启动全量加载: clear + 编译 | `src/service/db/pipeline.rs` | 246-275 |
+| register_functions (接受 JS) | `src/service/pipeline/batch_execution.rs` | 136-168 |
