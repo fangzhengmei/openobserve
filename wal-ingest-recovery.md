@@ -170,9 +170,12 @@ async fn rotate(&self, ...) -> Result<()> {
 
 **persist()** (`src/ingester/src/immutable.rs:92-131`)：
 
+此阶段仅将 Memtable 落盘为本地 `.parquet` 文件，**不涉及对象存储上传**。
+
 ```
 Step 1: 将 Memtable 写入 .par 临时文件
     ↓  memtable.persist() → 生成多个 .par 文件
+    ↓  同时写入 WAL_PARQUET_METADATA 内存缓存（key 为 .parquet 路径）
 Step 2: 创建 .lock 文件，记录所有 .par 文件路径
     ↓  fs::write(done_path, lock_data)
 Step 3: 删除原始 .wal 文件
@@ -187,11 +190,23 @@ Step 5: 删除 .lock 文件
 ```rust
 pub(crate) async fn persist(&self, wal_path: &PathBuf) -> Result<PersistStat> {
     // 1. dump memtable to disk
-    let (schema_size, paths) = self.memtable.persist(...).await?;
+    let (schema_size, paths) = self
+        .memtable
+        .persist(
+            self.memtable.id(),
+            self.idx,
+            &self.key.org_id,
+            &self.key.stream_type,
+        )
+        .await?;
     
     // 2. create a lock file
     let done_path = wal_path.with_extension("lock");
-    let lock_data = paths.iter().map(...).join("\n");
+    let lock_data = paths
+        .iter()
+        .map(|(p, ..)| p.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
     fs::write(&done_path, lock_data.as_bytes()).await?;
     
     // 3. delete wal file
@@ -207,7 +222,33 @@ pub(crate) async fn persist(&self, wal_path: &PathBuf) -> Result<PersistStat> {
 }
 ```
 
-### 3.4 持久化调度
+**WAL_PARQUET_METADATA 缓存**：`memtable.persist()` 在写入 `.par` 之前，会将 `FileMeta` 以 `.parquet` 路径为 key 写入全局缓存 `WAL_PARQUET_METADATA` (`src/ingester/src/partition.rs:257-270`)。后续 `job::files::parquet` 扫描时优先从此缓存读取元数据，避免反复解析 parquet 文件。
+
+### 3.4 persist 与 upload 的职责分界
+
+**重要修正**：`immutable.persist()` 完成后，parquet 文件仅存在于本地 WAL 目录 (`data_wal_dir/files/`)。上传到对象存储是由**独立的后台任务** `job::files::parquet` 完成的，而非 persist 阶段。
+
+```
+persist 阶段 (ingester 进程内)          upload 阶段 (job::files::parquet)
+───────────────────────────          ─────────────────────────────────
+
+WAL → Memtable → IMMUTABLES          
+         ↓                           
+   persist() 5步协议                  
+         ↓                           
+   本地 .parquet 文件  ╶──────╴╴╴╴→  scan_wal_files() 扫描 .parquet
+   WAL_PARQUET_METADATA 缓存          ↓
+                                     prepare_files() 读取 FileMeta
+                                         ↓
+                                     move_files()
+                                     ├─ merge_files() 合并小文件
+                                     ├─ storage::put() 上传对象存储
+                                     ├─ db::file_list::set() 写元数据
+                                     ├─ [可选] create_tantivy_index()
+                                     └─ remove_file() 删除本地文件
+```
+
+### 3.5 持久化调度
 
 **持久化工作线程** (`src/ingester/src/lib.rs:134-178`)：
 - 启动 `mem_dump_thread_num` 个工作线程，从 channel 接收持久化任务
@@ -398,12 +439,28 @@ let entry = match reader.read_entry() {
                               │  Step 3: 删 .wal 文件       │
                               │  Step 4: .par → .parquet    │
                               │  Step 5: 删 .lock 文件      │
+                              │  + 写 WAL_PARQUET_METADATA  │
+                              └──────────────┬──────────────┘
+                                             │
+                              ┌──────────────▼──────────────┐
+                              │ job::files::parquet 后台任务 │
+                              │ 每隔 file_push_interval 扫描 │
+                              │ 本地 .parquet 文件           │
+                              └──────────────┬──────────────┘
+                                             │
+                              ┌──────────────▼──────────────┐
+                              │ move_files()                 │
+                              │ 1. merge_files() 合并小文件  │
+                              │ 2. storage::put() 上传存储   │
+                              │ 3. db::file_list::set() 写元 │
+                              │ 4. [可选] 生成倒排索引       │
+                              │ 5. 删除本地 .parquet 文件    │
                               └──────────────┬──────────────┘
                                              │
                                              ▼
                       ┌──────────────────────────────────────────┐
-                      │          上传到对象存储 / Compactor        │
-                      │         run_merge() / run_retention()     │
+                      │        对象存储中的 Parquet 文件          │
+                      │      + file_list DB 元数据记录            │
                       └──────────────────────────────────────────┘
 ```
 
@@ -631,24 +688,25 @@ pub async fn merge_parquet_files(...) -> Result<MergeParquetResult> {
 |------|----------|-----------|
 | **数据来源** | HTTP/Ingest API 直接接收用户数据 | 对象存储中的 parquet 文件 |
 | **处理延迟** | 低延迟，近实时处理 | 高延迟，T+N 处理（3*retention_time） |
-| **输出位置** | 本地磁盘 `.parquet` | 对象存储 `s3/gcs/oss` |
+| **输出位置** | 本地磁盘 `.parquet` + 上传到对象存储 | 对象存储 `s3/gcs/oss` |
 | **文件粒度** | 小文件，频繁生成 | 大文件，按 `max_file_size` 合并 |
 | **Schema 处理** | 动态推断、实时演化 | Schema 并集、规范化 |
-| **索引生成** | 可选（ingester 可配置） | 必选（基于配置的 FTS/Index 字段） |
+| **索引生成** | 与 Compactor 条件相同（见下方详解） | 与 Ingester 条件相同 |
 | **状态依赖** | 强依赖本地 WAL + Memtable | 依赖 file_list DB 元数据 |
 | **并发模型** | 单 Writer + 多持久化 Worker | JobScheduler + MergeWorker 两级 |
+| **合并时机** | 上传前合并小 parquet → 大 parquet | 定时合并多个大 parquet |
 
 ### 9.2 数据流衔接
 
 ```
-Ingester 阶段                          Compactor 阶段
-───────────                          ──────────────
+Ingester 阶段                                    Compactor 阶段
+───────────                                    ──────────────
 
 Ingest API → [WAL] → Memtable
                     ↓
             rotate() 阈值触发
                     ↓
-          immutable.persist()
+          immutable.persist()          ← 仅写本地磁盘
           ├─ .par 临时文件
           ├─ .lock 文件
           ├─ 删除 .wal
@@ -656,30 +714,93 @@ Ingest API → [WAL] → Memtable
           └─ 删除 .lock
                     ↓
           本地磁盘 .parquet 文件
+          + WAL_PARQUET_METADATA 缓存
                     ↓
-          文件上传到对象存储 ╶╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╮
-          写入 file_list 元数据                        │
-                    │                                    │
-                    │  等待 3*max_file_retention_time     │
-                    │                                    │
-                    ▼                                    │
-          generate_job_by_stream()                      │
-                    │                                    │
-                    ▼                                    │
-          run_merge() 拉取 Jobs                          │
-                    │                                    │
-                    ▼                                    │
-          merge_by_stream() 按分区分组                   │
-                    │                                    │
-                    ▼                                    │
-          merge_files()  ────────────────────────────────╯
+          job::files::parquet 后台任务
+          ├─ scan_wal_files() 扫描本地 .parquet
+          ├─ prepare_files() 读取 FileMeta
+          ├─ move_files()
+          │   ├─ merge_files() 合并小文件 (DataFusion)
+          │   ├─ storage::put() 上传到对象存储
+          │   ├─ db::file_list::set() 写入 file_list 元数据
+          │   ├─ [可选] create_tantivy_index() 生成索引
+          │   └─ remove_file() 删除本地 .parquet
+          └─ scan_pending_delete_files() 清理延迟删除
+                    ↓
+          对象存储 .parquet + file_list ╶╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╮
+                                                                │
+                    等待 3*max_file_retention_time               │
+                                                                │
+                    ▼                                           │
+          generate_job_by_stream()                              │
+                    │                                           │
+                    ▼                                           │
+          run_merge() 拉取 Jobs                                 │
+                    │                                           │
+                    ▼                                           │
+          merge_by_stream() 按分区分组                          │
+                    │                                           │
+                    ▼                                           │
+          merge_files()  ───────────────────────────────────────╯
           ├─ 下载 parquet 到本地缓存
           ├─ DataFusion 排序合并
           ├─ 生成新的大 parquet
           ├─ 上传到对象存储
-          ├─ 生成倒排索引
-          └─ 更新 file_list（新增+标记删除）
+          ├─ [可选] generate_inverted_index()
+          └─ write_file_list()（新增+标记删除）
 ```
+
+### 9.3 倒排索引生成的开关条件
+
+**Ingester 和 Compactor 的索引生成条件完全一致**，需要同时满足以下三个条件：
+
+```
+条件 1: cfg.common.inverted_index_enabled == true
+    ↓  全局配置开关
+条件 2: stream_type.support_index() == true
+    ↓  仅 Logs / Metrics / Traces / Metadata 支持索引
+    ↓  (Index / EnrichmentTables / ServiceGraph / Filelist 不支持)
+条件 3: need_index == true
+    ↓  stream settings 中配置了 full_text_search_fields 或 index_fields
+    ↓  且这些字段存在于 latest_schema 中
+```
+
+**Ingester 侧** (`src/job/files/parquet.rs:902-935`)：
+```rust
+// 条件 1 + 2: 全局开关 + stream 类型
+if !cfg.common.inverted_index_enabled || !stream_type.support_index() {
+    return Ok((account, new_file_key, new_file_meta, retain_file_list));
+}
+// 条件 3: 是否有可索引字段
+let need_index = full_text_search_fields
+    .iter()
+    .chain(index_fields.iter())
+    .any(|f| latest_schema_fields.contains(f));
+if !need_index {
+    return Ok((account, new_file_key, new_file_meta, retain_file_list));
+}
+// 生成 tantivy 索引
+let index_size = create_tantivy_index("INGESTER", ...).await?;
+```
+
+**Compactor 侧** (`src/service/compact/merge.rs:874-934`)：
+```rust
+// 条件 3: 先检查是否有可索引字段
+let need_index = full_text_search_fields
+    .iter()
+    .chain(index_fields.iter())
+    .any(|f| latest_schema_fields.contains(f));
+if !need_index {
+    log::debug!("skip index generation for stream: ...");
+}
+
+// 条件 1 + 2 + 3: 全部满足才生成
+if cfg.common.inverted_index_enabled && stream_type.support_index() && need_index {
+    generate_inverted_index("COMPACTOR", ...).await?;
+}
+```
+
+**差异**：Ingester 先检查条件 1+2（可提前 return），再检查条件 3；Compactor 先检查条件 3（打印 debug 日志），再组合检查三个条件。但最终行为一致。
 
 ---
 
@@ -688,13 +809,13 @@ Ingest API → [WAL] → Memtable
 ### 10.1 文件生命周期状态机
 
 ```
-              Ingester 侧                              Compactor 侧
-           ───────────────                           ─────────────
+              Ingester persist 阶段              Ingester upload 阶段           Compactor 阶段
+              ─────────────────────              ────────────────────           ──────────────
 
   [0] 初始状态
     │
     ▼  ingest 请求
-  [1] WAL 写入中 (.wal.tmp?)
+  [1] WAL 写入中
     │  成功
     ▼
   [2] .wal 文件 (完整)
@@ -703,12 +824,12 @@ Ingest API → [WAL] → Memtable
   [3] IMMUTABLES 队列
     │
     ▼  persist() Step 1
-  [4] 写入 .par 临时文件
+  [4] 写入 .par + WAL_PARQUET_METADATA
     │  ├─ 崩溃 → 重启发现无 .lock → 删 .par
     │  └─ 成功
     ▼  persist() Step 2
   [5] 写入 .lock 文件
-    │  ├─ 崩溃 → .wal + .lock + .par 共存
+    │  ├─ 崩溃 → .wal + .lock + .par
     │  │         → 重启补做: 删.wal, .par→.parquet, 删.lock
     │  └─ 成功
     ▼  persist() Step 3
@@ -724,36 +845,50 @@ Ingest API → [WAL] → Memtable
     ▼  persist() Step 5
   [8] 删除 .lock 文件
     │
-    ▼  本地文件 → 对象存储
-  [9] 对象存储 .parquet
-    │  ├─ 崩溃 → 上传中断，文件不完整
-    │  │         → 下次重新上传（基于 file_list）
+    │  ──── persist 完成，本地 .parquet 就绪 ────
+    ▼
+  [9] PROCESSING_FILES 标记
+    │  job::files::parquet 后台扫描
+    ▼
+  [10] merge_files() 合并小 parquet
+    │  DataFusion 排序合并
+    │  ├─ 崩溃 → 本地 .parquet 仍在，下次重试
     │  └─ 成功
-    ▼  写入 file_list
-  [10] file_list 元数据
-    │  ├─ 崩溃 → 元数据未写入，文件孤立
-    │  │         → GC 扫描清理
+    ▼
+  [11] storage::put() 上传到对象存储
+    │  ├─ 崩溃 → 本地 .parquet 仍在，下次重试上传
     │  └─ 成功
-    ▼  等待 3*retention
-  [11] 生成 compactor job
+    ▼
+  [12] db::file_list::set() 写入元数据
+    │  ├─ 崩溃 → 对象存储有孤立文件，无元数据
+    │  │         → 下次上传新文件时覆盖（UUID 不同）
+    │  │         → 孤立文件需 GC 清理
+    │  └─ 成功
+    ▼
+  [13] [可选] create_tantivy_index() 生成索引
+    │  ├─ 崩溃 → 索引缺失，搜索降级
+    │  │         → compactor 合并时重新生成
+    │  └─ 成功
+    ▼
+  [14] 删除本地 .parquet 文件
+    │  ├─ 文件被 WAL 锁定 → 加入 pending_delete 列表
+    │  │         → 下次 scan_pending_delete_files() 清理
+    │  ├─ 删除失败 → 加入 pending_delete 列表
+    │  └─ 成功 → 从 PROCESSING_FILES 移除
+    ▼
+  [15] 对象存储 .parquet + file_list 元数据
     │
-    ▼  merge_files() Step 1
-  [12] 下载 parquet 到缓存
-    │
-    ▼  merge_files() Step 2-4
-  [13] DataFusion 合并 → 新 parquet
-    │
-    ▼  merge_files() Step 5
-  [14] 上传新 parquet
-    │
-    ▼  merge_files() Step 6
-  [15] 更新 file_list（新增+删除标记）
+    │  等待 3*max_file_retention_time
+    ▼
+  [16] compactor 合并 + 索引重新生成
     │
     ▼  delay_delete
-  [16] 延迟删除旧文件
+  [17] 延迟删除旧文件
 ```
 
 ### 10.2 异常场景矩阵
+
+#### persist 阶段异常
 
 | 崩溃位置 | 现场特征 | 恢复策略 | 数据风险 |
 |---------|---------|---------|---------|
@@ -764,10 +899,28 @@ Ingest API → [WAL] → Memtable
 | **Step 3 删 .wal 后** | `.lock` + `.par`（无 `.wal`） | `.par`→`.parquet`，删 `.lock` | 无 |
 | **Step 4 重命名中** | 部分 `.par` 已重命名 | 遍历 `.lock` 列表，补做重命名 | 无 |
 | **Step 5 删 .lock 前** | `.lock` + `.parquet` | 删 `.lock` | 无 |
-| **上传对象存储中** | 新文件部分上传 | 下次合并重新生成 | 中：可能重复上传 |
-| **更新 file_list 前** | 新文件已上传，元数据未写 | 新文件孤立，GC 清理 | 中：存储泄漏 |
-| **标记删除旧文件后** | 旧文件 deleted=true 但未物理删除 | delay_delete 后续清理 | 低：存储临时占用 |
+
+#### upload 阶段异常（job::files::parquet）
+
+| 崩溃位置 | 现场特征 | 恢复策略 | 数据风险 |
+|---------|---------|---------|---------|
+| **merge_files() 合并中** | 本地 `.parquet` 仍在 | `PROCESSING_FILES` 标记仍在，下次循环重新合并 | 无：原文件未动 |
+| **storage::put() 上传中** | 本地 `.parquet` 仍在，对象存储可能有部分数据 | 下次循环重新上传（新文件名含 UUID，旧部分由 GC 清理） | 低：对象存储可能有孤立文件 |
+| **db::file_list::set() 写元数据前** | 对象存储有文件，file_list 无记录 | 下次上传产生新文件，旧孤立文件由 GC 清理 | 中：存储泄漏直到 GC |
+| **db::file_list::set() 重试** | set() 内部最多重试 5 次，每次间隔 1 秒 | 5 次均失败后释放 PROCESSING_FILES 标记，下次重试 | 低 |
+| **create_tantivy_index() 索引生成失败** | parquet 已上传，索引缺失 | 搜索降级走 parquet 扫描；compactor 合并时重新生成 | 低：搜索性能下降 |
+| **删除本地文件时文件被锁定** | 文件被 WAL 读锁持有 | 加入 `pending_delete` 列表，后续 `scan_pending_delete_files()` 清理 | 无 |
+| **删除本地文件 IO 错误** | 文件残留 | 同上，加入 `pending_delete`，下次清理 | 低：磁盘临时占用 |
+| **DB 健康检查失败** | 跳过本轮扫描 | 避免 DB 不可用时生成孤立对象存储文件 | 无：主动跳过 |
+
+#### compactor 阶段异常
+
+| 崩溃位置 | 现场特征 | 恢复策略 | 数据风险 |
+|---------|---------|---------|---------|
 | **合并查询执行中** | 新文件未生成 | Job 超时释放，下次重试 | 无 |
+| **上传新 parquet 后** | 新文件已上传，file_list 未更新 | `write_file_list()` 重试 5 次；孤立文件 GC 清理 | 中：存储泄漏 |
+| **write_file_list() 部分成功** | batch_process 事务性操作 | 重试保证最终一致 | 低 |
+| **标记删除旧文件后** | 旧文件 deleted=true 但未物理删除 | delay_delete 后续清理 | 低：存储临时占用 |
 
 ### 10.3 Compactor Job 容错机制
 
@@ -830,5 +983,226 @@ tokio::task::spawn(async move {
 | `src/service/compact/worker.rs` | Worker 调度 | `JobScheduler`, `MergeWorker` |
 | `src/service/compact/dump.rs` | File list dump | `dump()`, `generate_dump()` |
 | `src/service/search/datafusion/merge/mod.rs` | DataFusion 合并引擎 | `merge_parquet_files()`, `write_parquet()` |
-| `src/service/file_list/mod.rs` | File list 元数据 | `query_for_merge()`, `batch_process()` |
+| `src/service/file_list/mod.rs` | File list 元数据 | `set()`, `progress()` |
+| `src/service/db/file_list/local.rs` | 本地文件状态管理 | `add_pending_delete()`, `add_removing()` |
 | `src/job/compactor.rs` | Job 总调度 | `run()` 循环调用 run_merge/run_retention |
+| `src/job/files/parquet.rs` | Ingester parquet 上传任务 | `run()`, `move_files()`, `merge_files()` |
+| `src/job/files/mod.rs` | Ingester 文件任务入口 | `run()`, `generate_storage_file_name()` |
+| `src/ingester/src/partition.rs` | Memtable 持久化与分区 | `persist()`, `WAL_PARQUET_METADATA` 写入 |
+
+---
+
+## 十二、Ingester Parquet 上传至对象存储的完整流程
+
+### 12.1 启动入口
+
+`job::files::mod.rs` 在 Ingester 节点启动时注册 (`src/job/files/mod.rs:25-38`)：
+
+```rust
+pub async fn run() -> Result<(), anyhow::Error> {
+    if !LOCAL_NODE.is_ingester() {
+        return Ok(());
+    }
+    crate::service::db::file_list::local::load_pending_delete().await?;
+    tokio::task::spawn(parquet::run());    // parquet 上传任务
+    tokio::task::spawn(broadcast::run());   // file_list 广播
+    tokio::task::spawn(clean_empty_dirs()); // 空目录清理
+}
+```
+
+### 12.2 主循环
+
+`job::files::parquet::run()` (`src/job/files/parquet.rs:70-178`)：
+
+```
+loop {
+    sleep(file_push_interval)              // 每隔 file_push_interval 秒
+        ↓
+    infra::file_list::health_check()      // DB 健康检查，失败则跳过本轮
+        ↓
+    scan_pending_delete_files()            // 清理待删除文件
+        ↓
+    scan_wal_files(tx)                    // 扫描本地 .parquet 文件
+        ↓
+    [Worker threads] ← (prefix, files)    // 工作线程消费
+        ↓
+    move_files(thread_id, prefix, files)  // 合并+上传
+}
+```
+
+**关键保护**：DB 健康检查 (`parquet.rs:137-142`)：
+```rust
+if let Err(e) = infra::file_list::health_check().await {
+    log::error!(
+        "[INGESTER:JOB] DB health check failed, skip uploading to avoid orphaned files in object store: {e}"
+    );
+    continue;
+}
+```
+DB 不可用时主动跳过上传，避免对象存储产生无元数据的孤立文件。
+
+### 12.3 文件准备阶段
+
+**prepare_files()** (`src/job/files/parquet.rs:284-349`)：
+
+```rust
+// 1. 遍历扫描到的 .parquet 文件
+for file in files {
+    let file_key = strip_prefix(&file, &wal_dir);  // 获取相对路径
+    
+    // 2. 检查是否正在处理
+    if PROCESSING_FILES.read().await.contains(&file_key) {
+        continue;  // 跳过已在处理的文件
+    }
+    
+    // 3. 读取 FileMeta（优先从内存缓存）
+    let parquet_meta = if let Some(meta) = WAL_PARQUET_METADATA.read().await.get(&file_key) {
+        meta.clone()  // 优先从内存缓存读取
+    } else if let Ok(parquet_meta) = read_metadata_from_file(&file).await {
+        parquet_meta  // 回退到解析文件
+    } else {
+        continue;  // 无法获取元数据，跳过
+    };
+    
+    // 4. 空文件直接删除
+    if parquet_meta.eq(&FileMeta::default()) {
+        remove_file(wal_dir.join(&file)).await;
+        continue;
+    }
+    
+    // 5. 按分区前缀分组，标记为处理中
+    PROCESSING_FILES.write().await.insert(file_key);
+}
+```
+
+### 12.4 文件移动（合并 + 上传 + 清理）
+
+**move_files()** (`src/job/files/parquet.rs:351-623`)：
+
+```
+Step 1: 前置检查
+    ├─ 检查 stream 是否正在删除 → 直接删除文件
+    ├─ 获取 latest schema → 失败则释放文件
+    ├─ 检查 stream 是否存在 → 不存在则删除文件
+    └─ 检查数据保留期 → 过期则删除文件
+
+Step 2: 合并阈值判断
+    ├─ 文件总大小 < min(max_file_size_on_disk, compact.max_file_size)
+    │   且字段数 < file_move_fields_limit
+    │   → 检查是否有过期文件（created_at < now - max_file_retention_time）
+    │   → 没有过期文件则释放，等待更多数据积累
+    └─ 满足阈值或有过期文件 → 继续合并
+
+Step 3: 合并循环
+    loop {
+        merge_files() → 返回 (account, new_file_key, new_file_meta, old_file_list)
+            ↓
+        db::file_list::set() → 写入 file_list 元数据（重试 5 次）
+            ↓
+        删除旧文件:
+            ├─ wal::lock_files_exists() → 文件被锁定
+            │   → add_pending_delete() → 延迟删除
+            └─ 文件未被锁定
+                → remove_file() → 删除本地文件
+                → 从 PROCESSING_FILES 移除
+    }
+```
+
+### 12.5 Ingester 合并文件细节
+
+**merge_files()** (`src/job/files/parquet.rs:627-937`)：
+
+与 Compactor 的 `merge_files()` 逻辑相似但有以下区别：
+
+| 维度 | Ingester merge_files() | Compactor merge_files() |
+|------|----------------------|------------------------|
+| 数据源 | 本地 WAL 目录 `.parquet` | 对象存储下载到缓存 |
+| 最大文件大小 | `min(max_file_size_on_disk, compact.max_file_size)` | `compact.max_file_size` |
+| 合并引擎 | `merge::merge_parquet_files()` | `merge::merge_parquet_files()` |
+| 结果类型 | 仅支持 `Single`（Multiple 会 panic） | 支持 `Single` 和 `Multiple` |
+| 上传方法 | `storage::put()` | `storage::put()` / `put_with_compliance()` |
+| 索引来源 | 从 stream_settings 读取 FTS/Index 字段 | 同左 |
+| 文件存储类型 | `StorageType::Wal` | `StorageType::Wal` |
+| 写入 file_list | `db::file_list::set()` 单条写入 | `write_file_list()` 批量写入 |
+
+### 12.6 file_list 元数据写入
+
+**db::file_list::set()** (`src/service/db/file_list/mod.rs:47-80`)：
+
+```rust
+pub async fn set(account: &str, key: &str, meta: Option<FileMeta>, deleted: bool) -> Result<()> {
+    let mut file_data = FileKey::new(0, account, key, meta.unwrap_or_default(), deleted);
+    
+    // 1. 写入 file_list 存储，最多重试 5 次
+    for _ in 0..5 {
+        match progress(account, key, meta.as_ref(), deleted).await {
+            Ok(id) => { file_data.id = id; break; }
+            Err(e) => {
+                log::error!("[FILE_LIST] Error saving file to storage, retrying: {e}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+    
+    // 2. 通知其他节点（如果 cache_latest_files.enabled）
+    if cfg.cache_latest_files.enabled {
+        broadcast::BROADCAST_QUEUE.write().await.push(file_data);
+    }
+}
+```
+
+**progress()** 内部：
+- `!deleted` → `infra::file_list::add()` + `incr_stream_stats()`（本地模式）
+- `deleted` → `infra::file_list::remove()`
+
+### 12.7 Pending Delete 延迟删除机制
+
+当本地 `.parquet` 文件被 WAL 读取任务锁定时（`wal::lock_files_exists()` 返回 true），不能立即删除。此时通过 **pending_delete** 机制延迟处理：
+
+```
+move_files()
+    ↓  删除本地文件时
+    ├─ wal::lock_files_exists(file_key) == true?
+    │   ├─ Yes → db::file_list::local::add_pending_delete()
+    │   │        写入 LOCAL_CACHE + 内存集合
+    │   └─ No  → 直接 remove_file() + remove_removing()
+    ↓
+scan_pending_delete_files()  （每轮循环执行）
+    ↓
+    ├─ wal::lock_files_exists(file_key) == true?
+    │   ├─ Yes → 跳过（仍在使用）
+    │   └─ No  → 删除文件 + 从 pending_delete 移除
+```
+
+**数据持久化**：`pending_delete` 列表同时写入 `infra::file_list::LOCAL_CACHE`（SQLite），确保重启后不丢失。
+
+---
+
+## 十三、修正记录
+
+本文档相比初始版本，进行了以下关键修正：
+
+### 修正 1：persist 与 upload 是两个独立阶段
+
+**原结论**：persist 5 步协议完成后，数据即"上传到对象存储 / Compactor"。
+**修正**：`immutable.persist()` 仅将 Memtable 落盘为本地 `.parquet` 文件。上传到对象存储是由独立后台任务 `job::files::parquet` 完成的，两阶段之间通过 `WAL_PARQUET_METADATA` 内存缓存衔接 FileMeta。
+
+### 修正 2：Ingester 也会做文件合并
+
+**原结论**：persist 完成后直接上传到对象存储。
+**修正**：`job::files::parquet::move_files()` 先调用 `merge_files()` 通过 DataFusion 合并多个小 parquet 文件为一个较大的 parquet，然后才上传。这与 Compactor 的合并逻辑相似，但数据源不同（本地文件 vs 对象存储）。
+
+### 修正 3：索引生成条件 Ingester 与 Compactor 相同
+
+**原结论**：索引生成"Ingester 可选，Compactor 必选"。
+**修正**：两端的索引生成条件完全一致，均需同时满足：`inverted_index_enabled == true` + `stream_type.support_index() == true`（仅 Logs/Metrics/Traces/Metadata）+ stream settings 中有可索引字段。区别仅在检查顺序不同。
+
+### 修正 4：WAL_PARQUET_METADATA 的角色
+
+**原结论**：未提及。
+**修正**：`memtable.persist()` 在写入 `.par` 文件前，以 `.parquet` 路径为 key 将 `FileMeta` 写入全局缓存 `WAL_PARQUET_METADATA`。后续 `job::files::parquet` 扫描时优先从此缓存读取元数据，避免反复解析 parquet 文件的 I/O 开销。该缓存在上传完成后清理，在 `lib.rs` 的后台任务中定期 shrink_to_fit。
+
+### 修正 5：上传阶段的异常场景更丰富
+
+**原结论**：仅笼统描述"上传中断，下次重新上传"。
+**修正**：详细区分了 DB 健康检查失败（主动跳过）、merge 失败（保留原文件重试）、put 失败（新 UUID 覆盖）、set 失败（孤立文件 + 5 次重试）、索引生成失败（搜索降级）、文件被锁定（pending_delete 延迟删除）等多种场景。
