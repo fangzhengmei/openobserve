@@ -808,3 +808,477 @@ if is_cross_type && !cross_type_records.is_empty() {
 - `vector_enrichment` crate: 数据 enrichment 表支持
 - `tokio`: 异步运行时和并发原语
 - `serde_json`: JSON 数据处理
+
+---
+
+## 五、函数能力边界与脚本类型限制
+
+### 5.1 双脚本体系与三级限制模型
+
+OpenObserve 同时支持 VRL 和 JavaScript 两种脚本类型，但对二者施加了**差异化的三级限制模型**：
+
+```
+            ┌───────────────────────────────────────────────────────┐
+            │                限制层级                                │
+            ├───────────────────────────────────────────────────────┤
+            │  L1: 组织级 ─ JS 仅 _meta 组织可用                    │
+            │  L2: 管道级 ─ Pipeline 内禁止 JS 函数                 │
+            │  L3: 函数级 ─ VRL/JS 各自的沙箱与安全限制              │
+            └───────────────────────────────────────────────────────┘
+```
+
+#### 5.1.1 L1: 组织级限制 — JavaScript 仅限 `_meta` 组织
+
+**位置**: `src/service/functions.rs:68-73`
+
+```rust
+// save_function 中的校验
+if func.trans_type.unwrap_or(0) == 1 && org_id != "_meta" {
+    return Ok(MetaHttpResponse::bad_request(
+        "JavaScript functions are only allowed in the '_meta' organization. \
+         Please use VRL functions for other organizations.",
+    ));
+}
+```
+
+**位置**: `src/service/functions.rs:140-144`
+
+```rust
+// test_run_function 中的校验
+if trans_type == 1 && org_id != "_meta" {
+    return Ok(MetaHttpResponse::bad_request(
+        "JavaScript functions are only allowed in the '_meta' organization. \
+         Please use VRL functions for other organizations.",
+    ));
+}
+```
+
+**影响范围**:
+- `save_function`: 创建/更新函数时拦截
+- `update_function`: 更新函数时同样拦截
+- `test_run_function`: 测试运行时拦截
+- JS 函数的**唯一合法用途**是 `_meta` 组织的 SSO claim 解析
+
+#### 5.1.2 L2: 管道级限制 — Pipeline 内禁止 JavaScript
+
+**位置**: `src/service/pipeline/mod.rs:42-63`
+
+```rust
+async fn validate_no_javascript_functions(pipeline: &Pipeline) -> Result<(), PipelineError> {
+    for node in &pipeline.nodes {
+        if let NodeData::Function(function_params) = &node.data {
+            // 从 DB 加载函数定义以检查 trans_type
+            let function = db_functions::get(&pipeline.org, &function_params.name)
+                .await
+                .map_err(|e| PipelineError::InvalidPipeline(format!(
+                    "Failed to load function '{}': {}", function_params.name, e
+                )))?;
+
+            if function.is_js() {
+                return Err(PipelineError::InvalidPipeline(format!(
+                    "JavaScript functions cannot be used in pipelines. \
+                     Function '{}' is a JavaScript function. \
+                     Please use VRL functions instead.",
+                    function_params.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+**调用时机**: 在 `save_pipeline` 和 `update_pipeline` 中均调用：
+
+```rust
+// save_pipeline (src/service/pipeline/mod.rs:89)
+validate_no_javascript_functions(&pipeline).await?;
+
+// update_pipeline (src/service/pipeline/mod.rs:137)
+validate_no_javascript_functions(&pipeline).await?;
+```
+
+**注意**: 此验证是在 Pipeline 创建/更新时**实时查询 DB** 获取函数的 `trans_type`，而非仅依赖 Pipeline 定义中的节点元数据。这确保了即使函数后来被修改为 JS 类型，Pipeline 保存时也能捕获。
+
+**前端联动**: 前端 PipelineEditor 同样过滤 JS 函数：
+
+```javascript
+// web/src/components/pipeline/PipelineEditor.vue:705-709
+// JavaScript functions (trans_type === 1) cannot be used in pipelines
+if (func.trans_type !== 1) {
+    functions.value[func.name] = func;
+    functionOptions.value.push(func.name);
+}
+```
+
+#### 5.1.3 L3: 函数级沙箱与安全限制
+
+**VRL 安全限制** (`src/service/ingestion/mod.rs:93-96`):
+
+```rust
+pub fn compile_vrl_function(func: &str, org_id: &str) -> Result<VRLRuntimeConfig, std::io::Error> {
+    // 禁止 get_env_var — 防止环境变量泄露
+    if func.contains("get_env_var") {
+        return Err(std::io::Error::other("get_env_var is not supported"));
+    }
+    // ...
+}
+```
+
+**VRL 能力边界**:
+- 可用: `vrl::stdlib::all()` (VRL 标准库全部函数) + `vector_enrichment::vrl_functions()` (enrichment 函数)
+- 禁止: `get_env_var` (环境变量读取)
+- 上下文注入: `org_id` 和 `stream_name` 通过 `metadata` 注入，在 VRL 中以 `org_id` / `stream_name` 变量访问
+- 执行模式: AST 解释执行 (`VrlRuntime::Ast`)
+
+**JavaScript 安全限制** (`src/common/utils/js.rs:76-135`):
+
+```rust
+pub fn compile_js_function(func: &str, _org_id: &str) -> Result<JSRuntimeConfig, std::io::Error> {
+    // 非空检查
+    if func.trim().is_empty() {
+        return Err(std::io::Error::other("JavaScript function cannot be empty"));
+    }
+
+    // 企业版: 使用集中式安全模式库
+    #[cfg(feature = "enterprise")]
+    {
+        if let Err(pattern) = js_security::check_js_security(func) {
+            return Err(std::io::Error::other(format!(
+                "JavaScript function contains forbidden pattern: {}", pattern
+            )));
+        }
+    }
+
+    // 开源版: 内置危险模式列表
+    #[cfg(not(feature = "enterprise"))]
+    {
+        const DANGEROUS_PATTERNS: &[&str] = &[
+            "eval(", "Function(", "import(", "globalThis",
+            "window.", "self.", "global.", "__proto__",
+            "constructor.prototype", "constructor.constructor",
+            "setTimeout", "setInterval", "setImmediate",
+            "XMLHttpRequest", "fetch(", "WebSocket",
+            "require(", "process.", "__dirname", "__filename",
+            "module.", "exports.", "Reflect.", "Proxy(",
+        ];
+        // ...
+    }
+}
+```
+
+**JS 运行时沙箱** (`src/common/utils/js.rs:19-53`):
+
+```rust
+thread_local! {
+    static JS_RUNTIME: Runtime = {
+        let rt = Runtime::new().expect("Failed to create JS runtime");
+        rt.set_memory_limit(10 * 1024 * 1024);     // 内存限制: 10MB
+        rt.set_max_stack_size(512 * 1024);           // 栈大小限制: 512KB
+        rt
+    };
+    static JS_CONTEXT: Context = JS_RUNTIME.with(|rt| {
+        Context::full(rt).expect("Failed to create JS context")  // 使用完整上下文
+    });
+}
+```
+
+**JS 能力边界总结**:
+
+| 维度 | 限制 | 值 |
+|-----|------|---|
+| 内存上限 | 单次执行 | 10 MB |
+| 栈上限 | 递归深度 | 512 KB |
+| 危险全局 | eval, Function | 编译时拦截 |
+| 网络访问 | fetch, XMLHttpRequest, WebSocket | 编译时拦截 |
+| 定时器 | setTimeout, setInterval, setImmediate | 编译时拦截 |
+| 模块系统 | require, import, module, exports | 编译时拦截 |
+| 原型链攻击 | __proto__, constructor.prototype | 编译时拦截 |
+| 反射/代理 | Reflect, Proxy | 编译时拦截 |
+| Node API | process, __dirname, __filename | 编译时拦截 |
+| 全局逃逸 | globalThis, window, self, global | 编译时拦截 |
+| 上下文注入 | orgId, streamName, inputJson | 运行时注入 |
+
+### 5.2 校验入口与执行链路的连接方式
+
+#### 5.2.1 完整校验-编译-缓存-执行链路
+
+```
+                        写入路径 (Pipeline 生命周期)
+                        ═════════════════════════
+
+ HTTP 请求
+    │
+    ▼
+ save_pipeline / update_pipeline          ←── 校验入口
+    │
+    ├─ pipeline.validate()                ←── L0: 结构校验 (节点/边/环/leaf 类型)
+    │   ├─ 非空名称
+    │   ├─ 非空节点和边
+    │   ├─ 首节点 = StreamNode | QueryNode
+    │   ├─ ConditionNode 非空条件
+    │   ├─ 足够边数连通
+    │   ├─ DFS 遍历: leaf 必须是 StreamNode
+    │   ├─ AfterFlatten 一致性检查
+    │   └─ EnrichmentTables 仅 Scheduled
+    │
+    ├─ validate_no_javascript_functions()  ←── L2: Pipeline 级 JS 拦截
+    │   └─ 遍历 FunctionNode → DB 查 trans_type → is_js() 则拒绝
+    │
+    ▼
+ db::pipeline::set / update               ←── 持久化 + 触发缓存更新
+    │
+    ├─ infra_pipeline::put()              ←── 写入存储
+    └─ update_cache()                     ←── 发送协调事件
+         │
+         ▼
+    coordinator::emit_put_event()         ←── 集群广播
+         │
+         ▼
+    db::pipeline::watch()                 ←── 各节点监听
+         │
+         ├─ ExecutablePipeline::new()     ←── 编译入口
+         │   ├─ register_functions()       ←── 编译所有 FunctionNode
+         │   │   └─ compile_vrl_function / compile_js_function  ←── L3: 函数级安全
+         │   └─ topological_sort()         ←── 执行顺序
+         │
+         └─ STREAM_EXECUTABLE_PIPELINES   ←── 缓存 ExecutablePipeline
+              .insert(stream_params, exec_pl)
+```
+
+```
+                        读取路径 (Ingest 执行)
+                        ══════════════════════
+
+ Ingest 请求到达
+    │
+    ▼
+ get_stream_executable_pipeline()         ←── 缓存查找
+    │
+    ▼
+ STREAM_EXECUTABLE_PIPELINES.read()
+    .get(stream_params)
+    .cloned()                              ←── O(1) 缓存读取
+    │
+    ▼
+ exec_pl.process_batch()                  ←── 执行入口
+    │
+    ├─ 每节点 spawn tokio 任务
+    ├─ process_node(match node_data)
+    │   ├─ FunctionNode → apply_vrl_fn / apply_js_fn  ←── 运行时
+    │   ├─ ConditionNode → conditions.evaluate()
+    │   └─ StreamNode → flatten + send
+    │
+    └─ 结果/错误收集
+```
+
+#### 5.2.2 关键衔接点分析
+
+**衔接点 1: validate → compile 的延迟绑定**
+
+校验时 (`save_pipeline`) 只检查 `is_js()`，**不执行编译**。编译发生在缓存构建时 (`ExecutablePipeline::new`)。这意味着：
+
+1. 校验通过 ≠ 编译成功：函数语法错误在 `register_functions` 阶段才暴露
+2. 编译失败时，Pipeline 不会被缓存，`log::error!` 记录但**不阻塞其他 Pipeline**
+3. 缓存失败后，Ingest 走无 Pipeline 的直接写入路径
+
+**位置**: `src/service/db/pipeline.rs:423-432`
+
+```rust
+match ExecutablePipeline::new(&pipeline).await {
+    Err(e) => {
+        log::error!(
+            "[Pipeline::watch] {}/{}/{}: Error initializing pipeline \
+             into ExecutablePipeline when updating cache: {}",
+            pipeline.org, pipeline.name, pipeline.id, e
+        );
+        // 注意: 仅 log，不阻塞 watch 循环
+    }
+    Ok(exec_pl) => {
+        stream_exec_pl.insert(stream_params.clone(), exec_pl);
+    }
+};
+```
+
+**衔接点 2: 函数更新对 Pipeline 缓存的影响**
+
+**位置**: `src/service/functions.rs:400-419`
+
+```rust
+// update_function 中: 更新关联的 Pipeline
+if let Ok(associated_pipelines) = db::pipeline::list_by_org(org_id).await {
+    for pipeline in associated_pipelines {
+        if pipeline.contains_function(&func.name)
+            && let Err(e) = db::pipeline::update(&pipeline, None).await
+        {
+            // 更新失败 → 500 错误返回
+            return Ok((http::StatusCode::INTERNAL_SERVER_ERROR, ...).into_response());
+        }
+    }
+}
+```
+
+函数更新 → 遍历所有关联 Pipeline → 调用 `pipeline::update` → 触发 `update_cache` → 重新编译 `ExecutablePipeline`。若编译失败，Pipeline 从缓存中移除。
+
+**衔接点 3: VRL `. ` 追加与编译的关系**
+
+**位置**: `src/service/functions.rs:79-81`
+
+```rust
+// save_function 中: VRL 函数自动追加 "."
+if func.trans_type.unwrap() == 0 && !func.function.ends_with('.') {
+    func.function = format!("{} \n .", func.function);
+}
+```
+
+VRL 语法要求程序最后一行是一个**点表达式**（表示返回当前值）。此追加发生在**编译前**，确保编译器能正确解析。在 Pipeline 的 `register_functions` 中则不再追加（因为 DB 中已存储追加点后的函数体）。
+
+### 5.3 脚本限制对 Ingest 字段改写的影响
+
+#### 5.3.1 VRL 限制对字段改写的影响
+
+**`get_env_var` 禁止**:
+- **影响**: VRL 函数无法读取服务端环境变量，无法将环境变量值注入到记录字段中
+- **替代方案**: 使用 enrichment 表 或 VRL 的硬编码值
+- **安全意义**: 防止通过 VRL 函数泄露服务端敏感配置（数据库密码、API Key 等）
+
+**AST 解释执行的性能特征**:
+- **影响**: 每次 `apply_vrl_fn` 调用都是完整的 AST 遍历，对高频小记录场景存在性能瓶颈
+- **设计选择**: 牺牲执行速度换取编译速度和安全性（AST 模式无 JIT 注入风险）
+- **对字段改写的影响**: VRL 函数中避免使用复杂正则、深层嵌套循环等操作，否则单条记录处理时间会显著增加
+
+**metadata 注入的限制**:
+- **可用**: `org_id`, `stream_name`
+- **不可用**: 请求级信息（如 client IP、请求头、用户身份）
+- **影响**: 字段改写逻辑无法基于请求来源做条件分支（如按 IP 段分流）
+
+#### 5.3.2 JavaScript 限制对字段改写的影响 (仅 _meta 组织)
+
+**Pipeline 内禁止 JS 的连锁效应**:
+- **最关键的约束**: 即使 JS 函数存在于 `_meta` 组织，也**无法在 Pipeline 中使用**
+- **JS 函数的合法使用场景**: 仅限传统的 Stream-Function 直接关联模式（`StreamOrder`，非 Pipeline）
+- **遗留机制**: `StreamOrder.is_removed` + `StreamOrder.apply_before_flattening` 字段控制 JS 函数在流上的执行时机
+- **Pipeline 取代**: 新的 Pipeline 架构仅支持 VRL，JS 函数是遗留兼容方案
+
+**JS 运行时隔离对字段改写的影响**:
+
+| 限制 | 对字段改写的影响 |
+|-----|---------------|
+| 10MB 内存 | 无法在单次执行中构建超大中间数组 (如: `rows.map(...)` 的 ResultArray 模式下大数组受限) |
+| 512KB 栈 | 递归深度受限，无法处理深层嵌套 JSON 的递归改写 |
+| 禁止 eval/Function | 无法动态生成字段名或动态构造改写逻辑 |
+| 禁止网络访问 | 无法从外部 API 获取数据来丰富记录字段 |
+| 禁止 require/import | 无法使用第三方库处理数据 |
+| 编译时拦截 | 错误在保存函数时即暴露，不会延迟到 ingest |
+
+#### 5.3.3 两类脚本的错误副作用控制差异
+
+**VRL 错误处理**:
+
+```rust
+// apply_vrl_fn — 失败返回原始 row
+match result {
+    Ok(res) => match res.try_into() {
+        Ok(val) => (val, None),
+        Err(err) => (row, Some(clean_err))   // ← 原始数据回退
+    },
+    Err(err) => (row, Some(clean_err))       // ← 原始数据回退
+}
+```
+
+- **副作用控制**: VRL 执行在独立 `TargetValueRef` 上操作，输入 `row` 不被修改
+- **回退策略**: 失败 → 返回原始 `row`，错误记录但不阻断
+- **度量**: `metrics::INGEST_ERRORS` 按 `[org, stream_type, stream_name, TRANSFORM_FAILED]` 上报
+
+**JavaScript 错误处理**:
+
+```rust
+// apply_js_fn — 通过 JSON 序列化/反序列化隔离
+let exec_code = format!(
+    r#"(function() {{
+        try {{
+            var {var_name} = JSON.parse(inputJson);  // ← 反序列化隔离
+            {func_for_execution}
+            return JSON.stringify({{ success: true, data: {var_name} }});
+        }} catch(e) {{
+            return JSON.stringify({{
+                success: false, error: e.name + ': ' + e.message,
+                line: e.lineNumber || 'unknown',
+                column: e.columnNumber || 'unknown'
+            }});
+        }}
+    }})();"#,
+    var_name, func_for_execution, var_name
+);
+```
+
+- **副作用控制**: JS 通过 `JSON.parse(inputJson)` 创建**副本**，原始 `row` 不受 JS 执行影响
+- **回退策略**: 与 VRL 相同 — 失败返回原始 `row`
+- **额外信息**: JS 错误包含 `lineNumber` 和 `columnNumber`，方便定位
+- **安全脱敏**: JS 错误消息不包含 `row` 数据内容，`log::error!` 中也仅记录错误消息
+
+**关键差异对比**:
+
+| 维度 | VRL | JavaScript |
+|-----|-----|-----------|
+| 输入隔离 | `vrl::value::Value::from(&row)` (引用) | `JSON.parse(inputJson)` (深拷贝) |
+| 执行环境 | `Runtime::resolve` | `Context::eval` |
+| 错误信息 | VRL 诊断 | JS 异常名+消息+行列号 |
+| 内存控制 | 无显式限制 | 10MB / 512KB |
+| Pipeline 可用 | ✅ | ❌ (L2 限制) |
+| 组织限制 | 所有组织 | 仅 _meta (L1 限制) |
+| 运行时状态 | `RuntimeState` (无副作用) | `thread_local!` 上下文 (隔离) |
+
+### 5.4 限制体系的潜在风险与防御缺口
+
+#### 5.4.1 编译失败 → 静默降级
+
+**问题**: `ExecutablePipeline::new` 编译失败时，Pipeline 从缓存中移除，但**不产生用户可见的告警**。Ingest 请求会静默走无 Pipeline 路径，数据直接写入源流。
+
+**场景**: 函数更新导致语法错误 → 关联 Pipeline 重新编译 → 失败 → Pipeline 从缓存消失 → 后续 ingest 不再执行任何转换。
+
+**缓解**: 错误通过 `publish_error` 发布到 self_reporting 系统，但需要用户主动查看。
+
+#### 5.4.2 L2 校验的 TOCTOU 窗口
+
+**问题**: `validate_no_javascript_functions` 在保存时查询 DB 获取函数类型。若在保存 Pipeline 后、缓存构建前，函数被修改为 JS 类型，则：
+
+- 校验通过时函数为 VRL
+- 缓存构建时函数可能已变为 JS
+- `register_functions` 会编译 JS 函数并放入 `CompiledFunctionRuntime::JS`
+
+**实际风险**: 低。因为 `update_function` 会触发关联 Pipeline 的重新更新和缓存重建，最终一致性可保证。
+
+#### 5.4.3 VRL `get_env_var` 的简单字符串匹配
+
+**问题**: 使用 `func.contains("get_env_var")` 检测，可能被以下方式绕过：
+- 字符串拼接: `get_" + "env_var"`
+- 通过变量间接调用
+
+**实际风险**: 低。VRL 编译器本身不支持字符串拼接调用函数，且 VRL 不支持反射。但更健壮的做法是在编译后检查 AST 中是否存在 `get_env_var` 函数调用节点。
+
+#### 5.4.4 JS 危险模式的简单字符串匹配
+
+**问题**: `DANGEROUS_PATTERNS` 使用 `contains()` 检测，可能被以下方式绕过：
+- 注释中包含关键词: `// eval is not used` 会被误报
+- 字符串值中包含关键词: `row.msg = "window.location"` 会被误报
+
+**缓解**: 企业版使用 `o2_enterprise::enterprise::auth::js_security` 的集中式安全检查，可能有更精确的模式匹配。
+
+### 5.5 限制体系关键代码索引
+
+| 功能 | 文件位置 | 行号 |
+|-----|---------|-----|
+| L1: JS 组织限制 (save) | `src/service/functions.rs` | 68-73 |
+| L1: JS 组织限制 (test) | `src/service/functions.rs` | 140-144 |
+| L1: JS 组织限制 (update) | `src/service/functions.rs` | 360-364 |
+| L2: Pipeline JS 拦截 | `src/service/pipeline/mod.rs` | 42-63 |
+| L2: save_pipeline 调用 | `src/service/pipeline/mod.rs` | 89 |
+| L2: update_pipeline 调用 | `src/service/pipeline/mod.rs` | 137 |
+| L3: VRL get_env_var 禁止 | `src/service/ingestion/mod.rs` | 94-96 |
+| L3: JS 危险模式列表 | `src/common/utils/js.rs` | 96-135 |
+| L3: JS 运行时沙箱 | `src/common/utils/js.rs` | 19-53 |
+| VRL 追加点号 | `src/service/functions.rs` | 79-81 |
+| 编译失败静默降级 | `src/service/db/pipeline.rs` | 423-432 |
+| 函数更新触发 Pipeline 重编 | `src/service/functions.rs` | 400-419 |
+| 前端 JS 过滤 | `web/src/components/pipeline/PipelineEditor.vue` | 705-709 |
