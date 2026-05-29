@@ -1282,3 +1282,377 @@ let exec_code = format!(
 | 编译失败静默降级 | `src/service/db/pipeline.rs` | 423-432 |
 | 函数更新触发 Pipeline 重编 | `src/service/functions.rs` | 400-419 |
 | 前端 JS 过滤 | `web/src/components/pipeline/PipelineEditor.vue` | 705-709 |
+
+---
+
+## 六、双路径校验差异与绕过风险深度分析
+
+### 6.1 save/update_pipeline vs update_function: 校验覆盖率对比
+
+#### 6.1.1 两条路径的校验矩阵
+
+| 校验项 | save_pipeline | update_pipeline | update_function → db::pipeline::update |
+|-------|-------------|---------------|---------------------------------------|
+| **L0: Pipeline 结构校验** (`pipeline.validate()`) | ✅ | ✅ | ❌ **无** |
+| **L2: Pipeline JS 拦截** (`validate_no_javascript_functions`) | ✅ | ✅ | ❌ **无** |
+| **版本冲突检测** | ❌ | ✅ | ❌ **无** |
+| **源 Stream 唯一性检查** | ✅ | ✅ | ❌ **无** |
+| **DerivedStream 触发器保存** | ✅ | ✅ | ❌ **无** |
+
+#### 6.1.2 关键代码路径对比
+
+**Path A: save_pipeline (HTTP API 入口)**
+```
+save_pipeline (src/service/pipeline/mod.rs:67)
+    ├─ 源 Stream 唯一性检查
+    ├─ pipeline.validate()          ← L0: 结构校验
+    ├─ validate_no_javascript_functions()  ← L2: JS 拦截
+    ├─ DerivedStream 触发器保存
+    └─ db::pipeline::set()
+```
+
+**Path B: update_pipeline (HTTP API 入口)**
+```
+update_pipeline (src/service/pipeline/mod.rs:117)
+    ├─ 版本冲突检测
+    ├─ pipeline.validate()          ← L0: 结构校验
+    ├─ validate_no_javascript_functions()  ← L2: JS 拦截
+    ├─ 源 Stream 变更检查
+    ├─ DerivedStream 触发器保存
+    └─ db::pipeline::update()
+```
+
+**Path C: update_function → 级联 Pipeline 更新**
+```
+update_function (src/service/functions.rs:341)
+    ├─ L1: JS 组织限制检查 (非 _meta 禁 JS)
+    ├─ 函数编译 (VRL/JS 各自编译)
+    ├─ db::functions::set()
+    └─ 遍历关联 Pipeline: db::pipeline::update(&pipeline, None)
+           ├─ infra_pipeline::put()    ← 直接写入 DB
+           └─ update_cache()            ← 触发集群缓存更新
+                └─ [无任何校验！]
+```
+
+### 6.2 绕过路径 1: 函数类型变更绕过 L2 校验
+
+#### 6.2.1 攻击路径完整链路
+
+**前提**: 已有一个 VRL 函数被 Pipeline 引用。
+
+```
+时序攻击 (TOCTOU 窗口利用):
+═════════════════════════════════════════════════
+
+  T0: 创建 VRL 函数 func_a (trans_type: 0)
+      │
+  T1: 创建 Pipeline 引用 func_a
+      │
+      ├─ save_pipeline 调用 validate_no_javascript_functions()
+      ├─ DB 查询 func_a.trans_type = 0 (VRL) → 校验通过
+      └─ Pipeline 保存成功
+      │
+  T2: 调用 update_function 将 func_a 改为 JS (trans_type: 1)
+      │
+      ├─ L1 检查: 如果 org_id = "_meta" → 通过
+      │   (关键: _meta 组织允许创建 JS 函数！)
+      │
+      ├─ 函数编译: JS 函数编译通过
+      ├─ db::functions::set() → func_a.trans_type 变为 1
+      │
+      └─ 遍历关联 Pipeline: 对每个 Pipeline 调用
+           db::pipeline::update(&pipeline, None)
+               │
+               ├─ infra_pipeline::put()   ← 直接写 DB
+               └─ update_cache()           ← 触发 watch 事件
+                    │
+  T3: watch() 监听到事件，开始缓存重建
+      │
+      ├─ ExecutablePipeline::new(&pipeline)
+      │   └─ register_functions()
+      │       ├─ get_transforms(org, func_a)
+      │       │   └─ DB 查询: trans_type = 1 (JS)
+      │       ├─ compile_js_function()    ← JS 函数成功编译！
+      │       └─ CompiledFunctionRuntime::JS(...)  ← 存入运行时！
+      │
+      └─ STREAM_EXECUTABLE_PIPELINES.insert()
+           └─ Pipeline 缓存包含 JS 运行时！
+      │
+  T4: Ingest 请求到达，执行 Pipeline
+      │
+      └─ process_node()
+           └─ FunctionNode
+                ├─ 匹配 CompiledFunctionRuntime::JS
+                └─ apply_js_fn()  ← JS 函数被执行！
+```
+
+#### 6.2.2 关键脆弱点分析
+
+**脆弱点 1: _meta 组织允许 JS 函数**
+
+`src/service/functions.rs:360-364`:
+```rust
+// 仅当 org_id != "_meta" 时拒绝 JS
+if func.trans_type.unwrap_or(0) == 1 && org_id != "_meta" {
+    return Ok(MetaHttpResponse::bad_request(
+        "JavaScript functions are only allowed in the '_meta' organization..."
+    ));
+}
+```
+
+**结果**: 在 `_meta` 组织中，JS 函数可以被创建和更新。
+
+**脆弱点 2: db::pipeline::update 无校验**
+
+`src/service/db/pipeline.rs:73-86`:
+```rust
+pub async fn update(
+    pipeline: &Pipeline,
+    prev_source_stream: Option<StreamParams>,
+) -> Result<(), PipelineError> {
+    if prev_source_stream.is_some() {
+        update_cache(PipelineTableEvent::Remove(&pipeline.id)).await;
+    }
+    infra_pipeline::put(pipeline).await?;       // ← 直接写入
+    update_cache(PipelineTableEvent::Add(pipeline)).await;  // ← 触发缓存
+    Ok(())
+    // 注意: 这里没有任何校验调用！
+}
+```
+
+**脆弱点 3: register_functions 接受 JS**
+
+`src/service/pipeline/batch_execution.rs:143-146`:
+```rust
+let compiled_runtime = if transform.is_js() {
+    // Compile JS function
+    let js_config = compile_js_function(&transform.function, &self.org)?;
+    CompiledFunctionRuntime::JS(js_config, transform.is_result_array_js())
+} else {
+    // Compile VRL function
+    ...
+};
+```
+
+**结果**: `register_functions` 不区分调用来源，只要函数是 JS 就编译。
+
+#### 6.2.3 实际可执行性验证
+
+在 `process_node` 中存在完整的 JS 执行分支：
+
+`src/service/pipeline/batch_execution.rs:953-999`:
+```rust
+CompiledFunctionRuntime::JS(js_config, is_result_array) => {
+    if !is_result_array {
+        // Single record processing with JS
+        record = match apply_js_fn(
+            js_config,
+            record,
+            &org_id,
+            std::slice::from_ref(&stream_name),
+        ) {
+            (res, None) => res,
+            (res, Some(error)) => {
+                // 错误处理: 发送错误，返回 res
+                res
+            }
+        };
+        flattened = false;
+        send_to_children(...).await;
+    } else {
+        // Result array mode - collect records
+        result_array_records.push(record);
+    }
+}
+```
+
+**结论**: JS 函数在 Pipeline 中**完全可执行**，包括单记录模式和批量模式！
+
+### 6.3 绕过路径 2: 直接 DB 操作绕过所有校验
+
+#### 6.3.1 协调器事件监听机制
+
+`src/service/db/pipeline.rs:393-499`:
+```rust
+pub async fn watch() -> Result<(), anyhow::Error> {
+    loop {
+        match ev {
+            db::Event::Put(ev) => {
+                let pipeline_id = ev.key.strip_prefix(PIPELINES_WATCH_PREFIX).unwrap();
+                let pipeline = get_by_id(pipeline_id).await?;
+
+                match &pipeline.source {
+                    PipelineSource::Realtime(stream_params) => {
+                        if pipeline.enabled {
+                            match ExecutablePipeline::new(&pipeline).await {
+                                Ok(exec_pl) => {
+                                    stream_exec_pl.insert(stream_params.clone(), exec_pl);
+                                    // ← 直接编译并缓存，无任何额外校验！
+                                }
+                                Err(e) => {
+                                    log::error!(...);  // 仅记录日志
+                                }
+                            }
+                        }
+                    }
+                    ...
+                }
+            }
+            ...
+        }
+    }
+}
+```
+
+#### 6.3.2 直接写入 DB 的绕过方式
+
+如果攻击者能直接写入协调器/DB：
+
+```
+绕过路径:
+══════════
+
+1. 直接向 DB 写入 Pipeline 定义
+   （引用一个 JS 函数）
+   │
+   ▼
+2. watch() 监听到 Put 事件
+   │
+   ├─ get_by_id() 读取 Pipeline
+   ├─ ExecutablePipeline::new()
+   │  └─ register_functions()
+   │     ├─ get_transforms() → 获取 JS 函数
+   │     └─ compile_js_function() → 编译成功
+   │
+   └─ 插入 STREAM_EXECUTABLE_PIPELINES
+        │
+        ▼
+3. Ingest 时执行 JS 函数
+```
+
+**风险评级**: 低（需要 DB 写入权限，但权限模型中应该限制）。
+
+### 6.4 校验绕过对 Ingest 字段改写的实际影响
+
+#### 6.4.1 安全边界突破
+
+| 预期限制 | 被绕过的实际状态 | 影响 |
+|---------|---------------|------|
+| "Pipeline 内不能使用 JS 函数" | ❌ JS 函数可在 Pipeline 中执行 | **安全边界完全突破** |
+| "JS 仅用于 _meta 组织 SSO" | ❌ JS 可用于通用数据转换 | 功能限制被绕过 |
+| "非 _meta 组织不能用 JS" | ✅ 仍有效 (L1 校验在 update_function 中) | 组织级限制仍生效 |
+
+#### 6.4.2 对字段改写能力的扩展
+
+如果 L2 校验被绕过，JS 函数在 Pipeline 中获得：
+
+1. **完整的字段读写能力**:
+   - 读取/修改/删除任意字段
+   - 添加新字段
+   - 支持 `#ResultArray#` 批量模式
+
+2. **JS 特有的能力**:
+   - 正则表达式 (`RegExp`)
+   - 更灵活的字符串操作
+   - 完整的数组方法 (`map`, `filter`, `reduce`)
+   - `Math` 对象的全部数学函数
+
+3. **但受限于 L3 沙箱**:
+   - ❌ 网络访问 (`fetch`, `XMLHttpRequest`)
+   - ❌ 文件系统访问
+   - ❌ 定时器 (`setTimeout`)
+   - ❌ 模块系统 (`require`, `import`)
+
+#### 6.4.3 对错误副作用控制的影响
+
+**预期行为**:
+- Pipeline 内只有 VRL，错误模型一致且经过充分测试
+
+**实际行为 (绕过后)**:
+- Pipeline 内混入 JS 函数，错误模型存在差异：
+
+| 维度 | VRL | JS (绕过 L2 后) |
+|-----|-----|---------------|
+| 输入隔离 | 引用转换 | JSON 深拷贝 |
+| 错误信息 | VRL 诊断 | JS 异常名+行列号 |
+| 内存限制 | 无显式限制 | 10MB |
+| 栈限制 | 依赖 Rust 栈 | 512KB |
+| 调试可见性 | 经过生产验证 | 相对较少测试 |
+
+**风险**: JS 函数在 Pipeline 环境下的错误处理路径可能没有经过充分的生产环境验证，可能引入意外的行为差异。
+
+### 6.5 防御建议与修复方案
+
+#### 6.5.1 立即修复: 在 register_functions 中添加 L2 校验
+
+**位置**: `src/service/pipeline/batch_execution.rs:136-168`
+
+```rust
+// 修复建议: 在编译前再次校验函数类型
+async fn register_functions(&self) -> Result<HashMap<String, CompiledFunctionRuntime>> {
+    let mut function_map = HashMap::new();
+    for node in &self.nodes {
+        if let NodeData::Function(func_params) = &node.data {
+            let transform = get_transforms(&self.org, &func_params.name).await?;
+
+            // 新增: L2 级校验 - Pipeline 内禁止 JS 函数
+            if transform.is_js() {
+                return Err(anyhow::anyhow!(
+                    "JavaScript functions cannot be used in pipelines. \
+                     Function '{}' is a JavaScript function.",
+                    func_params.name
+                ));
+            }
+
+            // ... 原有编译逻辑
+        }
+    }
+    Ok(function_map)
+}
+```
+
+**理由**: 这是最后一道防线，确保无论通过什么路径进入缓存构建，JS 函数都会被拒绝。
+
+#### 6.5.2 补充修复: 在 db::pipeline::update 中添加校验
+
+**位置**: `src/service/db/pipeline.rs:73-86`
+
+```rust
+// 修复建议: 对外部调用者也应校验
+pub async fn update(
+    pipeline: &Pipeline,
+    prev_source_stream: Option<StreamParams>,
+    validate: bool,  // 新增参数控制是否校验
+) -> Result<(), PipelineError> {
+    if validate {
+        pipeline.validate()
+            .map_err(|e| PipelineError::InvalidPipeline(e.to_string()))?;
+        validate_no_javascript_functions(pipeline).await?;
+    }
+    // ... 原有逻辑
+}
+```
+
+**注意**: 需要考虑性能影响，缓存重建时可能不需要重复校验。
+
+#### 6.5.3 深度防御: 多层校验矩阵
+
+| 层级 | 当前状态 | 建议 |
+|-----|---------|------|
+| HTTP API 层 (save/update_pipeline) | ✅ 有校验 | 保持现状 |
+| DB 层 (db::pipeline::set/update) | ❌ 无校验 | 可选添加（性能权衡） |
+| 缓存构建层 (register_functions) | ❌ 无校验 | **必须添加**（最后防线） |
+| 执行层 (process_node) | ⚠️ 有执行逻辑 | 保留（但应确保永远走不到） |
+
+### 6.6 双路径校验差异关键代码索引
+
+| 功能 | 文件位置 | 行号 |
+|-----|---------|-----|
+| save_pipeline 完整校验 | `src/service/pipeline/mod.rs` | 67-114 |
+| update_pipeline 完整校验 | `src/service/pipeline/mod.rs` | 117-191 |
+| db::pipeline::update (无校验) | `src/service/db/pipeline.rs` | 73-86 |
+| update_function 级联 Pipeline 更新 | `src/service/functions.rs` | 400-419 |
+| register_functions (接受 JS) | `src/service/pipeline/batch_execution.rs` | 136-168 |
+| process_node 执行 JS | `src/service/pipeline/batch_execution.rs` | 953-999 |
+| watch() 监听重建缓存 | `src/service/db/pipeline.rs` | 393-499 |
+| L1: JS 组织限制 | `src/service/functions.rs` | 360-364 |
