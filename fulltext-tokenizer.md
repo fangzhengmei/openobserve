@@ -1976,17 +1976,18 @@ DataFusion 执行
 
 ### 12.6 关键边界与注意事项
 
-#### 12.6.1 fuzzy_match_all 的 extract_column 陷阱
+#### 12.6.1 fuzzy_match_all 的 extract_column 陷阱（详见第 13 章深入分析）
 
 在 `RewriteMatchPhysical` 中，`fuzzy_match_all` 的第一个参数使用 `extract_column` 提取，这意味着它期望参数是一个**列引用**而非字面值。然而 SQL 语法 `fuzzy_match_all('error', 2)` 传入的是字符串字面值。
 
-当 `RewriteMatchPhysical` 执行 `extract_column(item_expr)` 时，如果参数是字面值而非列引用，会返回错误。但实际上这个错误场景在正常流程中**不会发生**，因为：
+**这是一个真实存在的 Bug**，在默认配置下会导致使用 `fuzzy_match_all` 的查询失败。详细的执行路径分析、错误场景和对回退过滤正确性的影响见第 13 章。
 
-1. `fuzzy_match_all` 被 `IndexRule` 提取后，从原始过滤器中移除
-2. 如果 `can_remove_filter = true`（不可能，因为 FuzzyMatchAll 永远 false），或 `is_add_filter_back = false`，则过滤器被重构时不包含 `fuzzy_match_all`
-3. 只有 `is_add_filter_back = true` 时，过滤器才保留，此时 `fuzzy_match_all` 已被 `Condition::FuzzyMatchAll.to_physical_expr()` 转换为 `fuzzy_match(field, value, distance)` 格式，不再包含原始 UDF 调用
-
-因此 `RewriteMatchPhysical` 中的 `fuzzy_match_all` 分支实际上**很少被执行**——它只在 `IndexRule` 未提取 `fuzzy_match_all` 时（例如没有 FTS 字段的 stream）才触发。
+**简要总结**：
+- `extract_column` 期望 `Column` 表达式，但 SQL 字面量是 `Literal` 表达式
+- 当 `is_remove_filter = false`（默认配置，且 FuzzyMatchAll 的 `can_remove_filter` 永远为 false），原始 UDF 保留在过滤器中
+- `RewriteMatchPhysical` 尝试重写时，`extract_column(Literal("error"))` 失败，返回 "Expected column expression" 错误
+- 查询因此失败，无法执行回退过滤
+- 详细分析、路径追踪和对正确性的影响见第 13 章
 
 #### 12.6.2 match_all_hash 不走索引的设计原因
 
@@ -2003,3 +2004,344 @@ DataFusion 执行
 - `Equal`/`In` → 二元比较表达式
 
 这些不同类型的表达式由 DataFusion 统一求值，确保最终结果的精确性。但由于 `can_remove_filter` 对 `FuzzyMatchAll` 永远返回 `false`，使用 `fuzzy_match_all` 的查询**总是**会保留回退过滤器，即使索引搜索没有跳过任何条件。
+
+## 13. fuzzy_match_all 的 extract_column 问题深度解析
+
+### 13.1 extract_column 与 extract_string_literal 的行为对比
+
+两个函数都定义在 `src/service/search/datafusion/optimizer/physical_optimizer/utils.rs` 中，行为完全不同：
+
+#### 13.1.1 extract_string_literal（match_all 使用）
+
+```rust
+// utils.rs:39-55
+pub fn extract_string_literal(expr: &Arc<dyn PhysicalExpr>) -> Result<String> {
+    if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
+        match literal.value() {
+            ScalarValue::Utf8(Some(s)) => Ok(s.clone()),
+            ScalarValue::Utf8View(Some(s)) => Ok(s.to_string()),
+            ScalarValue::LargeUtf8(Some(s)) => Ok(s.clone()),
+            _ => Err(DataFusionError::Internal(...)),
+        }
+    } else {
+        Err(DataFusionError::Internal(
+            "Expected literal expression for string argument".to_string(),
+        ))
+    }
+}
+```
+
+**行为**：期望表达式是 `Literal` 类型，提取其中的字符串值。
+
+**适用场景**：处理 `match_all('error')` 中的 `'error'` 字符串字面值。
+
+#### 13.1.2 extract_column（fuzzy_match_all 使用）
+
+```rust
+// utils.rs:57-65
+pub fn extract_column(expr: &Arc<dyn PhysicalExpr>) -> Result<Column> {
+    if let Some(column) = expr.as_any().downcast_ref::<Column>() {
+        Ok(column.clone())
+    } else {
+        Err(DataFusionError::Internal(
+            "Expected column expression".to_string(),
+        ))
+    }
+}
+```
+
+**行为**：期望表达式是 `Column` 类型（对表列的引用），返回 `Column` 对象（包含列名和索引）。
+
+**适用场景**：处理引用列的表达式，如 `fuzzy_match_all(log_field, 2)` 中的 `log_field` 列引用。
+
+#### 13.1.3 调用时的参数形态对比
+
+| SQL 写法 | 物理表达式类型 | 适用函数 |
+|---------|---------------|---------|
+| `match_all('error')` | `Literal("error")` | `extract_string_literal` ✅ |
+| `fuzzy_match_all('error', 2)` | `Literal("error")` | `extract_column` ❌ |
+| `fuzzy_match_all(log_field, 2)` | `Column("log_field")` | `extract_column` ✅ |
+
+### 13.2 完整执行路径追踪
+
+优化器执行顺序（`flight.rs:579-611`）：
+1. `IndexRule::optimize` → 提取索引条件，可能修改过滤器
+2. `FollowerIndexOptimizerRule::optimize` → （可选）后续索引优化
+3. `RewriteMatchPhysical::optimize` → 重写 `match_all`/`fuzzy_match_all`/`match_all_hash` UDF 调用
+
+#### 13.2.1 路径 A：is_remove_filter = true（成功路径）
+
+**触发条件**：`feature_query_remove_filter_with_index = true` 配置开启
+
+```
+SQL: SELECT * FROM t WHERE fuzzy_match_all('error', 2)
+    ↓
+IndexOptimizer::f_up()
+    ├── split_conjunction(FilterExec.predicate)
+    ├── is_expr_valid_for_index(fuzzy_match_all) → true（仅检查 arg.len()==2）
+    ├── Condition::from_physical_expr → FuzzyMatchAll("error", 2)
+    ├── index_conditions.add_condition(FuzzyMatchAll)
+    ├── other_conditions = []（空）
+    ├── is_remove_filter = config_flag || can_remove_filter()
+    │   └── config_flag = true → is_remove_filter = true
+    ├── construct_filter_exec(filter, other_conditions)
+    │   └── 其他条件为空 → 过滤器被完全移除
+    └── 返回修改后的计划（过滤器已移除）
+    ↓
+Tantivy 索引搜索
+    ├── Condition::FuzzyMatchAll → FuzzyTermQuery
+    ├── 返回 (file_name, result, has_skipped_conditions)
+    └── 根据搜索结果设置 is_add_filter_back
+    ↓
+create_tables_from_files（is_add_filter_back=true 时）
+    └── IndexCondition.to_physical_expr()
+        └── FuzzyMatchAll → fuzzy_match(field, "error", 2) for each field
+        └── 注意：此处使用 value.to_string()，不包装 %
+    ↓
+RewriteMatchPhysical::optimize
+    └── FilterExec 已被移除，没有 fuzzy_match_all UDF 需要重写
+    └── 计划中只有 fuzzy_match UDF 调用，不会匹配重写条件
+    ↓
+DataFusion 执行
+    └── fuzzy_match(field, "error", 2) 正确执行
+    └── fuzzy_match UDF 内部分词后逐词计算 Levenshtein 距离
+    ↓
+✅ 结果正确
+```
+
+**路径 A 正确性**：
+- `IndexCondition.to_physical_expr()` 正确使用 `value.to_string()`，不添加 `%` 包装
+- `fuzzy_match` UDF 接收正确的 needle（"error"）进行 Levenshtein 距离计算
+- 查询成功且结果正确
+
+#### 13.2.2 路径 B：is_remove_filter = false（默认配置，错误路径）
+
+**触发条件**：默认配置 `feature_query_remove_filter_with_index = false`（总是，因为 `FuzzyMatchAll.can_remove_filter()` 永远返回 `false`）
+
+```
+SQL: SELECT * FROM t WHERE fuzzy_match_all('error', 2)
+    ↓
+IndexOptimizer::f_up()
+    ├── is_expr_valid_for_index(fuzzy_match_all) → true
+    ├── Condition::from_physical_expr → FuzzyMatchAll("error", 2)
+    ├── index_conditions.add_condition(FuzzyMatchAll)
+    ├── other_conditions = []
+    ├── is_remove_filter = config_flag(false) || can_remove_filter(false) → false
+    ├── 返回 Transformed::new(node, false) → 过滤器保持不变
+    └── FilterExec 仍包含原始 fuzzy_match_all('error', 2) UDF 调用
+    ↓
+Tantivy 索引搜索（正常执行，与路径 A 相同）
+    ├── Condition::FuzzyMatchAll → FuzzyTermQuery
+    ├── 返回 (file_name, result, has_skipped_conditions)
+    └── is_add_filter_back 根据搜索结果设置
+    ↓
+RewriteMatchPhysical::optimize
+    └── FilterExec.predicate 仍包含 ScalarFunctionExpr(fuzzy_match_all, [Literal("error"), Literal(2)])
+        ├── name == FUZZY_MATCH_ALL_UDF_NAME → true
+        ├── item_expr = args[0] = Literal("error")
+        ├── extract_column(Literal("error")) → ❌ Error: "Expected column expression"
+        └── 整个 optimize() 调用失败，返回错误
+    ↓
+❌ 查询失败，无法到达 DataFusion 执行阶段
+    ↓
+❌ 回退过滤无法执行，查询中断
+```
+
+**路径 B 错误根因**：
+1. `FuzzyMatchAll.can_remove_filter()` 永远返回 `false`（`index.rs:504`）
+2. 默认配置 `feature_query_remove_filter_with_index = false`
+3. 因此 `is_remove_filter = false`，过滤器保持不变
+4. `RewriteMatchPhysical` 尝试重写，但 `fuzzy_match_all` 分支使用 `extract_column` 而非 `extract_string_literal`
+5. 第一个参数是 `Literal("error")`，不是 `Column`，因此 `extract_column` 失败
+6. 查询在优化阶段就失败，无法执行回退过滤
+
+#### 13.2.3 路径 C：列引用作为参数（内部不一致，Panic 路径）
+
+**触发条件**：用户错误地使用列引用而非字面值
+
+```
+SQL: SELECT * FROM t WHERE fuzzy_match_all(log_field, 2)
+    ↓
+IndexOptimizer::f_up()
+    ├── is_expr_valid_for_index → true（仅检查 arg.len()==2）
+    ├── Condition::from_physical_expr
+    │   └── get_physical_value(args[0])
+    │       └── args[0] 是 Column("log_field")，不是 Literal
+    │       └── hit unreachable!() → ⚠️ Panic!
+    ↓
+❌ 进程崩溃
+```
+
+**路径 C 错误根因**：
+- `get_physical_value` 函数（`index.rs:718-733`）期望 `Literal` 表达式，遇到非 `Literal` 时调用 `unreachable!()`
+- 这使得使用列引用作为 `fuzzy_match_all` 第一个参数的查询会直接导致进程崩溃
+
+### 13.3 错误与成功路径的完整矩阵
+
+| 路径 | 触发条件 | extract_column 结果 | 回退过滤 | 最终结果 |
+|------|---------|--------------------|----------|---------|
+| A | `feature_query_remove_filter_with_index=true` | 不执行 | `to_physical_expr()` 正确执行 | ✅ 成功 |
+| B1 | 默认配置 + `fuzzy_match_all('literal', d)` + 索引搜索完整（无跳过条件） | ❌ Error: Expected column | 无法执行 | ❌ 查询失败 |
+| B2 | 默认配置 + `fuzzy_match_all('literal', d)` + has_skipped=true | ❌ Error: Expected column | 无法执行 | ❌ 查询失败 |
+| C | `fuzzy_match_all(column_ref, d)` | `unreachable!()` | 无法执行 | ❌ Panic 崩溃 |
+| D | 无 FTS 字段 + `fuzzy_match_all('literal', d)` | ❌ Error: Expected column | 无法执行 | ❌ 查询失败 |
+
+**关键发现**：在默认配置下（生产环境最常见），**所有**使用 `fuzzy_match_all` 的查询都会在 `RewriteMatchPhysical` 阶段失败。只有手动开启 `feature_query_remove_filter_with_index = true` 才能绕过此 Bug。
+
+### 13.4 对回退过滤正确性的影响
+
+`fuzzy_match_all` 的 `extract_column` 问题对回退过滤正确性有**严重影响**：
+
+#### 13.4.1 查询完全失败，回退过滤无法执行
+
+在路径 B（默认配置）中，查询在优化阶段就失败了。这意味着：
+- Tantivy 索引搜索可能已经正确执行并找到了匹配行
+- 但由于 `RewriteMatchPhysical` 失败，查询完全中断
+- 用户无法得到任何结果，即使回退过滤本可以正确筛选
+- 这是**可用性问题**而非正确性问题，但影响更严重
+
+#### 13.4.2 路径 A 中的潜在正确性问题（% 包装）
+
+即使在路径 A（配置开启，查询成功）中，也存在另一个潜在的正确性问题：如果 `RewriteMatchPhysical` 确实执行了 `fuzzy_match_all` 重写（例如，当 `IndexRule` 未提取该条件时），它会错误地将搜索词包装在 `%...%` 中：
+
+```rust
+// rewrite_match.rs:288
+let term = Arc::new(Literal::new(ScalarValue::Utf8(Some(format!("%{item}%")))));
+```
+
+但 `fuzzy_match` UDF 不做 LIKE 匹配，它做 Levenshtein 距离比较：
+```rust
+// fuzzy_match_udf.rs:82-84
+terms
+    .iter()
+    .any(|term| levenshtein(term, needle) as i64 <= dis)
+```
+
+如果 needle 是 `%error%`，它会与分词结果做距离比较：
+- `levenshtein("error", "%error%")` = 2（添加了首尾的 %）
+- 当 distance = 1 时，无法匹配
+- 当 distance = 2 时，可以匹配
+
+这意味着：
+- `fuzzy_match_all('error', 1)` → 如果经过 RewriteMatchPhysical 重写，变成 `fuzzy_match(field, '%error%', 1)` → `levenshtein("error", "%error%") = 2 > 1` → **不匹配**
+- 但 Tantivy 路径中 `FuzzyTermQuery` 使用 needle = "error" → **可以匹配**
+- 两条路径结果不一致，产生正确性问题
+
+**幸运的是**，在路径 A 中，`fuzzy_match_all` 已经被 `IndexRule` 从过滤器中移除，所以 `RewriteMatchPhysical` 不会遇到它。但如果 `IndexRule` 因某种原因未能提取该条件，这个问题就会显现。
+
+#### 13.4.3 与 to_physical_expr 的对比（无 % 包装）
+
+`IndexCondition.to_physical_expr()` 中的 `FuzzyMatchAll` 处理**没有**这个问题：
+
+```rust
+// index.rs:633
+let term = Arc::new(Literal::new(ScalarValue::Utf8(Some(value.to_string()))));
+// ← 正确，不添加 %
+```
+
+这意味着通过 `to_physical_expr()` 添加的回退过滤器是正确的，而通过 `RewriteMatchPhysical` 重写的过滤器是错误的（如果执行的话）。
+
+### 13.5 三个 Bug 总结
+
+通过深度分析，发现 `fuzzy_match_all` 重写逻辑中存在三个独立的 Bug：
+
+| Bug | 位置 | 影响 | 严重程度 |
+|-----|------|------|---------|
+| **Bug 1** | `rewrite_match.rs:274` 使用 `extract_column` 而非 `extract_string_literal` | 默认配置下所有 `fuzzy_match_all('literal', d)` 查询失败 | 🔴 严重 |
+| **Bug 2** | `rewrite_match.rs:288` 使用 `format!("%{item}%")` 包装搜索词 | 如果重写执行，`fuzzy_match` UDF 会错误地将 `%` 作为字面量比较 | 🟠 中等（仅在特定路径触发） |
+| **Bug 3** | `index.rs:728` `get_physical_value` 遇到 `Column` 时 `unreachable!()` | `fuzzy_match_all(column, d)` 会导致进程 Panic | 🔴 严重（崩溃而非报错） |
+
+### 13.6 修复建议
+
+#### 13.6.1 Bug 1 修复：extract_column → extract_string_literal
+
+```rust
+// rewrite_match.rs:274-278
+// 修复前：
+let item = extract_column(item_expr)?;
+
+// 修复后：
+let item = extract_string_literal(item_expr)?;
+```
+
+**理由**：`fuzzy_match_all('error', 2)` 的第一个参数是搜索词**字面值**，不是列引用。这与 `match_all` 和 `match_all_hash` 的处理方式保持一致。
+
+#### 13.6.2 Bug 2 修复：移除 % 包装
+
+```rust
+// rewrite_match.rs:288
+// 修复前：
+let term = Arc::new(Literal::new(ScalarValue::Utf8(Some(format!("%{item}%")))));
+
+// 修复后：
+let term = Arc::new(Literal::new(ScalarValue::Utf8(Some(item.clone()))));
+```
+
+**理由**：`fuzzy_match` UDF 内部使用 Levenshtein 距离计算，不做 LIKE 模式匹配。`%` 字符会被当作字面量参与距离计算，导致匹配失败。这与 `to_physical_expr()` 中的处理方式保持一致。
+
+#### 13.6.3 Bug 3 修复：避免 unreachable!()，返回优雅错误
+
+```rust
+// index.rs:718-733
+// 修复前：
+fn get_physical_value(expr: &Arc<dyn PhysicalExpr>) -> String {
+    if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
+        // ...
+    } else {
+        unreachable!()
+    }
+}
+
+// 修复后：
+// 将 get_physical_value 改为返回 Result，或在调用处检查表达式类型
+// 更好的方式：在 from_physical_expr 中先检查是否为 Literal，非 Literal 则返回错误
+```
+
+**理由**：`unreachable!()` 会导致进程崩溃，应该返回优雅的错误信息提示用户参数类型错误。
+
+### 13.7 修复后的路径 B（成功路径）
+
+```
+SQL: SELECT * FROM t WHERE fuzzy_match_all('error', 2)
+    ↓
+IndexOptimizer::f_up() → is_remove_filter = false → 过滤器保持不变
+    ↓
+Tantivy 索引搜索 → 正常执行
+    ↓
+RewriteMatchPhysical::optimize（Bug 已修复）
+    ├── item = extract_string_literal(Literal("error")) → Ok("error")
+    ├── term = Literal("error")（无 % 包装，Bug 2 已修复）
+    └── 重写为：fuzzy_match(field1, "error", 2) OR fuzzy_match(field2, "error", 2) OR ...
+    ↓
+DataFusion 执行
+    ├── 先用 Tantivy BitVec 过滤行
+    ├── 再用 fuzzy_match UDF 精确匹配
+    └── fuzzy_match 内部分词后逐词计算 Levenshtein 距离
+    ↓
+✅ 结果正确
+```
+
+**修复后正确性**：
+- `fuzzy_match(field, "error", 2)` 接收正确的 needle
+- Levenshtein 距离计算正确：`levenshtein("hello", "error")` 等
+- 与 Tantivy 路径的语义一致（都基于分词后的词项做模糊匹配）
+- 回退过滤正确执行，确保结果精确性
+
+### 13.8 关键边界总结
+
+1. **`extract_column` vs `extract_string_literal`** 不是"有意的差异"，而是**真实的 Bug**，在默认配置下会导致所有 `fuzzy_match_all` 查询失败
+
+2. **`%...%` 包装** 对 `fuzzy_match` 是错误的，因为 `fuzzy_match` 不做 LIKE 匹配
+
+3. **`is_remove_filter` 决策** 直接决定了 Bug 是否触发：
+   - `true` → 过滤器移除，Bug 绕开
+   - `false` → 过滤器保留，Bug 触发
+
+4. **回退过滤的双重机制**：
+   - `IndexCondition.to_physical_expr()` → 正确（无 % 包装）
+   - `RewriteMatchPhysical` → 有 Bug（% 包装 + 错误的 extract 函数）
+
+5. **对正确性的影响**：
+   - 默认配置：查询完全失败，无结果 → 不是不正确，而是不可用
+   - 开启配置：查询成功，回退过滤通过 `to_physical_expr` 正确执行 → 结果正确
+   - 如果 `RewriteMatchPhysical` 执行了 `fuzzy_match_all` 重写：`%` 包装导致匹配不一致 → 结果不正确
