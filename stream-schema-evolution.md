@@ -519,14 +519,125 @@ if let Some(updated_schema) = read_cache.get(&cache_key)
 
 **执行结果总结**：
 1. **只有类型拓宽 + 乱序**才会触发两次 handle_diff_schema 调用
-2. **第二次调用是空操作**，在缓存检查处直接返回
+2. **正常情况下第二次调用是空操作**，在缓存检查处直接返回
 3. **实际只创建 1 个新版本**，而不是 2 个
 4. **类型收窄永远不会触发乱序补齐**
+
+---
+
+#### 第二次调用进入 merge 的边界条件
+
+虽然正常情况下第二次调用在缓存检查处直接返回，但在以下**并发/缓存不一致**场景下仍可能进入 merge：
+
+| 场景 | 原因 | 进入 merge？ |
+|------|------|--------------|
+| **场景 1：多节点并发** | 第一次调用在节点 A 成功，第二次调用在节点 B，节点 B 的本地缓存尚未通过 watch 同步更新 | ✅ |
+| **场景 2：单节点并发** | 线程 1 第一次调用成功并更新缓存，但线程 2 在本地锁释放前发起第二次调用，缓存检查在线程 1 更新缓存之前执行 | ✅ |
+| **场景 3：第一次调用失败** | 第一次调用因数据库事务冲突/网络错误失败，未更新缓存 | ✅ |
+| **场景 4：watch 事件延迟** | 数据库 watch 事件推送延迟，本地缓存尚未更新 | ✅ |
+| **场景 5：进程重启** | 进程刚重启，缓存尚未从数据库加载完成 | ✅ |
+
+**判定条件**（`service/schema.rs:264-270`）：
+```rust
+if let Some(updated_schema) = read_cache.get(&cache_key)
+    && let (false, _) = get_schema_changes(updated_schema, inferred_schema)
+{
+    return Ok(None);  // 直接返回
+}
+// 否则继续执行...
+```
+
+只要 `get_schema_changes` 返回 `(true, _)` 或缓存中无数据，就会进入 merge。
+
+---
+
+#### 进入 merge 但不追加版本的场景与结果
+
+当第二次调用进入 merge 后，有两种情况**不会**追加新版本：
+
+**情况 A：schema 已合并（无变更）**
+
+```rust
+// infra/src/schema/mod.rs:490-494
+let (is_schema_changed, field_datatype_delta, merged_fields) =
+    get_merge_schema_changes(latest_schema, &inferred_schema);
+
+if !is_schema_changed {
+    tx.send(Some((latest_schema.clone(), field_datatype_delta))).unwrap();
+    return Ok(None);  // 返回 None，不更新数据库
+}
+```
+
+**返回结果**：`Ok(None)`
+**缓存影响**：
+- 不更新数据库
+- 不更新 `STREAM_SCHEMAS_LATEST`（handle_diff_schema 收到 None 直接返回）
+- 后续版本判断不受影响
+
+**情况 B：只有 zo_cast 类型收窄变更**
+
+```rust
+// infra/src/schema/mod.rs:498-504
+let schema_version_changes = field_datatype_delta
+    .iter()
+    .filter(|f| f.metadata().get("zo_cast").is_none())
+    .collect::<Vec<_>>();
+let need_new_version = !schema_version_changes.is_empty();
+
+// infra/src/schema/mod.rs:523-530
+} else {
+    // just update the latest schema
+    tx.send(Some((final_schema.clone(), field_datatype_delta))).unwrap();
+    Ok(Some((
+        Some(json::to_vec(&vec![final_schema]).unwrap().into()),
+        None,  // 新版本 key 为 None，表示不追加版本
+    )))
+}
+```
+
+**返回结果**：`Ok(Some((final_schema, delta)))`
+**缓存影响**：
+- 更新数据库中最新版本 schema（但不追加新版本）
+- 本地锁保护下，handle_diff_schema 更新 `STREAM_SCHEMAS_LATEST` 缓存（`service/schema.rs:439-443`）
+- 触发 watch 事件，同步更新 `STREAM_SCHEMAS` 全版本列表
+- 后续版本判断使用更新后的 latest schema，但版本数量不变
+
+---
+
+#### 缓存更新时序与竞态分析
+
+**缓存更新路径**：
+
+```
+handle_diff_schema(线程A)
+    ↓
+db::schema::merge() → 数据库事务成功
+    ↓
+（本地）更新 STREAM_SCHEMAS_LATEST  [service/schema.rs:440-443]
+    ↓
+（异步）watch 事件触发
+    ↓
+更新 STREAM_SCHEMAS_LATEST  [service/db/schema.rs:470-475]
+更新 STREAM_SCHEMAS 全版本  [service/db/schema.rs:493-499]
+```
+
+**竞态窗口**：
+- 第一次调用的本地更新（行 440-443）发生在**数据库事务提交后**
+- watch 事件的更新发生在**异步监听线程**
+- 两次更新之间存在时间窗口（通常微秒级）
+
+**第二次调用在竞态窗口内进入 merge 的结果**：
+1. 数据库中已有更新后的 schema
+2. `get_merge_schema_changes` 返回 `is_schema_changed = false`
+3. merge 返回 `Ok(None)`
+4. handle_diff_schema 直接返回 `Ok(None)`
+5. 无副作用，不影响缓存
 
 **设计意图**：
 - 防止乱序旧数据的类型变更污染已经存在的 schema 版本
 - 确保时间戳较早的数据不会导致已有的 schema 版本"提前"开始
 - 第二次调用是为了处理竞态条件（如第一次调用因并发失败），正常情况下是空操作
+- 多重检查（缓存检查 + merge 内的 is_schema_changed 检查）确保即使进入 merge 也不会重复创建版本
 
 ### 5.6 并发控制
 
@@ -536,6 +647,7 @@ if let Some(updated_schema) = read_cache.get(&cache_key)
 2. **双重检查**：获取锁后再次检查缓存，避免重复更新
 3. **重试机制**：数据库事务失败时重试（`meta_transaction_retries` 次）
 4. **缓存更新**：数据库更新成功后同步更新内存缓存
+5. **Watch 同步**：数据库变更通过 watch 事件异步同步到集群所有节点
 
 ---
 
@@ -810,6 +922,8 @@ for 每个过期版本:
 | 乱序补齐 | `service/schema.rs` | `check_for_schema` (行 164-206) |
 | 缓存检查 | `service/schema.rs` | `handle_diff_schema` (行 264-270) |
 | 版本模式 | `infra/src/schema/mod.rs` | `merge` (行 498-531) |
+| 变更快速返回 | `infra/src/schema/mod.rs` | `merge` (行 490-494) |
+| Watch 同步 | `service/db/schema.rs` | `watch` (行 470-499) |
 | 历史归档 | `service/compact/retention.rs` | `delete_by_date` (行 486-501) |
 | 历史写入 | `infra/src/schema/history/` | `create`, `create_table` |
 | 缓存管理 | `service/db/schema.rs` | `cache`, `watch`, `list` |
@@ -824,12 +938,15 @@ for 每个过期版本:
 3. **版本化演进**：每个 schema 变更带时间戳，支持历史数据回溯查询
 4. **乱序友好**：乱序数据触发新版本（仅类型拓宽）
 5. **双模式更新**：模式A追加新版本，模式B仅更新最新版本
-6. **二次调用为空**：乱序时两次调用，但第二次在缓存检查处直接返回
-7. **归档分离**：ingest 写主表，compact 负责归档到 history 表
-8. **高并发设计**：本地锁 + 双重检查 + 数据库事务重试
-9. **性能优化**：内存缓存 + 哈希快速比较 + 快/慢路径分离
-10. **持久化历史**：独立的 schema_history 表记录每次演进
-11. **灵活配置**：支持用户定义 schema（UDS）限制字段爆炸
-12. **类型感知**：三类流（Logs/Metrics/Traces）UDS 行为差异化设计
-13. **边界清晰**：实时写入触发演进，历史归档只读查询
+6. **二次调用为空**：乱序时两次调用，正常情况第二次在缓存检查处直接返回
+7. **多重保护**：即使进入 merge，内部 is_schema_changed 检查也会快速返回
+8. **竞态处理**：第二次调用专门用于处理并发/缓存不一致场景
+9. **缓存双更新**：本地同步更新 + watch 异步同步，确保最终一致
+10. **归档分离**：ingest 写主表，compact 负责归档到 history 表
+11. **高并发设计**：本地锁 + 双重检查 + 数据库事务重试
+12. **性能优化**：内存缓存 + 哈希快速比较 + 快/慢路径分离
+13. **持久化历史**：独立的 schema_history 表记录每次演进
+14. **灵活配置**：支持用户定义 schema（UDS）限制字段爆炸
+15. **类型感知**：三类流（Logs/Metrics/Traces）UDS 行为差异化设计
+16. **边界清晰**：实时写入触发演进，历史归档只读查询
 
