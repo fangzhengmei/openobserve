@@ -15,6 +15,7 @@ src/
 ├── config/src/utils/schema.rs       # Schema 推断与类型转换核心逻辑
 ├── service/schema.rs                # Schema 检查与演进服务层
 ├── service/db/schema.rs             # Schema 数据库操作包装层
+├── service/compact/retention.rs     # 数据保留与 schema 归档
 ├── infra/src/schema/
 │   ├── mod.rs                       # Schema 缓存与合并核心逻辑
 │   └── history/                     # Schema 历史记录存储
@@ -106,7 +107,7 @@ ingest() [logs/metrics/traces]
 search()
     ├─ 按时间范围选择 Parquet 文件
     ├─ 按时间范围选择对应 schema 版本
-    ├─ 多版本 schema 合并查询
+    ├─多版本 schema 合并查询
     └─ 结果返回
 ```
 
@@ -116,9 +117,101 @@ search()
 
 ---
 
-## 三、首次写入字段推断流程
+## 三、Ingest 演进 vs Compact 归档：schema_history 写入边界
 
-### 3.1 推断入口
+### 3.1 两条独立链路
+
+```
+Schema 版本生命周期：
+
+Ingest 链路（写入时）                      Compact 链路（归档时）
+─────────────────────────                  ─────────────────────────
+check_for_schema()                         retention::delete_by_date()
+    ↓                                            ↓
+handle_diff_schema()                        按保留期过滤过期数据
+    ↓                                            ↓
+db::schema::merge()                       查询时间范围内的 schema 版本
+    ↓                                            ↓
+infra::schema::merge()                       移除当前版本（pop last）
+    ↓                                            ↓
+写入 /schema/{key} 元数据表          ┌─ history::create() → 写入 schema_history
+    │                                └─ schema::delete() → 从 /schema/ 元数据表删除
+    └──────────────────────────────────────────────────┘
+```
+
+### 3.2 Ingest 链路：写入主元数据表
+
+**核心函数**：`infra::schema::merge` (`infra/src/schema/mod.rs:419-538`)
+
+Ingest 过程中，schema 演进**仅写入主元数据表**（`/schema/` 前缀），不直接写入 `schema_history` 表：
+
+```rust
+// 存储路径：/schema/{org}/{stream_type}/{stream_name}
+// 存储格式：JSON 数组，包含所有版本的 schema
+db.get_for_update(
+    &key.clone(),
+    infra_db::NEED_WATCH,
+    None,
+    Box::new(move |value| {
+        // 合并逻辑...
+        // 返回更新后的值，写入主元数据表
+    })
+).await?;
+```
+
+**Ingest 写入特点**：
+- 存储位置：主元数据表（`/schema/` 前缀）
+- 存储格式：JSON 数组，包含所有版本
+- 版本控制：通过 `start_dt` / `end_dt` 元数据区分版本
+- 触发时机：每次 schema 变更时（新字段、类型拓宽）
+
+### 3.3 Compact 链路：归档到 schema_history
+
+**核心函数**：`retention::delete_by_date` (`service/compact/retention.rs:486-501`)
+
+当数据保留期到期时，compact 模块负责将过期的 schema 版本**从主元数据表移动到 schema_history 表**：
+
+```rust
+// 1. 查询时间范围内的所有 schema 版本
+let mut schema_versions =
+    infra::schema::get_versions(org_id, stream_type, stream_name, Some(time_range)).await?;
+
+// 2. 移除当前版本（最后一个），只归档过期版本
+schema_versions.pop();  // pop last version, it's the current version
+
+// 3. 归档过期版本到 schema_history
+for schema in schema_versions {
+    let start_dt: i64 = match schema.metadata().get("start_dt") {
+        Some(v) => v.parse().unwrap_or_default(),
+        None => 0,
+    };
+    if start_dt == 0 {
+        continue;
+    }
+    // 写入 schema_history 表
+    infra::schema::history::create(org_id, stream_type, stream_name, start_dt, schema).await?;
+    // 从主元数据表删除
+    infra::schema::delete(org_id, stream_type, stream_name, Some(start_dt)).await?;
+}
+```
+
+### 3.4 边界总结
+
+| 维度 | Ingest 演进 | Compact 归档 |
+|------|------------|-------------|
+| **触发时机** | 数据写入时 schema 变更 | 数据保留期到期时 |
+| **写入目标** | 主元数据表 `/schema/` | `schema_history` 表 |
+| **版本处理** | 追加新版本到数组 | 移动过期版本到 history 表 |
+| **当前版本** | 永远保留在主表 | 不归档（pop 掉最后一个） |
+| **调用链** | check_for_schema → handle_diff_schema → merge | delete_by_date → history::create |
+
+> **关键边界**：schema_history 表**仅由 compact/retention 模块写入**，ingest 过程从不直接写入 schema_history。
+
+---
+
+## 四、首次写入字段推断流程
+
+### 4.1 推断入口
 
 `check_for_schema` 函数 (`service/schema.rs:81-209`) 是 schema 检查的主入口：
 
@@ -127,7 +220,7 @@ search()
 3. **快速路径比较**：使用 `schema_eq` 比较 schema 是否相同
 4. **慢路径处理**：如 schema 不同，进入 `handle_diff_schema`
 
-### 3.2 字段类型推断算法
+### 4.2 字段类型推断算法
 
 **infer_json_schema_from_map** (`config/src/utils/schema.rs:55-80`)
 
@@ -143,7 +236,7 @@ search()
 | Null      | 忽略           |
 | 其他      | 报错           |
 
-### 3.3 类型提升规则
+### 4.3 类型提升规则
 
 **convert_data_type** (`config/src/utils/schema.rs:158-208`) 处理同一字段在不同记录中的类型冲突：
 
@@ -160,7 +253,7 @@ Utf8 → LargeUtf8
 
 > **设计意图**：遵循" widening conversion"（拓宽转换）原则，确保数据不会因类型变更而丢失。
 
-### 3.4 Schema 标准化
+### 4.4 Schema 标准化
 
 **fix_schema** (`config/src/utils/schema.rs:213-266`) 对推断出的 schema 进行标准化：
 
@@ -172,9 +265,9 @@ Utf8 → LargeUtf8
 
 ---
 
-## 四、Schema 演进与冲突处理
+## 五、Schema 演进与冲突处理
 
-### 4.1 Schema 变更检测
+### 5.1 Schema 变更检测
 
 **get_schema_changes** (`service/schema.rs:574-615`)
 
@@ -189,7 +282,7 @@ pub fn get_schema_changes(schema: &SchemaCache, inferred_schema: &Schema)
    - 拓宽转换（如 Int32→Int64）：更新 schema，记录 delta
    - 收窄转换（如 Int64→Int32）：不更新 schema，添加 `zo_cast` 标记到 delta
 
-### 4.2 Schema 合并核心逻辑
+### 5.2 Schema 合并核心逻辑
 
 **get_merge_schema_changes** (`infra/src/schema/mod.rs:688-738`)
 
@@ -203,7 +296,7 @@ pub fn get_merge_schema_changes(schema: &Schema, inferred_schema: &Schema)
 - `Vec<Field>`: 类型变更 delta（含 zo_cast 标记）
 - `Vec<Field>`: 合并后的完整字段列表
 
-### 4.3 类型拓宽判定
+### 5.3 类型拓宽判定
 
 **is_widening_conversion** (`infra/src/schema/mod.rs:816-891`)
 
@@ -219,66 +312,172 @@ pub fn get_merge_schema_changes(schema: &Schema, inferred_schema: &Schema)
 | Float32 | Float64, Utf8, LargeUtf8 |
 | Utf8 | LargeUtf8 |
 
-### 4.4 Schema 版本演进机制
+### 5.4 Schema 版本演进机制
 
-**merge** (`infra/src/schema/mod.rs:419-538`) 是 schema 更新的核心：
+**merge** (`infra/src/schema/mod.rs:419-538`) 是 schema 更新的核心，包含两种处理模式：
+
+#### 模式 A：追加新版本
+
+**触发条件** (`infra/src/schema/mod.rs:500-506`)：
+```rust
+// 1. 过滤掉 zo_cast 标记的字段（类型收窄）
+let schema_version_changes = field_datatype_delta
+    .iter()
+    .filter(|f| f.metadata().get("zo_cast").is_none())
+    .collect::<Vec<_>>();
+
+// 2. 需要新版本：存在非 zo_cast 的变更
+let need_new_version = !schema_version_changes.is_empty();
+
+// 3. 提供了 start_dt（记录时间戳）
+if need_new_version && let Some(start_dt) = start_dt {
+    // 追加新版本逻辑
+}
+```
+
+**执行结果**：
+1. 更新旧版本 schema：添加 `end_dt = start_dt` 元数据
+2. 创建新版本 schema：设置 `start_dt = start_dt` 元数据
+3. 两个版本都保留在主元数据表的 JSON 数组中
+
+#### 模式 B：仅更新最新版本
+
+**触发条件**：
+- `need_new_version = false`（只有 zo_cast 类型收窄变更）
+- 或 `start_dt = None`（未提供记录时间戳）
+
+**执行结果** (`infra/src/schema/mod.rs:523-531`)：
+```rust
+} else {
+    // just update the latest schema
+    tx.send(Some((final_schema.clone(), field_datatype_delta)))
+        .unwrap();
+    Ok(Some((
+        Some(json::to_vec(&vec![final_schema]).unwrap().into()),
+        None,  // 不创建新版本
+    )))
+}
+```
+
+**执行结果**：
+- 原地修改最新版本 schema
+- 不创建新版本
+- 不修改 `start_dt` / `end_dt` 元数据
 
 #### 场景 1：新流首次写入
 - 直接创建 schema，设置 `created_at` 和 `start_dt` 元数据
 - 不创建新版本（只有初始版本）
 
-#### 场景 2：字段添加 / 类型拓宽
-- 判断是否需要新版本：过滤 delta 中带 `zo_cast` 标记的字段
-- 如需新版本：
-  1. 更新旧版本 schema：添加 `end_dt = record_ts`
-  2. 创建新版本 schema：设置 `start_dt = record_ts`
-- 如不需新版本：直接更新最新 schema
+#### 场景 2：字段添加 / 类型拓宽（带时间戳）
+- 走 **模式 A**：追加新版本
+- 更新旧版本 `end_dt`，创建新版本 `start_dt`
 
 #### 场景 3：类型收窄（Int64 → Int32）
-- 不更新 schema
+- 走 **模式 B**：仅更新最新版本
+- 不更新 schema 字段类型
 - 在 delta 字段中添加 `zo_cast: true` 元数据标记
 - 写入时按原 schema 进行类型转换
 
-### 4.5 乱序时间触发版本补齐
+### 5.5 乱序时间触发版本补齐
 
-**判定逻辑** (`service/schema.rs:164-173, 193-206`)
+**完整判定逻辑** (`service/schema.rs:164-206`)
 
-```rust
-// 触发条件
-if !field_datatype_delta.is_empty() {
-    if let Some(start_dt) = schema_metadata.get("start_dt") {
-        let created_at = start_dt.parse().unwrap_or_default();
-        if record_ts <= created_at {  // 关键判定
-            need_insert_new_latest = true;
-        }
-    }
-}
-
-// 执行补齐
-if need_insert_new_latest {
-    _ = handle_diff_schema(
-        ...,
-        now_micros(),  // 使用当前时间作为新版本 start_dt
-        ...
-    ).await?;
-}
+```
+check_for_schema(record_ts)
+    ↓
+1. get_schema_changes() → 检测到类型变更 delta
+    ↓
+2. 乱序检测：record_ts <= current_version.start_dt ?
+    │
+    ├─ 否：正常流程
+    │     ↓
+    │     handle_diff_schema(record_ts)
+    │       ↓
+    │     merge(..., Some(record_ts))
+    │       ↓
+    │     根据 need_new_version 决定 模式A/模式B
+    │
+    └─ 是：乱序补齐流程（need_insert_new_latest = true）
+          ↓
+          第一次调用：handle_diff_schema(record_ts)
+            ↓
+            merge(..., Some(record_ts))
+            ↓
+            合并 schema，可能创建新版本（模式A）或更新（模式B）
+          ↓
+          第二次调用：handle_diff_schema(now_micros())
+            ↓
+            merge(..., Some(now_micros()))
+            ↓
+            用当前时间创建新版本（模式A）
 ```
 
-**触发条件**：
+#### 乱序补齐的两种结果
+
+**情况 1：乱序数据触发拓宽变更**
+
+```
+初始状态：
+  版本1: start_dt=1000, fields={value: Int32}
+
+乱序数据到达：record_ts=500, value字段为 Int64
+  ↓
+第一次调用 handle_diff_schema(500):
+  need_new_version = true (类型拓宽)
+  merge(..., Some(500)) → 模式A
+    版本1: end_dt=500
+    版本2: start_dt=500, fields={value: Int64}
+
+第二次调用 handle_diff_schema(now_micros=2000):
+  need_new_version = true (无变更但强制创建)
+  merge(..., Some(2000)) → 模式A
+    版本2: end_dt=2000
+    版本3: start_dt=2000, fields={value: Int64}
+
+最终结果：3 个版本
+  版本1: [0, 500)  Int32
+  版本2: [500, 2000) Int64  ← 乱序数据使用此版本
+  版本3: [2000, ∞)   Int64  ← 后续新数据使用此版本
+```
+
+**情况 2：乱序数据仅触发收窄变更**
+
+```
+初始状态：
+  版本1: start_dt=1000, fields={value: Int64}
+
+乱序数据到达：record_ts=500, value字段为 Int32
+  ↓
+第一次调用 handle_diff_schema(500):
+  need_new_version = false (只有 zo_cast)
+  merge(..., Some(500)) → 模式B
+    仅更新最新版本，添加 zo_cast 标记
+
+第二次调用 handle_diff_schema(now_micros=2000):
+  need_new_version = false (无实际变更)
+  merge(..., Some(2000)) → 模式B
+    仅更新最新版本
+
+最终结果：仍为 1 个版本
+  版本1: [0, ∞)  Int64  ← 乱序数据通过 cast 转换写入
+```
+
+**触发条件总结**：
 1. 存在类型变更 delta（`field_datatype_delta` 非空）
 2. 记录时间戳 ≤ 当前 schema 版本的 `start_dt`
 
-**执行结果**：
-- 创建一个**新的 schema 版本**，`start_dt = now_micros()`（当前系统时间）
-- 原 schema 版本保持不变（`end_dt` 不修改）
-- 新记录使用新 schema 版本写入
+**执行结果总结**：
+- 总是调用两次 `handle_diff_schema`：第一次用 `record_ts`，第二次用 `now_micros()`
+- 第一次调用：处理乱序数据的 schema 合并
+- 第二次调用：用当前时间创建新版本，确保时序一致性
+- 是否真正追加新版本取决于 `need_new_version`（是否有非 zo_cast 变更）
 
 **设计意图**：
 - 防止乱序旧数据的类型变更污染已经存在的 schema 版本
 - 确保时间戳较早的数据不会导致已有的 schema 版本"提前"开始
 - 新版本从当前时间开始，保证时序一致性
 
-### 4.6 并发控制
+### 5.6 并发控制
 
 **handle_diff_schema** (`service/schema.rs:242-479`) 中的并发保护：
 
@@ -289,9 +488,9 @@ if need_insert_new_latest {
 
 ---
 
-## 五、Schema 历史记录系统
+## 六、Schema 历史记录系统
 
-### 5.1 存储设计
+### 6.1 存储设计
 
 **表结构** (`infra/src/schema/history/sqlite.rs:90-110`)
 
@@ -311,7 +510,7 @@ CREATE TABLE schema_history (
 - `schema_history_stream_idx`: (org, stream_type, stream_name) 联合索引
 - `schema_history_stream_version_idx`: (org, stream_type, stream_name, start_dt) 唯一索引
 
-### 5.2 版本管理机制
+### 6.2 版本管理机制
 
 **Schema 元数据字段**：
 - `created_at`: 流创建时间
@@ -323,17 +522,18 @@ CREATE TABLE schema_history (
 2. 缓存未命中时从数据库加载
 3. 支持按时间范围过滤版本
 
-### 5.3 历史记录触发点
+### 6.3 历史记录触发点
 
 Schema 历史记录在以下情况创建：
 1. **新字段添加**：导致字段数量增加
 2. **类型拓宽**：如 Int32 → Int64
 3. **字段删除**：用户手动删除字段时
 4. **乱序补齐**：旧数据触发新版本创建时
+5. **数据保留到期**：compact/retention 模块归档过期版本
 
 > **注意**：类型收窄（带 zo_cast 标记）不会创建历史记录。
 
-### 5.4 旧数据回溯支持
+### 6.4 旧数据回溯支持
 
 **filter_schema_version_id** (`service/db/schema.rs:922-940`)
 
@@ -347,9 +547,9 @@ pub fn filter_schema_version_id(schemas: &[Schema], _start_dt: i64, end_dt: i64)
 
 ---
 
-## 六、用户定义 Schema (UDS) 三类流行为对比
+## 七、用户定义 Schema (UDS) 三类流行为对比
 
-### 6.1 UDS 支持范围
+### 7.1 UDS 支持范围
 
 **support_uds()** (`config/src/meta/stream.rs:146-151`)
 
@@ -369,7 +569,7 @@ pub fn support_uds(&self) -> bool {
 | Traces | ✅ |
 | 其他类型 | ❌ |
 
-### 6.2 自动启用条件
+### 7.2 自动启用条件
 
 **handle_diff_schema** (`service/schema.rs:353-358`)
 
@@ -386,7 +586,7 @@ if cfg.common.allow_user_defined_schemas
 }
 ```
 
-### 6.3 强制保留字段差异
+### 7.3 强制保留字段差异
 
 **check_schema_for_defined_schema_fields** (`service/schema.rs:525-572`)
 
@@ -440,7 +640,7 @@ for field in schema.fields() {
 }
 ```
 
-### 6.4 UDS 字段选择策略对比
+### 7.4 UDS 字段选择策略对比
 
 | 维度 | Logs | Metrics | Traces |
 |------|------|---------|--------|
@@ -449,7 +649,7 @@ for field in schema.fields() {
 | 字段排序 | 按名称 | 按名称 | 按名称 |
 | 触发阈值 | 相同配置 | 相同配置 | 相同配置 |
 
-### 6.5 Schema 过滤逻辑
+### 7.5 Schema 过滤逻辑
 
 **generate_schema_for_defined_schema_fields** (`service/schema.rs:484-523`)
 
@@ -460,9 +660,9 @@ for field in schema.fields() {
 
 ---
 
-## 七、缓存系统设计
+## 八、缓存系统设计
 
-### 7.1 多级缓存结构
+### 8.1 多级缓存结构
 
 ```
 STREAM_SCHEMAS_LATEST (RwAHashMap)
@@ -478,7 +678,7 @@ STREAM_SETTINGS (RwAHashMap)
   └── value: StreamSettings (流配置)
 ```
 
-### 7.2 缓存加载流程
+### 8.2 缓存加载流程
 
 **cache()** (`service/db/schema.rs:600-678`) 启动时预加载：
 1. 从数据库读取所有 schema 记录
@@ -486,7 +686,7 @@ STREAM_SETTINGS (RwAHashMap)
 3. 填充 `STREAM_SCHEMAS_LATEST`、`STREAM_SETTINGS`
 4. 构建完整版本列表填充 `STREAM_SCHEMAS`
 
-### 7.3 变更监听
+### 8.3 变更监听
 
 **watch()** (`service/db/schema.rs:373-598`) 实时同步：
 1. 监听 `/schema/` 前缀的数据库变更事件
@@ -495,9 +695,9 @@ STREAM_SETTINGS (RwAHashMap)
 
 ---
 
-## 八、关键代码路径
+## 九、关键代码路径
 
-### 8.1 数据写入时 Schema 检查流程
+### 9.1 数据写入时 Schema 检查流程
 
 ```
 ingest()
@@ -513,19 +713,37 @@ check_for_schema()  [service/schema.rs:81]
   ├─ get_schema_changes() 检测变更
   ├─ 乱序检测：record_ts <= start_dt ?
   │   └─ 是：need_insert_new_latest = true
-  └─ handle_diff_schema()  [service/schema.rs:242]
+  └─ handle_diff_schema(record_ts)  [service/schema.rs:242]
       ├─ local_lock 并发控制
       └─ db::schema::merge()  [service/db/schema.rs:54]
           └─ infra::schema::merge()  [infra/schema/mod.rs:419]
               ├─ get_merge_schema_changes()
-              ├─ 决定是否创建新版本
-              ├─ history::create() 记录历史
-              └─ 更新 STREAM_SCHEMAS_LATEST 缓存
+              ├─ need_new_version ?
+              │   ├─ 是：模式A - 追加新版本
+              │   └─ 否：模式B - 仅更新最新版本
+              └─ 更新 /schema/ 主元数据表
                   ↓ （乱序时二次调用）
                   handle_diff_schema(now_micros())
+                  └─ 模式A - 用当前时间创建新版本
 ```
 
-### 8.2 核心文件速查表
+### 9.2 Compact 归档流程
+
+```
+retention::delete_by_date()  [compact/retention.rs:440]
+  ↓
+删除过期 Parquet 文件
+  ↓
+infra::schema::get_versions(time_range)
+  ↓
+schema_versions.pop()  // 移除当前版本
+  ↓
+for 每个过期版本:
+  ├─ history::create() → 写入 schema_history 表
+  └─ schema::delete() → 从 /schema/ 主表删除
+```
+
+### 9.3 核心文件速查表
 
 | 功能 | 文件 | 关键函数 |
 |------|------|----------|
@@ -534,22 +752,26 @@ check_for_schema()  [service/schema.rs:81]
 | Schema 合并 | `infra/src/schema/mod.rs` | `merge`, `get_merge_schema_changes` |
 | 类型拓宽 | `infra/src/schema/mod.rs` | `is_widening_conversion` |
 | 乱序补齐 | `service/schema.rs` | `check_for_schema` (行 164-206) |
-| 历史记录 | `infra/src/schema/history/` | `create`, `create_table` |
+| 版本模式 | `infra/src/schema/mod.rs` | `merge` (行 498-531) |
+| 历史归档 | `service/compact/retention.rs` | `delete_by_date` (行 486-501) |
+| 历史写入 | `infra/src/schema/history/` | `create`, `create_table` |
 | 缓存管理 | `service/db/schema.rs` | `cache`, `watch`, `list` |
 | UDS 差异 | `service/schema.rs` | `check_schema_for_defined_schema_fields` |
 
 ---
 
-## 九、设计特点总结
+## 十、设计特点总结
 
 1. **宽表兼容**：支持动态字段添加，无需预先定义 schema
 2. **类型安全**：通过拓宽转换保证数据完整性，收窄转换用 cast 标记
 3. **版本化演进**：每个 schema 变更带时间戳，支持历史数据回溯查询
 4. **乱序友好**：旧数据触发新版本补齐，保证时序一致性
-5. **高并发设计**：本地锁 + 双重检查 + 数据库事务重试
-6. **性能优化**：内存缓存 + 哈希快速比较 + 快/慢路径分离
-7. **持久化历史**：独立的 schema_history 表记录每次演进
-8. **灵活配置**：支持用户定义 schema（UDS）限制字段爆炸
-9. **类型感知**：三类流（Logs/Metrics/Traces）UDS 行为差异化设计
-10. **边界清晰**：实时写入触发演进，历史归档只读查询
+5. **双模式更新**：模式A追加新版本，模式B仅更新最新版本
+6. **归档分离**：ingest 写主表，compact 负责归档到 history 表
+7. **高并发设计**：本地锁 + 双重检查 + 数据库事务重试
+8. **性能优化**：内存缓存 + 哈希快速比较 + 快/慢路径分离
+9. **持久化历史**：独立的 schema_history 表记录每次演进
+10. **灵活配置**：支持用户定义 schema（UDS）限制字段爆炸
+11. **类型感知**：三类流（Logs/Metrics/Traces）UDS 行为差异化设计
+12. **边界清晰**：实时写入触发演进，历史归档只读查询
 
