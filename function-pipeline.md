@@ -1667,80 +1667,150 @@ pub async fn update(
 
 当 `ExecutablePipeline::new` 编译失败（例如函数语法错误、VRL 禁止函数等），实时 Pipeline 的内存缓存是保留旧的编译结果，还是被清空？
 
-#### 7.1.2 代码实证：缓存不保留旧值
+**修正说明**: 此前提到的"编译失败时旧缓存值保留"结论不精确，实际行为取决于 `prev_source_stream` 参数控制的事件顺序。以下是精确分析。
 
-**场景 1: update_function 触发的缓存重建**
+#### 7.1.2 核心机制: prev_source_stream 决定事件顺序
 
-`update_function` 的级联更新路径：
-
-```
-update_function (functions.rs:341)
-    └─ db::pipeline::update(&pipeline, None)      ← prev_source_stream = None
-         │
-         ├─ prev_source_stream.is_some() → false   ← 不执行 Remove
-         │
-         ├─ infra_pipeline::put()                  ← 写入新 Pipeline 到 DB
-         └─ update_cache(PipelineTableEvent::Add)  ← 触发 Put 事件
-              └─ watch() 收到 Put 事件
-                   │
-                   ├─ 获取 pipeline_stream_mapping_cache 的写锁
-                   ├─ 获取 stream_exec_pl 的写锁
-                   │
-                   ├─ ExecutablePipeline::new()     ← 尝试编译
-                   │   ├─ Err(e) → log::error!     ← 仅记录日志
-                   │   │            不执行任何缓存写入
-                   │   │            不执行任何缓存删除
-                   │   │            **旧缓存中的值仍保留！**
-                   │   └─ Ok(exec_pl) →
-                   │        pipeline_stream_mapping_cache.insert()
-                   │        stream_exec_pl.insert()    ← 覆盖旧值
-                   │
-                   └─ 释放写锁
-```
-
-**关键发现**: `watch()` 中编译失败时，代码逻辑如下 (`db/pipeline.rs:422-442`)：
+`db::pipeline::update` 函数 (`db/pipeline.rs:73-86`) 的行为由 `prev_source_stream` 参数控制：
 
 ```rust
-if pipeline.enabled {
-    match ExecutablePipeline::new(&pipeline).await {
-        Err(e) => {
-            log::error!(...);
-            // ← 没有 remove 操作！
-            // ← 旧缓存中的 ExecutablePipeline 仍然存在！
-        }
-        Ok(exec_pl) => {
-            pipeline_stream_mapping_cache
-                .insert(pipeline_id.to_string(), stream_params.clone());
-            stream_exec_pl.insert(stream_params.clone(), exec_pl);
-        }
-    };
+pub async fn update(
+    pipeline: &Pipeline,
+    prev_source_stream: Option<StreamParams>,  // ← 关键参数
+) -> Result<(), PipelineError> {
+    if prev_source_stream.is_some() {
+        // 源 Stream 变更: 先发送 Remove 事件删除旧缓存
+        update_cache(PipelineTableEvent::Remove(&pipeline.id)).await;
+    }
+
+    infra_pipeline::put(pipeline).await?;
+    update_cache(PipelineTableEvent::Add(pipeline)).await;  // 再发送 Add 事件
+
+    Ok(())
 }
 ```
 
-**结论: 编译失败时，旧缓存值保留。**
+`watch()` 中对两类事件的处理 (`db/pipeline.rs:407-496`)：
 
-#### 7.1.3 缓存语义完整矩阵
+```rust
+// Add 事件处理 (行 422-432)
+match ExecutablePipeline::new(&pipeline).await {
+    Err(e) => {
+        log::error!(...);
+        // ← 仅记录日志，不执行任何缓存修改
+        // ← 旧值是否保留取决于之前是否有 Remove 事件
+    }
+    Ok(exec_pl) => {
+        stream_exec_pl.insert(stream_params.clone(), exec_pl);
+    }
+};
 
-| 场景 | 触发方式 | 缓存操作 | 旧值是否保留 |
-|-----|---------|---------|-----------|
-| 新 Pipeline 保存 | save_pipeline → set → Add 事件 | 编译成功 → insert；编译失败 → 无操作 | N/A (新 Pipeline 无旧值) |
-| Pipeline 更新 | update_pipeline → update → Add 事件 | 编译成功 → insert (覆盖)；编译失败 → 无操作 | ✅ **旧值保留** |
-| 函数更新 → 级联 | update_function → update → Add 事件 | 编译成功 → insert (覆盖)；编译失败 → 无操作 | ✅ **旧值保留** |
-| Pipeline 禁用 | update_pipeline → update → Add 事件 | pipeline.enabled = false → remove | ❌ 旧值被删除 |
-| Pipeline 删除 | delete_pipeline → Remove 事件 | remove | ❌ 旧值被删除 |
-| 源 Stream 变更 | update_pipeline → update → Remove + Add | 先 remove 再 insert | ❌ 旧值被删除 |
-| 节点启动/重启 | cache() 全量加载 | clear → 逐个编译 | ❌ 旧值被清除 |
+// Delete/Remove 事件处理 (行 471-484)
+if let Some(removed) = PIPELINE_STREAM_MAPPING.write().await.remove(pipeline_id)
+    && STREAM_EXECUTABLE_PIPELINES.write().await.remove(&removed).is_some()
+{
+    // ← 立即删除缓存
+}
+```
 
-#### 7.1.4 对 ingest 字段改写的实际影响
+#### 7.1.3 场景一: prev_source_stream = None（无 Remove 事件）
 
-**影响 1: 函数更新失败时不影响已有数据流**
+**调用路径**:
+- `update_function` 级联更新 → `db::pipeline::update(&pipeline, None)` (`functions.rs:403`)
+- `update_pipeline` 且源 Stream 不变 → `prev_source_stream = None` (`pipeline/mod.rs:169`)
+
+**事件顺序**:
+```
+只有 Add 事件 (无 Remove):
+═══════════════════════════
+
+  旧缓存: { stream_params → old_exec_pl }
+      │
+      ▼
+  Add 事件 → ExecutablePipeline::new() 失败
+      │
+      ├─ Err(e) → log::error!
+      │   └─ 无任何缓存操作
+      │
+      ▼
+  新缓存: { stream_params → old_exec_pl }  ← 旧值保留！
+```
+
+**结果**: ✅ **旧值保留**
+
+**验证路径**:
+1. 创建 Pipeline 引用 VRL 函数 `func_a` → 缓存正常
+2. 调用 `update_function` 将 `func_a` 改为有语法错误的版本
+3. 观察 `db::pipeline::update(&pipeline, None)` → 仅 Add 事件
+4. `watch()` 中 `ExecutablePipeline::new()` 失败 → 旧缓存仍在
+5. 发送 Ingest 请求 → 仍使用旧函数转换数据
+
+#### 7.1.4 场景二: prev_source_stream = Some（先 Remove 后 Add）
+
+**调用路径**:
+- `update_pipeline` 且源 Stream 变更 → `prev_source_stream = Some(old_stream)` (`pipeline/mod.rs:150`)
+
+**事件顺序**:
+```
+先 Remove 后 Add:
+══════════════════
+
+  旧缓存: { stream_params → old_exec_pl }
+      │
+      ▼
+  Remove 事件 → 删除旧缓存
+      │
+      ▼
+  缓存: { }  ← 已空
+      │
+      ▼
+  Add 事件 → ExecutablePipeline::new() 失败
+      │
+      ├─ Err(e) → log::error!
+      │   └─ 无任何缓存操作
+      │
+      ▼
+  新缓存: { }  ← 旧值被删除，无新值！
+```
+
+**结果**: ❌ **旧值被删除，缓存为空**
+
+**验证路径**:
+1. 创建 Pipeline 绑定源流 `stream_a` → 缓存正常
+2. 调用 `update_pipeline` 改源流为 `stream_b`，同时函数有语法错误
+3. 观察 `db::pipeline::update(&pipeline, Some(stream_a))` → Remove 先于 Add
+4. `watch()` 中 Remove 清空缓存 → Add 编译失败无操作
+5. 发送 Ingest 请求到 `stream_b` → 无 Pipeline 执行，直接写入
+
+#### 7.1.5 缓存语义完整矩阵（修正版）
+
+| 场景 | 触发方式 | `prev_source_stream` | 事件顺序 | 编译失败后缓存状态 |
+|-----|---------|---------------------|---------|-----------------|
+| 新 Pipeline 保存 | `save_pipeline` → `set` → Add | N/A | Add | N/A (新 Pipeline 无旧值) |
+| Pipeline 更新 (源不变) | `update_pipeline` → `update` → Add | `None` | Add | ✅ **旧值保留** |
+| Pipeline 更新 (源变更) | `update_pipeline` → `update` → Remove+Add | `Some(old)` | Remove → Add | ❌ **缓存为空** |
+| 函数更新 → 级联 | `update_function` → `update` → Add | `None` | Add | ✅ **旧值保留** |
+| Pipeline 禁用 | `update_pipeline` → `update` → Add | `None` | Add (enabled=false) | ❌ 旧值被删除 (行 443-451) |
+| Pipeline 删除 | `delete_pipeline` → `emit_delete_event` | N/A | Delete | ❌ 旧值被删除 |
+| 节点启动/重启 | `cache()` 全量加载 | N/A | clear → 逐个编译 | ❌ 旧值被清除 |
+
+#### 7.1.6 对 ingest 字段改写的实际影响
+
+**影响 1: 函数更新失败时不影响已有数据流（源不变场景）**
 
 当 `update_function` 将函数改坏了，编译失败后：
 - 旧缓存中的 `ExecutablePipeline` 仍包含**旧版本的编译后函数**
 - Ingest 请求继续使用旧的编译结果
 - **结果**: 数据仍然被旧函数转换，不中断
 
-**影响 2: 函数更新成功时的无过渡切换**
+**影响 2: 源 Stream 变更时编译失败会导致 Pipeline 中断**
+
+当修改 Pipeline 源 Stream 且编译失败时：
+- `Remove` 事件先删除了旧缓存
+- `Add` 编译失败无法插入新缓存
+- **结果**: Ingest 走无 Pipeline 路径，数据直接写入源 Stream 而不经过任何转换
+
+**影响 3: 函数更新成功时的无过渡切换**
 
 编译成功后：
 - `stream_exec_pl.insert()` 原子替换旧的 `ExecutablePipeline`
@@ -1748,12 +1818,44 @@ if pipeline.enabled {
 - 新的 `process_batch` 调用获取新的 `ExecutablePipeline`
 - **结果**: 无缝切换，无中间态
 
-**影响 3: 启动时的全量加载无旧值可用**
+**影响 4: 启动时的全量加载无旧值可用**
 
 `cache()` 中先 `clear()` 再逐个编译，若某个 Pipeline 编译失败：
 - 该 Pipeline 不会被缓存
 - **没有旧值可用**（已被 clear）
 - Ingest 走无 Pipeline 路径
+
+#### 7.1.7 可复验的代码验证路径
+
+**验证点 1: watch() 中 Add 事件 Err 分支无 remove**
+- 文件: `src/service/db/pipeline.rs`
+- 行号: 423-432
+- 验证: `Err(e)` 分支仅有 `log::error!`，无 `.remove()` 调用
+
+**验证点 2: watch() 中 Delete 事件有 remove**
+- 文件: `src/service/db/pipeline.rs`
+- 行号: 471-484
+- 验证: `PIPELINE_STREAM_MAPPING.remove()` + `STREAM_EXECUTABLE_PIPELINES.remove()`
+
+**验证点 3: db::pipeline::update 的 prev_source_stream 分支**
+- 文件: `src/service/db/pipeline.rs`
+- 行号: 73-86
+- 验证: `if prev_source_stream.is_some()` 条件下先调用 `Remove` 事件
+
+**验证点 4: update_function 级联传入 None**
+- 文件: `src/service/functions.rs`
+- 行号: 403
+- 验证: `db::pipeline::update(&pipeline, None)`
+
+**验证点 5: update_pipeline 源不变时传入 None**
+- 文件: `src/service/pipeline/mod.rs`
+- 行号: 140-170
+- 验证: `else { None }` 分支（源相同时）
+
+**验证点 6: cache() 启动时先 clear**
+- 文件: `src/service/db/pipeline.rs`
+- 行号: 246-252
+- 验证: `.clear()` 在遍历编译前调用
 
 ### 7.2 _meta 组织限制的精确绕过条件
 
@@ -1948,8 +2050,8 @@ match ExecutablePipeline::new(&pipeline).await {
       │
       └─ 级联 Pipeline 更新
            │
-           ├─ db::pipeline::update() → 无 L2 校验
-           └─ watch() → 缓存重建
+           ├─ db::pipeline::update(&pipeline, None) → 无 L2 校验
+           └─ watch() → 缓存重建 (prev_source_stream=None)
                 │
                 ├─ register_functions()
                 │   ├─ get_transforms() → DB 查询: func_a 是 JS
@@ -1970,44 +2072,361 @@ match ExecutablePipeline::new(&pipeline).await {
 ```
 
 ```
-                          函数更新编译失败后的系统行为
-                          ══════════════════════════════
+                          函数更新失败的两种场景
+                          ═════════════════════════
 
+  场景 A: 函数自身编译失败 (语法错误等)
+  ──────────────────────────────────────────────
   update_function(func_a: VRL→语法错误)
       │
-      ├─ 编译失败 → HTTP 400 返回
+      ├─ compile_vrl_function() 失败 → HTTP 400 返回
       ├─ db::functions::set() 不执行 → DB 中 func_a 仍是旧 VRL
       │
       └─ 级联 Pipeline 更新不触发
            │
            └─ Pipeline 缓存不变 → 继续使用旧 VRL 函数
 
-  ─── 对比: Pipeline 直接更新编译失败 ───
+  场景 B: 函数编译通过, 但 Pipeline 编译失败 (如 enrichment 表缺失)
+  ──────────────────────────────────────────────
+  update_function(func_a: VRL→引用不存在的 enrichment 表)
+      │
+      ├─ compile_vrl_function() 通过 (VRL 语法合法)
+      ├─ db::functions::set() → DB 中 func_a 已更新
+      │
+      └─ 级联 Pipeline 更新触发
+           │
+           ├─ db::pipeline::update(&pipeline, None) → prev_source_stream=None
+           └─ watch() → 仅 Add 事件 (无 Remove)
+                │
+                ├─ ExecutablePipeline::new()
+                │   └─ register_functions() 中 enrichment 表检查失败
+                │      → Err(e)
+                │
+                ├─ 实时路径:
+                │   ├─ Err 分支无缓存操作
+                │   ├─ stream_exec_pl 中的旧值保留
+                │   ├─ Ingest 继续使用旧 ExecutablePipeline
+                │   └─ 用户无感知, 数据仍被旧函数处理
+                │
+                └─ 调度路径:
+                     ├─ SCHEDULED_PIPELINES 中的 Pipeline 定义已更新
+                     └─ 下次调度时 ExecutablePipeline::new() 再次失败
+                         → 调度失败, 数据不被处理
 
-  update_pipeline → watch() → ExecutablePipeline::new() 失败
+  ─── 对比: Pipeline 源 Stream 变更时编译失败 ───
+
+  update_pipeline(改源流 stream_a→stream_b, 函数有问题)
       │
-      ├─ 实时路径:
-      │   ├─ stream_exec_pl 中的旧值保留
-      │   ├─ Ingest 继续使用旧 ExecutablePipeline
-      │   └─ 用户无感知, 数据仍被旧函数处理
+      ├─ db::pipeline::update(&pipeline, Some(stream_a)) → 先 Remove 后 Add
       │
-      └─ 调度路径:
-           ├─ SCHEDULED_PIPELINES 中的旧值保留 (Pipeline 定义)
-           ├─ 下次调度时 ExecutablePipeline::new() 再次尝试编译
-           ├─ 如果函数已被修复 → 编译成功 → 正常执行
-           └─ 如果函数未修复 → 编译再次失败 → 调度失败
+      └─ watch() → Remove 先删除旧缓存 → Add 编译失败无操作
+           │
+           └─ 缓存为空 → Ingest 走无 Pipeline 路径, 直接写入 stream_b
 ```
 
 ### 7.5 缓存与限制语义关键代码索引
 
 | 功能 | 文件位置 | 行号 |
 |-----|---------|-----|
-| watch() 编译失败保留旧缓存 | `src/service/db/pipeline.rs` | 422-442 |
-| db::pipeline::update 无 L2 校验 | `src/service/db/pipeline.rs` | 73-86 |
+| `prev_source_stream` 控制事件顺序 | `src/service/db/pipeline.rs` | 73-86 |
+| watch() Add 事件 Err 分支无 remove | `src/service/db/pipeline.rs` | 422-432 |
+| watch() Delete/Remove 事件有 remove | `src/service/db/pipeline.rs` | 471-484 |
+| watch() enabled=false 删除缓存 | `src/service/db/pipeline.rs` | 443-451 |
 | update_function L1 检查 (_meta 放行) | `src/service/functions.rs` | 360-364 |
+| update_function 级联传入 None | `src/service/functions.rs` | 403 |
+| update_pipeline 源不变时传入 None | `src/service/pipeline/mod.rs` | 140-170 |
+| update_pipeline 源变更时传入 Some | `src/service/pipeline/mod.rs` | 150 |
+| cache() 启动时先 clear | `src/service/db/pipeline.rs` | 246-252 |
 | 实时路径: Ingest 获取缓存 | `src/service/db/pipeline.rs` | 97-103 |
-| 调度路径: 获取 Pipeline 定义 | `src/service/db/pipeline.rs` | 158-159 |
 | 调度路径: 每次执行编译 | `src/service/alerts/scheduler/handlers.rs` | 2173 |
 | 调度路径: 编译失败处理 | `src/service/alerts/scheduler/handlers.rs` | 2174-2179 |
-| 启动全量加载: clear + 编译 | `src/service/db/pipeline.rs` | 246-275 |
 | register_functions (接受 JS) | `src/service/pipeline/batch_execution.rs` | 136-168 |
+
+---
+
+## 八、偏差分析与可复验验证路径
+
+### 8.1 描述偏差汇总与修正
+
+#### 8.1.1 偏差一: "编译失败时旧缓存值保留"
+
+**原始描述**: "编译失败时，旧缓存值保留。"
+
+**修正后**: "编译失败时，旧缓存值是否保留取决于 `prev_source_stream` 参数：
+- `prev_source_stream = None`（函数级联更新、源 Stream 不变的 Pipeline 更新）→ ✅ 旧值保留
+- `prev_source_stream = Some`（源 Stream 变更的 Pipeline 更新）→ ❌ 旧值被删除，缓存为空"
+
+**偏差产生原因**: 最初分析时未注意到 `db::pipeline::update` 函数中 `prev_source_stream` 参数对事件顺序的控制逻辑，将不同场景的行为混为一谈。
+
+**代码验证点**:
+- `db/pipeline.rs:73-86`: `if prev_source_stream.is_some()` 条件分支
+- `pipeline/mod.rs:140-170`: `prev_source_stream` 赋值逻辑
+- `functions.rs:403`: `db::pipeline::update(&pipeline, None)` 调用
+
+#### 8.1.2 偏差二: "函数更新编译失败后级联不触发"
+
+**原始描述**: "函数更新编译失败 → 级联 Pipeline 更新不触发"
+
+**修正后**: "函数更新编译失败分两种场景：
+- **场景 A**: 函数自身编译失败（VRL/JS 语法错误）→ HTTP 400 → DB 不更新 → 级联不触发 → 缓存不变
+- **场景 B**: 函数编译通过，但 Pipeline 编译失败（如 enrichment 表缺失）→ DB 更新成功 → 级联触发 → 缓存行为取决于 `prev_source_stream`"
+
+**偏差产生原因**: 最初分析时将"函数编译"和"Pipeline 编译"两个阶段混为一谈，未考虑 enrichment 表等外部依赖在 Pipeline 编译阶段才检查的情况。
+
+**代码验证点**:
+- `functions.rs:75-81`: `save_function` 中的 VRL 编译（无 enrichment 检查）
+- `batch_execution.rs:136-168`: `register_functions` 中的函数编译（含 enrichment 检查）
+- `functions.rs:400-419`: 级联 Pipeline 更新触发逻辑
+
+#### 8.1.3 偏差三: "Pipeline 更新编译失败后旧值保留"
+
+**原始描述**: "Pipeline 更新编译失败 → 旧值保留"
+
+**修正后**: "Pipeline 更新编译失败分两种场景：
+- 源 Stream 不变（`prev_source_stream = None`）→ ✅ 旧值保留
+- 源 Stream 变更（`prev_source_stream = Some`）→ ❌ 旧值被删除，缓存为空"
+
+**偏差产生原因**: 未区分 Pipeline 更新时源 Stream 是否变更这一关键条件。
+
+### 8.2 完整可复验代码验证路径
+
+以下所有验证点均可通过代码阅读直接确认，无需运行时测试。
+
+#### 8.2.1 验证组 A: 缓存行为验证
+
+| 验证编号 | 验证内容 | 文件位置 | 行号 | 验证方法 | 预期结果 |
+|---------|---------|---------|-----|---------|---------|
+| A-1 | Add 事件 Err 分支无 remove | `src/service/db/pipeline.rs` | 423-432 | 检查 `match` 的 `Err(e)` 分支 | 仅有 `log::error!`，无 `.remove()` 调用 |
+| A-2 | Delete 事件有 remove | `src/service/db/pipeline.rs` | 471-484 | 检查 `db::Event::Delete` 分支 | 有 `PIPELINE_STREAM_MAPPING.remove()` 和 `STREAM_EXECUTABLE_PIPELINES.remove()` |
+| A-3 | enabled=false 删除缓存 | `src/service/db/pipeline.rs` | 443-451 | 检查 `else if let Some(removed)` 分支 | `pipeline.enabled = false` 时调用 `.remove()` |
+| A-4 | `prev_source_stream` 控制 Remove 事件 | `src/service/db/pipeline.rs` | 73-86 | 检查 `if prev_source_stream.is_some()` | 为 `true` 时先调用 `update_cache(Remove)` |
+| A-5 | 函数级联传入 None | `src/service/functions.rs` | 403 | 检查 `db::pipeline::update` 调用 | 第二个参数为 `None` |
+| A-6 | 源不变时传入 None | `src/service/pipeline/mod.rs` | 169 | 检查 `else { None }` 分支 | 源相同时为 `None` |
+| A-7 | 源变更时传入 Some | `src/service/pipeline/mod.rs` | 150 | 检查 `PipelineSource::Realtime` 分支 | 为 `Some(stream_params)` |
+| A-8 | 启动时先 clear | `src/service/db/pipeline.rs` | 246-252 | 检查 `cache()` 函数 | `.clear()` 在 `for` 循环前调用 |
+
+#### 8.2.2 验证组 B: 脚本限制验证
+
+| 验证编号 | 验证内容 | 文件位置 | 行号 | 验证方法 | 预期结果 |
+|---------|---------|---------|-----|---------|---------|
+| B-1 | L1: 非 _meta 组织禁 JS | `src/service/functions.rs` | 69 | 检查 `if` 条件 | `trans_type == 1 && org_id != "_meta"` 时拒绝 |
+| B-2 | L2: save_pipeline 调 JS 校验 | `src/service/pipeline/mod.rs` | 89 | 检查 `save_pipeline` 函数 | 有 `validate_no_javascript_functions()` 调用 |
+| B-3 | L2: update_pipeline 调 JS 校验 | `src/service/pipeline/mod.rs` | 137 | 检查 `update_pipeline` 函数 | 有 `validate_no_javascript_functions()` 调用 |
+| B-4 | L2: db::pipeline::update 无 JS 校验 | `src/service/db/pipeline.rs` | 73-86 | 检查 `update` 函数 | 无任何校验调用 |
+| B-5 | register_functions 接受 JS | `src/service/pipeline/batch_execution.rs` | 143-146 | 检查 `if transform.is_js()` 分支 | 为 `true` 时调用 `compile_js_function()` |
+| B-6 | process_node 执行 JS | `src/service/pipeline/batch_execution.rs` | 953-999 | 检查 `CompiledFunctionRuntime::JS` 分支 | 有完整的执行逻辑，含单记录和批量模式 |
+
+#### 8.2.3 验证组 C: 路径差异验证
+
+| 验证编号 | 验证内容 | 文件位置 | 行号 | 验证方法 | 预期结果 |
+|---------|---------|---------|-----|---------|---------|
+| C-1 | 实时路径缓存预编译 | `src/service/db/pipeline.rs` | 423-437 | 检查 Add 事件 Realtime 分支 | `ExecutablePipeline::new()` 在 watch 中调用 |
+| C-2 | 实时路径缓存获取 | `src/service/db/pipeline.rs` | 97-103 | 检查 `get_executable_pipeline` | 从 `STREAM_EXECUTABLE_PIPELINES` 直接返回 |
+| C-3 | 调度路径缓存定义 | `src/service/db/pipeline.rs` | 453-467 | 检查 Add 事件 Scheduled 分支 | 仅存 `pipeline` 原始定义 |
+| C-4 | 调度路径每次编译 | `src/service/alerts/scheduler/handlers.rs` | 2173 | 检查调度处理逻辑 | `ExecutablePipeline::new()` 在每次调度时调用 |
+
+### 8.3 端到端测试场景（可运行验证）
+
+以下场景需在运行环境中验证，用于确认代码分析结论的正确性。
+
+#### 8.3.1 场景 1: 函数更新编译失败 - 旧值保留
+
+**前提**:
+- 已有 VRL 函数 `func_a`，功能为 `.foo = "old"`
+- Pipeline `pl_a` 引用 `func_a`，绑定 Stream `stream_a`
+- Pipeline 已启用并正常工作（`foo` 字段被设为 `"old"`）
+
+**步骤**:
+1. 调用 `update_function` 将 `func_a` 改为引用不存在的 enrichment 表：
+   ```
+   .foo = get_enrichment_table_record("non_existent_table", {.id})
+   ```
+2. 观察 `update_function` 返回值（应成功，因为 VRL 语法合法）
+3. 检查日志中 `[Pipeline::watch]` 的 error 日志（应有编译失败记录）
+4. 向 `stream_a` 发送 Ingest 请求
+
+**预期结果**:
+- `foo` 字段仍为 `"old"`（使用旧缓存）
+- `INGEST_ERRORS` 指标不会增加（因为旧函数执行成功）
+
+**验证点**: 确认 A-1, A-5, B-5
+
+#### 8.3.2 场景 2: Pipeline 源变更编译失败 - 缓存为空
+
+**前提**:
+- Pipeline `pl_a` 绑定 Stream `stream_a`，引用 `func_a`（`.foo = "old"`）
+- Pipeline 已启用并正常工作
+
+**步骤**:
+1. 调用 `update_pipeline` 将源流改为 `stream_b`，同时引用不存在的 enrichment 表
+2. 观察 `watch()` 日志（应有 Remove + Add 失败记录）
+3. 向 `stream_b` 发送 Ingest 请求
+
+**预期结果**:
+- `foo` 字段不存在（无 Pipeline 执行）
+- 数据直接写入 `stream_b`
+
+**验证点**: 确认 A-4, A-7
+
+#### 8.3.3 场景 3: _meta 组织 JS 绕过
+
+**前提**:
+- 使用 `_meta` 组织
+- 已有 VRL 函数 `func_a`（`.foo = "vrl"`）
+- Pipeline `pl_a` 引用 `func_a`，绑定 Stream `stream_a`
+
+**步骤**:
+1. 调用 `update_function` 将 `func_a` 改为 JS 函数：
+   ```javascript
+   input.foo = "js";
+   return input;
+   ```
+2. 观察 `update_function` 返回值（应成功，因为 org = "_meta"）
+3. 检查 `watch()` 日志（应有编译成功记录）
+4. 向 `stream_a` 发送 Ingest 请求
+
+**预期结果**:
+- `foo` 字段为 `"js"`（JS 函数被执行）
+- 无错误日志
+
+**验证点**: 确认 B-1, B-4, B-5, B-6
+
+#### 8.3.4 场景 4: 节点重启后编译失败
+
+**前提**:
+- Pipeline `pl_a` 引用 `func_a`（引用不存在的 enrichment 表）
+- Pipeline 已保存到 DB
+- 旧缓存中 `pl_a` 正常工作（使用旧版本 `func_a`）
+
+**步骤**:
+1. 重启 ingester 节点
+2. 检查 `cache()` 日志（应有编译失败记录）
+3. 向 `stream_a` 发送 Ingest 请求
+
+**预期结果**:
+- `foo` 字段不存在（无 Pipeline 执行，因为 cache() 先 clear 再编译，失败则不缓存）
+- 数据直接写入 `stream_a`
+
+**验证点**: 确认 A-8
+
+### 8.4 差异对 ingest 字段改写与错误副作用的影响总结
+
+#### 8.4.1 字段改写行为的不确定性矩阵
+
+| 操作场景 | 函数编译 | Pipeline 编译 | 实时路径字段改写 | 调度路径字段改写 |
+|---------|---------|-------------|---------------|---------------|
+| 函数更新（源不变） | ✅ 通过 | ✅ 通过 | 新函数 | 新函数（每次重编） |
+| 函数更新（源不变） | ✅ 通过 | ❌ 失败 | 旧函数（缓存保留） | ❌ 失败不处理 |
+| 函数更新（源不变） | ❌ 失败 | N/A | 旧函数（级联不触发） | 旧函数（级联不触发） |
+| Pipeline 更新（源变更） | ✅ 通过 | ✅ 通过 | 新函数 | 新函数（每次重编） |
+| Pipeline 更新（源变更） | ✅ 通过 | ❌ 失败 | 无改写（缓存为空） | ❌ 失败不处理 |
+| 节点重启 | ✅ 通过 | ✅ 通过 | 新函数 | 新函数 |
+| 节点重启 | ✅ 通过 | ❌ 失败 | 无改写（缓存为空） | ❌ 失败不处理 |
+
+#### 8.4.2 错误副作用控制的差异
+
+| 场景 | 实时路径错误控制 | 调度路径错误控制 |
+|-----|---------------|---------------|
+| 函数级联编译失败（源不变） | ✅ 无数据丢失（旧函数继续执行） | ❌ 数据不处理（调度失败） |
+| Pipeline 源变更编译失败 | ⚠️ 数据不经过转换直接写入（可能不符合预期） | ❌ 数据不处理 |
+| 节点重启编译失败 | ⚠️ 数据不经过转换直接写入 | ❌ 数据不处理 |
+| 函数执行时错误 | ✅ 返回原始 row，错误上报 | ✅ 返回原始 row，错误记录到 TriggerData |
+| JS 绕过 L2 后执行错误 | ✅ 返回原始 row | ✅ 返回原始 row |
+
+#### 8.4.3 运维判断建议
+
+**检查 Pipeline 是否正常工作的正确方法**:
+
+1. **不要**仅检查 `STREAM_EXECUTABLE_PIPELINES` 中是否有值
+   - 有值 ≠ 使用最新函数（可能是旧缓存）
+   - 无值 ≠ Pipeline 禁用（可能是编译失败后 Remove 事件清空）
+
+2. **应该**检查:
+   - `publish_error` 中的 self_reporting 数据（编译失败会发布）
+   - `INGEST_ERRORS` 指标（执行失败会上报）
+   - 输出流中的字段值是否符合预期
+
+3. **函数更新后的验证步骤**:
+   - 更新函数后立即检查 `update_function` 返回值
+   - 检查 `[Pipeline::watch]` 日志确认编译成功
+   - 发送测试数据验证字段改写符合预期
+
+### 8.5 偏差原因分析与启示
+
+#### 8.5.1 偏差产生的根本原因
+
+1. **多层编译模型**: 函数编译（VRL/JS 语法）与 Pipeline 编译（enrichment 表、拓扑排序等）是两个独立阶段，失败点不同导致行为不同。
+
+2. **参数驱动的分支逻辑**: `prev_source_stream` 参数在不同调用路径下值不同，导致事件顺序不同，最终缓存行为不同。
+
+3. **防御性设计的权衡**:
+   - 实时路径倾向"可用性优先"：编译失败时保留旧值，确保数据不中断
+   - 调度路径倾向"正确性优先"：每次重新编译，确保使用最新代码
+
+4. **文档与实现的差距**: 代码注释中没有明确说明 `prev_source_stream` 对缓存行为的影响，导致初读时容易忽略。
+
+#### 8.5.2 代码改进建议
+
+**建议 1: 在 register_functions 中添加 L2 校验**（最后一道防线）
+
+```rust
+// src/service/pipeline/batch_execution.rs:136-168
+async fn register_functions(&self) -> Result<HashMap<String, CompiledFunctionRuntime>> {
+    let mut function_map = HashMap::new();
+    for node in &self.nodes {
+        if let NodeData::Function(func_params) = &node.data {
+            let transform = get_transforms(&self.org, &func_params.name).await?;
+
+            // 新增: L2 级校验 - Pipeline 内禁止 JS 函数
+            if transform.is_js() {
+                return Err(anyhow::anyhow!(
+                    "JavaScript functions cannot be used in pipelines. \
+                     Function '{}' is a JavaScript function.",
+                    func_params.name
+                ));
+            }
+
+            // ... 原有编译逻辑
+        }
+    }
+    Ok(function_map)
+}
+```
+
+**建议 2: 编译失败时发布明确的告警事件**
+
+当前仅 `log::error!`，建议同时调用 `publish_error`，让用户通过 self_reporting 及时发现。
+
+**建议 3: 在 db::pipeline::update 中添加校验参数**
+
+```rust
+pub async fn update(
+    pipeline: &Pipeline,
+    prev_source_stream: Option<StreamParams>,
+    validate: bool,  // 新增参数
+) -> Result<(), PipelineError> {
+    if validate {
+        validate_no_javascript_functions(pipeline).await?;
+    }
+    // ...
+}
+```
+
+**建议 4: 优化函数更新后的用户反馈**
+
+`update_function` 级联更新 Pipeline 后，应返回哪些 Pipeline 编译成功/失败的详细信息，而非简单的 200 OK。
+
+### 8.6 本章关键代码索引
+
+| 功能 | 文件位置 | 行号 |
+|-----|---------|-----|
+| 验证点 A-1: Add Err 无 remove | `src/service/db/pipeline.rs` | 423-432 |
+| 验证点 A-2: Delete 有 remove | `src/service/db/pipeline.rs` | 471-484 |
+| 验证点 A-4: prev_source_stream 分支 | `src/service/db/pipeline.rs` | 73-86 |
+| 验证点 A-5: 函数级联传 None | `src/service/functions.rs` | 403 |
+| 验证点 A-6: 源不变传 None | `src/service/pipeline/mod.rs` | 169 |
+| 验证点 A-7: 源变更传 Some | `src/service/pipeline/mod.rs` | 150 |
+| 验证点 A-8: cache() 先 clear | `src/service/db/pipeline.rs` | 246-252 |
+| 验证点 B-5: register_functions 接受 JS | `src/service/pipeline/batch_execution.rs` | 143-146 |
+| 验证点 B-6: process_node 执行 JS | `src/service/pipeline/batch_execution.rs` | 953-999 |
+| 验证点 C-4: 调度路径每次编译 | `src/service/alerts/scheduler/handlers.rs` | 2173 |
