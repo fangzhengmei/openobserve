@@ -1050,3 +1050,441 @@ pub enum IndexOptimizeMode {
    - 查询 "HelloWorld" 会匹配包含 "hello" 和 "world" 的文档
    - 驼峰命名的拆分词会被分别搜索
    - 考虑数据特点调整查询关键词
+
+## 11. 容易误解的三个关键机制
+
+### 11.1 full_text_search_keys 与 index_fields 的互斥校验
+
+#### 11.1.1 为什么需要互斥
+
+在 Tantivy 索引中，`full_text_search_keys`（全文索引字段）和 `index_fields`（二级索引字段）使用不同的分词策略和索引结构：
+
+| 属性 | 全文索引字段 (FTS) | 二级索引字段 (Index) |
+|------|-------------------|---------------------|
+| Tantivy 字段 | 合并到 `INDEX_FIELD_NAME_FOR_ALL` | 创建独立字段 |
+| 分词器 | `O2_TOKENIZER`（驼峰拆分 + 小写） | `raw`（不分词，原样存储） |
+| 查询方式 | `match_all()` 在合并字段中搜索 | `Equal`/`In` 等精确匹配 |
+| 索引粒度 | 词项级别 | 原始值级别 |
+
+**如果同一字段同时出现在两种索引中**：
+- 全文索引会将其分词后存入合并字段（如 "HelloWorld" → "hello", "world"）
+- 二级索引会原样存入独立字段（如 "HelloWorld" → "HelloWorld"）
+- 查询语义产生歧义：`Equal("HelloWorld")` 在二级索引中能匹配，但在全文索引中分词后无法精确匹配
+
+#### 11.1.2 校验实现
+
+在 `src/service/stream.rs:1365-1414` 中：
+
+```rust
+fn validate_index_field_conflicts(
+    current_settings: &config::meta::stream::StreamSettings,
+    new_settings: &config::meta::stream::UpdateStreamSettings,
+) -> Result<(), String> {
+    // Get the actual FTS and Index fields including defaults
+    let current_fts_with_defaults =
+        infra::schema::get_stream_setting_fts_fields(&Some(current_settings.clone()));
+    let current_index_with_defaults =
+        infra::schema::get_stream_setting_index_fields(&Some(current_settings.clone()));
+
+    // Simulate the final state after applying the update
+    let mut final_fts_fields: HashSet<String> = current_fts_with_defaults.iter().cloned().collect();
+    let mut final_index_fields: HashSet<String> =
+        current_index_with_defaults.iter().cloned().collect();
+
+    // Apply removes
+    for field in &new_settings.full_text_search_keys.remove {
+        final_fts_fields.remove(field);
+    }
+    for field in &new_settings.index_fields.remove {
+        final_index_fields.remove(field);
+    }
+
+    // Apply adds
+    for field in &new_settings.full_text_search_keys.add {
+        final_fts_fields.insert(field.clone());
+    }
+    for field in &new_settings.index_fields.add {
+        final_index_fields.insert(field.clone());
+    }
+
+    // Find fields that would exist in both FTS and Secondary Index
+    let conflicting_fields: Vec<String> = final_fts_fields
+        .intersection(&final_index_fields)
+        .cloned()
+        .collect();
+
+    if !conflicting_fields.is_empty() {
+        let field_names: Vec<String> = conflicting_fields
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect();
+        return Err(format!(
+            "Field(s) {} cannot have both Full Text Search and Secondary Index. \
+             Please choose only one index type per field.",
+            field_names.join(", ")
+        ));
+    }
+    Ok(())
+}
+```
+
+#### 11.1.3 校验要点
+
+1. **模拟最终状态**：校验不是简单检查新增字段，而是模拟 `当前配置 + 移除 + 新增` 的最终状态
+2. **包含默认字段**：使用 `get_stream_setting_fts_fields()` 和 `get_stream_setting_index_fields()` 获取包含默认字段的完整列表
+3. **Bloom Filter 独立**：Bloom Filter 字段不受此互斥约束，可以与 FTS 或二级索引共存
+4. **校验时机**：在写入数据库之前执行，防止产生不一致状态
+
+#### 11.1.4 索引创建时的字段分流
+
+在 `src/service/tantivy/mod.rs` 中，互斥的字段走不同的索引路径：
+
+```
+用户配置字段列表
+    ↓
+fts_fields (只含 Utf8/LargeUtf8 类型)    index_fields (含所有类型)
+    ↓                                         ↓
+全部写入 INDEX_FIELD_NAME_FOR_ALL          各自创建独立字段
+使用 O2_TOKENIZER 分词                      使用 raw 分词器
+    ↓                                         ↓
+match_all() 查询                             Equal/In 查询
+```
+
+关键代码（`src/service/tantivy/mod.rs:237-240`）：
+
+```rust
+for column_name in tantivy_fields.iter() {
+    let field = match tantivy_schema.get_field(column_name) {
+        Ok(f) => f,                        // index_fields: 在 schema 中有独立字段
+        Err(_) => fts_field.unwrap(),      // fts_fields: 回退到合并字段
+    };
+}
+```
+
+### 11.2 索引条件部分跳过时的 DataFusion 回退过滤与结果缓存限制
+
+#### 11.2.1 条件跳过的根因
+
+在 `to_tantivy_query` 中（`src/service/search/index.rs:101-129`），当某个条件无法转换为 Tantivy 查询时，该条件会被**跳过**而非报错：
+
+```rust
+pub fn to_tantivy_query(
+    &self,
+    trace_id: &str,
+    schema: Schema,
+    default_field: Option<Field>,
+) -> anyhow::Result<(Box<dyn Query>, bool)> {
+    let mut has_skipped = false;
+    let mut queries: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(self.conditions.len());
+    for condition in &self.conditions {
+        match condition.to_tantivy_query(&schema, default_field) {
+            Ok(query) => {
+                queries.push((Occur::Must, query));
+            }
+            Err(e) => {
+                // 条件被跳过！
+                log::info!(
+                    "[trace_id {trace_id}] to_tantivy_query: skipping condition due to error: {e}"
+                );
+                has_skipped = true;
+            }
+        }
+    }
+    // ...
+    Ok((Box::new(BooleanQuery::from(queries)), has_skipped))
+}
+```
+
+**跳过发生的典型场景**：
+1. **新增索引字段无历史数据**：用户新添加了一个二级索引字段，但旧的 Tantivy 索引文件中没有这个字段（`schema.get_field(field)` 返回 Err）
+2. **MatchAll 但无全文搜索字段**：`default_field` 为 None，`MatchAll` 条件无法生成查询
+3. **字段不在当前索引 schema 中**：某些 Parquet 文件的索引可能是在字段配置变更之前创建的
+
+#### 11.2.2 回退过滤的完整链路
+
+当 `has_skipped_conditions = true` 时，系统必须保留 DataFusion 过滤器以确保查询正确性：
+
+```
+search_tantivy_index() 返回 (file_name, result, has_skipped_conditions=true)
+    ↓
+tantivy_search() 设置 is_add_filter_back = true
+    ↓
+search() 检查 is_add_filter_back
+    ├── true:  保留 index_condition 和 fst_fields，传给 create_tables_from_files()
+    └── false: 清空 index_condition = None, fst_fields = vec![]
+    ↓
+create_tables_from_files() 使用 index_condition 构建回退过滤器
+    ↓
+DataFusion 扫描 Parquet 时应用回退过滤器，精确匹配被跳过的条件
+```
+
+**代码路径**（`src/service/search/grpc/storage.rs:138-142`）：
+
+```rust
+// set index_condition to None, means we do not need to add filter back
+if !is_add_filter_back {
+    index_condition = None;
+    fst_fields = vec![];
+}
+```
+
+#### 11.2.3 回退过滤器的构建
+
+`IndexCondition.to_physical_expr()` 将索引条件转换回 DataFusion 物理表达式（`src/service/search/index.rs:543-672`）：
+
+```rust
+// MatchAll 回退为 LIKE 表达式
+Condition::MatchAll(value) => {
+    let value = value
+        .trim_start_matches("re:")
+        .trim_start_matches('*')
+        .trim_end_matches('*')
+        .to_string();
+    // 为每个 fst_field 创建 LIKE '%value%' 表达式
+    let term = Arc::new(Literal::new(ScalarValue::Utf8(Some(format!("%{value}%")))));
+    let mut expr_list: Vec<Arc<dyn PhysicalExpr>> = Vec::with_capacity(fst_fields.len());
+    for field in fst_fields.iter() {
+        expr_list.push(create_like_expr_with_not_null(field, term, schema));
+    }
+    Ok(disjunction(expr_list))  // 所有 FTS 字段 OR 组合
+}
+```
+
+#### 11.2.4 结果缓存限制
+
+**关键约束**：当条件被跳过时，索引搜索结果是不完整的，因此**不允许缓存**：
+
+```rust
+// src/service/search/grpc/storage.rs:939-949
+// Do not cache when conditions were skipped — the result is incomplete.
+if cfg.common.inverted_index_result_cache_enabled
+    && !cache_key.is_empty()
+    && !has_skipped_conditions        // ← 关键：跳过条件时禁止缓存
+    && (result.get_memory_size() < cfg.limit.inverted_index_result_cache_max_entry_size
+        || percent < 1.0)
+{
+    let entry = get_cache_entry(result.clone(), percent, parquet_file.meta.records as usize);
+    tantivy_result_cache::GLOBAL_CACHE.put(cache_key, entry);
+}
+```
+
+**缓存读取时的特殊处理**：缓存命中时返回 `has_skipped_conditions = false`，因为缓存的结果是之前完整搜索的结果：
+
+```rust
+if let Some(result) = tantivy_result_cache::GLOBAL_CACHE.get(&cache_key) {
+    return Ok((parquet_file.key.to_string(), result, false));  // false = 无跳过条件
+}
+```
+
+#### 11.2.5 多重回退触发条件汇总
+
+| 触发条件 | 代码位置 | 回退行为 |
+|---------|---------|---------|
+| `has_skipped_conditions = true` | `storage.rs:602-603` | `is_add_filter_back = true` |
+| 文件无索引（`file_name.is_empty()`） | `storage.rs:605-620` | `is_add_filter_back = true`，保留文件 |
+| 匹配行数过多（超过 `inverted_index_skip_threshold`） | `storage.rs:904-917` | 返回空文件名 + `has_skipped = true` |
+| 搜索出错 | `storage.rs:655-663` | `is_add_filter_back = true`，保留文件 |
+| 多个文件匹配行数过多 | `storage.rs:610-618` | 完全跳过索引搜索，保留所有文件 |
+
+### 11.3 match_all 重写与 tokenizer 的协作边界
+
+#### 11.3.1 两条独立的查询路径
+
+`match_all()` 在查询执行中有两条完全独立的路径，**它们之间不共享 tokenizer 处理**：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    match_all() 的两条路径                         │
+├───────────────────────┬─────────────────────────────────────────┤
+│   路径 A: 倒排索引    │   路径 B: DataFusion 回退过滤           │
+│   (Tantivy 搜索)      │   (RewriteMatch / to_physical_expr)     │
+├───────────────────────┼─────────────────────────────────────────┤
+│                       │                                         │
+│  Condition::MatchAll  │  RewriteMatchPhysical 优化器             │
+│       ↓               │       ↓                                 │
+│  o2_collect_search    │  直接使用原始字符串                      │
+│  _tokens("error")     │  trim * 后构造 LIKE '%error%'           │
+│       ↓               │       ↓                                 │
+│  ["error"]            │  "%error%"                              │
+│       ↓               │       ↓                                 │
+│  TermQuery 在         │  LIKE 在 Parquet 行数据上               │
+│  INDEX_FIELD_NAME_    │  子串匹配                               │
+│  FOR_ALL 中搜索       │       ↓                                 │
+│       ↓               │  DataFusion 自身的字符串匹配            │
+│  O2Tokenizer          │  (不经过 O2Tokenizer)                   │
+│  Search 模式分词      │                                         │
+│                       │                                         │
+└───────────────────────┴─────────────────────────────────────────┘
+```
+
+#### 11.3.2 路径 A：倒排索引中的 tokenizer 协作
+
+在 `Condition::MatchAll.to_tantivy_query()` 中（`src/service/search/index.rs:370-422`）：
+
+1. **分词处理**：`o2_collect_search_tokens(value)` 使用 Search 模式分词
+2. **查询构建**：每个 token 构建 `TermQuery`，在 `INDEX_FIELD_NAME_FOR_ALL` 中搜索
+3. **AND 组合**：多个 token 使用 `BooleanQuery::intersection`
+4. **通配符处理**：
+   - `*keyword*` → `ContainsQuery`（子串搜索）
+   - `keyword*` → `PhrasePrefixQuery`（前缀搜索）
+   - `*keyword` → `RegexQuery`（后缀搜索，转为正则 `.*keyword`）
+
+**关键**：这一路径中，查询关键词经过 O2Tokenizer Search 模式分词，与索引写入时的 Ingest 模式分词结果匹配。
+
+#### 11.3.3 路径 B：DataFusion 回退中的 LIKE 重写
+
+**RewriteMatchPhysical 优化器**（`src/service/search/datafusion/optimizer/physical_optimizer/rewrite_match.rs`）：
+
+```rust
+fn rewrite_match_all_physical(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: SchemaRef,
+    fields: &[(String, DataType)],
+) -> Result<Arc<dyn PhysicalExpr>> {
+    if name == MATCH_ALL_UDF_NAME {
+        let item = extract_string_literal(item_expr)?;
+        let item = item
+            .trim_start_matches("re:")  // 去掉 re: 前缀
+            .trim_start_matches('*')    // 去掉前导 *
+            .trim_end_matches('*')      // 去掉尾部 *
+            .to_string();
+
+        // 为每个 FTS 字段创建 LIKE '%item%' 表达式
+        for (field, data_type) in fields.iter() {
+            let term = Arc::new(Literal::new(ScalarValue::Utf8(Some(format!("%{item}%")))));
+            let new_expr = create_like_expr_with_not_null_physical(schema, field, term);
+            expr_list.push(new_expr);
+        }
+        Ok(disjunction(expr_list))  // 所有 FTS 字段 OR 组合
+    }
+}
+```
+
+**IndexCondition.to_physical_expr()** 中的 MatchAll 回退（`src/service/search/index.rs:582-616`）：
+
+```rust
+Condition::MatchAll(value) => {
+    let value = value
+        .trim_start_matches("re:")
+        .trim_start_matches('*')
+        .trim_end_matches('*')
+        .to_string();
+    // 直接构造 LIKE '%value%' 表达式
+    let term = Arc::new(Literal::new(ScalarValue::Utf8(Some(format!("%{value}%")))));
+    for field in fst_fields.iter() {
+        expr_list.push(create_like_expr_with_not_null(field, term, schema));
+    }
+    Ok(disjunction(expr_list))
+}
+```
+
+#### 11.3.4 协作边界的关键差异
+
+| 维度 | 路径 A (Tantivy) | 路径 B (DataFusion LIKE) |
+|------|-----------------|------------------------|
+| **分词** | O2Tokenizer Search 模式 | 无分词，直接使用原始字符串 |
+| **匹配方式** | 词项精确匹配 (TermQuery) | 子串匹配 (LIKE '%...%') |
+| **大小写** | LowerCaser 转小写后匹配 | `LikeExpr::new(false, true, ...)` 大小写不敏感 |
+| **驼峰处理** | "HelloWorld" → ["hello", "world"] 各自匹配 | "HelloWorld" 作为整体子串匹配 |
+| **通配符语义** | `*keyword*` → ContainsQuery | `*keyword*` → trim 后 LIKE '%keyword%' |
+| **多词查询** | "hello world" → AND 组合 | "hello world" → LIKE '%hello world%' |
+| **精度** | 词项级精确（可能有假阳性） | 子串级精确（保证真阳性） |
+
+#### 11.3.5 can_remove_filter 的边界
+
+`can_remove_filter()` 决定是否可以安全地移除 DataFusion 过滤器（即只用 Tantivy 索引结果）：
+
+```rust
+pub fn can_remove_filter(&self) -> bool {
+    match self {
+        Condition::Equal(..) => true,
+        Condition::NotEqual(..) => true,
+        Condition::StrMatch(..) => true,
+        Condition::In(..) => true,
+        Condition::Regex(..) => false,              // 正则查询不精确
+        Condition::MatchAll(v) => is_alphanumeric(v), // 仅纯字母数字可移除
+        Condition::FuzzyMatchAll(..) => false,       // 模糊查询不精确
+        Condition::All() => true,
+        Condition::Or(left, right) => left.can_remove_filter() && right.can_remove_filter(),
+        Condition::And(left, right) => left.can_remove_filter() && right.can_remove_filter(),
+        Condition::Not(condition) => condition.can_remove_filter(),
+    }
+}
+
+fn is_alphanumeric(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+```
+
+**`MatchAll` 为什么需要 `is_alphanumeric` 检查**：
+
+- **可移除** (`"error"`)：纯字母数字，O2Tokenizer 分词后 TermQuery 精确匹配，无异义
+- **不可移除** (`"error log"` 或 `"re:err.*"` 或 `"*error*"`)：
+  - 包含空格：分词为多个 token AND 组合，但 LIKE 回退是整体子串匹配，语义不同
+  - 包含通配符：Tantivy 使用 ContainsQuery/RegexQuery，可能有假阳性
+  - 包含正则前缀 `re:`：正则匹配精度低于精确匹配
+
+**移除过滤器的两种触发方式**：
+1. **配置开关**：`feature_query_remove_filter_with_index = true` 全局强制移除
+2. **条件判断**：`index_conditions.can_remove_filter()` 每个条件都允许移除时才移除
+
+#### 11.3.6 完整的决策流程图
+
+```
+match_all('keyword')
+    ↓
+┌───────────────────────────────────────────────────────┐
+│ IndexRule 提取 Condition::MatchAll("keyword")         │
+└───────────────────────┬───────────────────────────────┘
+                        ↓
+┌───────────────────────────────────────────────────────┐
+│ can_remove_filter()?                                   │
+│  ├─ keyword 是纯字母数字 → true                       │
+│  │    → 可移除 DataFusion 过滤器                       │
+│  └─ keyword 含空格/特殊字符 → false                   │
+│       → 必须保留 DataFusion 过滤器                     │
+└───────────────────────┬───────────────────────────────┘
+                        ↓
+┌───────────────────────────────────────────────────────┐
+│ Tantivy 索引搜索 (路径 A)                              │
+│  ├─ o2_collect_search_tokens("keyword")               │
+│  │    → 分词后在 INDEX_FIELD_NAME_FOR_ALL 中搜索       │
+│  └─ 返回 BitVec 行号位图                               │
+└───────────────────────┬───────────────────────────────┘
+                        ↓
+┌───────────────────────────────────────────────────────┐
+│ is_add_filter_back?                                    │
+│  ├─ true (条件跳过/匹配过多/无索引)                    │
+│  │    → 保留 index_condition                           │
+│  │    → DataFusion 扫描时应用 LIKE 回退过滤 (路径 B)  │
+│  └─ false (索引完整且精确)                             │
+│       → 清空 index_condition                           │
+│       → 仅扫描 BitVec 标记的行                         │
+└───────────────────────┬───────────────────────────────┘
+                        ↓
+┌───────────────────────────────────────────────────────┐
+│ RewriteMatchPhysical 优化器 (仅路径 B 触发)            │
+│  → match_all('keyword') 重写为                         │
+│    field1 LIKE '%keyword%' OR field2 LIKE '%keyword%' │
+│  → 注意：这里不经过 O2Tokenizer                        │
+│  → LIKE 是子串匹配，比 TermQuery 更宽松               │
+└───────────────────────────────────────────────────────┘
+```
+
+#### 11.3.7 常见误解澄清
+
+**误解 1**："match_all 查询关键词总是经过 O2Tokenizer 分词"
+
+**事实**：仅在 Tantivy 索引搜索路径（路径 A）中分词。DataFusion 回退过滤路径（路径 B）直接使用 LIKE 子串匹配，不经过任何分词。
+
+**误解 2**："索引搜索结果总是精确的，不需要回退过滤"
+
+**事实**：当条件被跳过（`has_skipped_conditions = true`）时，Tantivy 只搜索了部分条件，结果可能包含假阳性，必须由 DataFusion 回退过滤进一步筛选。
+
+**误解 3**："MatchAll 的 can_remove_filter 只看查询类型"
+
+**事实**：`MatchAll` 还检查查询值是否为纯字母数字。`match_all('error log')` 因为包含空格而不能移除过滤器——因为 Tantivy 路径会分词为 `"error" AND "log"`，而 LIKE 回退路径是 `LIKE '%error log%'` 整体匹配，两者的匹配域不同。
+
+**误解 4**："缓存的结果总是可以信任的"
+
+**事实**：当 `has_skipped_conditions = true` 时，结果不会被缓存，因为它是基于部分条件的不完整结果。缓存命中时返回 `has_skipped_conditions = false` 是因为缓存的是之前完整的搜索结果。但如果有新的索引字段被添加，旧的缓存结果可能遗漏了新字段的过滤，这是需要关注的边界情况。
