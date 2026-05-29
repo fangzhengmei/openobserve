@@ -380,41 +380,83 @@ if need_new_version && let Some(start_dt) = start_dt {
 
 ### 5.5 乱序时间触发版本补齐
 
-**完整判定逻辑** (`service/schema.rs:164-206`)
+#### 前置知识：get_schema_changes 的双重返回值
+
+**get_schema_changes** (`service/schema.rs:574-615`) 返回两个独立标志：
+```rust
+pub fn get_schema_changes(...) -> (bool, Vec<Field>)
+//                    ↑               ↑
+//           is_schema_changed  field_datatype_delta
+```
+
+| 变更类型 | is_schema_changed | field_datatype_delta |
+|----------|-------------------|----------------------|
+| 新字段 | true | 空（仅新字段无类型变更） |
+| 类型拓宽（Int32→Int64） | true | 非空（新类型字段） |
+| 类型收窄（Int64→Int32） | false | 非空（带 zo_cast 标记） |
+
+**关键结论**：类型收窄变更**不会**触发 schema 演进，因为 `is_schema_changed = false`。
+
+---
+
+#### 乱序补齐的真实触发条件
+
+**完整判定逻辑** (`service/schema.rs:129-173`)
 
 ```
 check_for_schema(record_ts)
     ↓
-1. get_schema_changes() → 检测到类型变更 delta
+1. get_schema_changes() → (is_schema_changed, delta)
     ↓
-2. 乱序检测：record_ts <= current_version.start_dt ?
+2. if !is_schema_changed → 直接返回，不触发乱序补齐
+    ↓
+3. 乱序检测：record_ts <= current_version.start_dt ?
     │
     ├─ 否：正常流程
     │     ↓
     │     handle_diff_schema(record_ts)
     │       ↓
     │     merge(..., Some(record_ts))
-    │       ↓
-    │     根据 need_new_version 决定 模式A/模式B
     │
     └─ 是：乱序补齐流程（need_insert_new_latest = true）
           ↓
           第一次调用：handle_diff_schema(record_ts)
-            ↓
-            merge(..., Some(record_ts))
-            ↓
-            合并 schema，可能创建新版本（模式A）或更新（模式B）
-          ↓
+          ↓ （第一次成功后更新 STREAM_SCHEMAS_LATEST 缓存）
           第二次调用：handle_diff_schema(now_micros())
             ↓
-            merge(..., Some(now_micros()))
-            ↓
-            用当前时间创建新版本（模式A）
+            【关键】缓存检查直接返回 Ok(None)
+            （不进入 merge）
 ```
 
-#### 乱序补齐的两种结果
+---
 
-**情况 1：乱序数据触发拓宽变更**
+#### 第二次 handle_diff_schema 调用的真实分支
+
+**缓存检查逻辑** (`service/schema.rs:264-270`)
+```rust
+// check if the schema has been updated by another thread
+let read_cache = STREAM_SCHEMAS_LATEST.read().await;
+if let Some(updated_schema) = read_cache.get(&cache_key)
+    && let (false, _) = get_schema_changes(updated_schema, inferred_schema)
+{
+    return Ok(None);  // 直接返回，不进入 merge
+}
+```
+
+**分析**：
+- 第一次调用成功后，会更新 `STREAM_SCHEMAS_LATEST` 缓存（`service/schema.rs:439-443`）
+- 第二次调用使用**同一个** `inferred_schema`
+- `get_schema_changes` 只比较**字段名和类型**，不比较元数据（如 start_dt）
+- 因为第一次调用已经把所有变更合并到缓存中了
+- 所以第二次调用的缓存检查返回 `(false, _)` → **直接返回 Ok(None)**
+
+> **重要修正**：第二次调用**不会**进入 merge，也**不会**创建新版本。它在缓存检查处就直接返回了。
+
+---
+
+#### 乱序补齐的真实结果
+
+**情况 1：乱序数据触发拓宽变更（唯一会触发乱序补齐的场景）**
 
 ```
 初始状态：
@@ -422,25 +464,30 @@ check_for_schema(record_ts)
 
 乱序数据到达：record_ts=500, value字段为 Int64
   ↓
+1. get_schema_changes → is_schema_changed=true, delta=[Int64]
+2. 乱序检测：500 <= 1000 → need_insert_new_latest = true
+  ↓
 第一次调用 handle_diff_schema(500):
-  need_new_version = true (类型拓宽)
-  merge(..., Some(500)) → 模式A
+  - 缓存检查：缓存中是版本1，get_schema_changes 返回 true
+  - 进入 merge(..., Some(500))
+  - need_new_version = true（类型拓宽）
+  - 模式A：追加新版本
     版本1: end_dt=500
     版本2: start_dt=500, fields={value: Int64}
-
+  - 更新 STREAM_SCHEMAS_LATEST 缓存为版本2
+  ↓
 第二次调用 handle_diff_schema(now_micros=2000):
-  need_new_version = true (无变更但强制创建)
-  merge(..., Some(2000)) → 模式A
-    版本2: end_dt=2000
-    版本3: start_dt=2000, fields={value: Int64}
+  - 缓存检查：缓存中是版本2，get_schema_changes 返回 false
+  - 【直接返回 Ok(None)】
+  - 不进入 merge
+  - 不创建新版本3
 
-最终结果：3 个版本
-  版本1: [0, 500)  Int32
-  版本2: [500, 2000) Int64  ← 乱序数据使用此版本
-  版本3: [2000, ∞)   Int64  ← 后续新数据使用此版本
+最终结果：2 个版本（不是 3 个！）
+  版本1: [0, 500)   Int32
+  版本2: [500, ∞)   Int64  ← 乱序数据和新数据都用此版本
 ```
 
-**情况 2：乱序数据仅触发收窄变更**
+**情况 2：乱序数据仅触发收窄变更（不会触发乱序补齐！）**
 
 ```
 初始状态：
@@ -448,34 +495,38 @@ check_for_schema(record_ts)
 
 乱序数据到达：record_ts=500, value字段为 Int32
   ↓
-第一次调用 handle_diff_schema(500):
-  need_new_version = false (只有 zo_cast)
-  merge(..., Some(500)) → 模式B
-    仅更新最新版本，添加 zo_cast 标记
+1. get_schema_changes → is_schema_changed=false, delta=[Int64 with zo_cast]
+2. 因为 is_schema_changed=false → 直接返回
+  ↓
+【不会进入乱序检测分支】
+【不会调用 handle_diff_schema】
+【版本数量不变】
 
-第二次调用 handle_diff_schema(now_micros=2000):
-  need_new_version = false (无实际变更)
-  merge(..., Some(2000)) → 模式B
-    仅更新最新版本
-
-最终结果：仍为 1 个版本
-  版本1: [0, ∞)  Int64  ← 乱序数据通过 cast 转换写入
+最终结果：1 个版本
+  版本1: [0, ∞)  Int64  ← 乱序数据通过 zo_cast 转换写入
 ```
 
-**触发条件总结**：
-1. 存在类型变更 delta（`field_datatype_delta` 非空）
-2. 记录时间戳 ≤ 当前 schema 版本的 `start_dt`
+---
+
+#### 触发条件与结果总结
+
+| 场景 | 触发乱序补齐？ | 调用 handle_diff_schema 次数 | 进入 merge 次数 | 版本数量变化 |
+|------|---------------|----------------------------|----------------|-------------|
+| 类型拓宽 + 乱序 | ✅ | 2 次 | 1 次（仅第一次） | +1 |
+| 类型收窄 + 乱序 | ❌ | 0 次 | 0 次 | 0 |
+| 类型拓宽 + 非乱序 | ❌ | 1 次 | 1 次 | +1 |
+| 类型收窄 + 非乱序 | ❌ | 0 次 | 0 次 | 0 |
 
 **执行结果总结**：
-- 总是调用两次 `handle_diff_schema`：第一次用 `record_ts`，第二次用 `now_micros()`
-- 第一次调用：处理乱序数据的 schema 合并
-- 第二次调用：用当前时间创建新版本，确保时序一致性
-- 是否真正追加新版本取决于 `need_new_version`（是否有非 zo_cast 变更）
+1. **只有类型拓宽 + 乱序**才会触发两次 handle_diff_schema 调用
+2. **第二次调用是空操作**，在缓存检查处直接返回
+3. **实际只创建 1 个新版本**，而不是 2 个
+4. **类型收窄永远不会触发乱序补齐**
 
 **设计意图**：
 - 防止乱序旧数据的类型变更污染已经存在的 schema 版本
 - 确保时间戳较早的数据不会导致已有的 schema 版本"提前"开始
-- 新版本从当前时间开始，保证时序一致性
+- 第二次调用是为了处理竞态条件（如第一次调用因并发失败），正常情况下是空操作
 
 ### 5.6 并发控制
 
@@ -710,11 +761,13 @@ check_for_schema()  [service/schema.rs:81]
   │   └─ infer_json_schema_from_object()
   │       └─ convert_data_type()
   ├─ schema_eq() 快速比较
-  ├─ get_schema_changes() 检测变更
+  ├─ get_schema_changes() → (is_schema_changed, delta)
+  ├─ if !is_schema_changed → 直接返回（类型收窄走此路径）
   ├─ 乱序检测：record_ts <= start_dt ?
-  │   └─ 是：need_insert_new_latest = true
+  │   └─ 是：need_insert_new_latest = true（仅类型拓宽）
   └─ handle_diff_schema(record_ts)  [service/schema.rs:242]
       ├─ local_lock 并发控制
+      ├─ 缓存检查：schema 已更新？→ 是则直接返回
       └─ db::schema::merge()  [service/db/schema.rs:54]
           └─ infra::schema::merge()  [infra/schema/mod.rs:419]
               ├─ get_merge_schema_changes()
@@ -722,9 +775,11 @@ check_for_schema()  [service/schema.rs:81]
               │   ├─ 是：模式A - 追加新版本
               │   └─ 否：模式B - 仅更新最新版本
               └─ 更新 /schema/ 主元数据表
+              └─ 更新 STREAM_SCHEMAS_LATEST 缓存
                   ↓ （乱序时二次调用）
                   handle_diff_schema(now_micros())
-                  └─ 模式A - 用当前时间创建新版本
+                  └─ 【关键】缓存检查 → 直接返回 Ok(None)
+                     （不进入 merge，不创建新版本）
 ```
 
 ### 9.2 Compact 归档流程
@@ -751,7 +806,9 @@ for 每个过期版本:
 | Schema 检查 | `service/schema.rs` | `check_for_schema`, `handle_diff_schema` |
 | Schema 合并 | `infra/src/schema/mod.rs` | `merge`, `get_merge_schema_changes` |
 | 类型拓宽 | `infra/src/schema/mod.rs` | `is_widening_conversion` |
+| 变更检测 | `service/schema.rs` | `get_schema_changes` (行 574-615) |
 | 乱序补齐 | `service/schema.rs` | `check_for_schema` (行 164-206) |
+| 缓存检查 | `service/schema.rs` | `handle_diff_schema` (行 264-270) |
 | 版本模式 | `infra/src/schema/mod.rs` | `merge` (行 498-531) |
 | 历史归档 | `service/compact/retention.rs` | `delete_by_date` (行 486-501) |
 | 历史写入 | `infra/src/schema/history/` | `create`, `create_table` |
@@ -765,13 +822,14 @@ for 每个过期版本:
 1. **宽表兼容**：支持动态字段添加，无需预先定义 schema
 2. **类型安全**：通过拓宽转换保证数据完整性，收窄转换用 cast 标记
 3. **版本化演进**：每个 schema 变更带时间戳，支持历史数据回溯查询
-4. **乱序友好**：旧数据触发新版本补齐，保证时序一致性
+4. **乱序友好**：乱序数据触发新版本（仅类型拓宽）
 5. **双模式更新**：模式A追加新版本，模式B仅更新最新版本
-6. **归档分离**：ingest 写主表，compact 负责归档到 history 表
-7. **高并发设计**：本地锁 + 双重检查 + 数据库事务重试
-8. **性能优化**：内存缓存 + 哈希快速比较 + 快/慢路径分离
-9. **持久化历史**：独立的 schema_history 表记录每次演进
-10. **灵活配置**：支持用户定义 schema（UDS）限制字段爆炸
-11. **类型感知**：三类流（Logs/Metrics/Traces）UDS 行为差异化设计
-12. **边界清晰**：实时写入触发演进，历史归档只读查询
+6. **二次调用为空**：乱序时两次调用，但第二次在缓存检查处直接返回
+7. **归档分离**：ingest 写主表，compact 负责归档到 history 表
+8. **高并发设计**：本地锁 + 双重检查 + 数据库事务重试
+9. **性能优化**：内存缓存 + 哈希快速比较 + 快/慢路径分离
+10. **持久化历史**：独立的 schema_history 表记录每次演进
+11. **灵活配置**：支持用户定义 schema（UDS）限制字段爆炸
+12. **类型感知**：三类流（Logs/Metrics/Traces）UDS 行为差异化设计
+13. **边界清晰**：实时写入触发演进，历史归档只读查询
 
