@@ -963,57 +963,130 @@ SELECT id, status FROM file_list_jobs WHERE org = $1 AND stream = $2 AND offsets
 
 #### 心跳续约与超时接管
 
-**心跳更新逻辑** (`src/service/compact/mod.rs:360-383`)：
+Compactor 有**两处独立的心跳续约路径**：
+
+##### 路径 A：run_merge() 批量心跳 (`compact/mod.rs:360-383`)
+
+在 `run_merge()` 领取一批 job 后，启动一个后台线程为这批 job 统一续约：
+
 ```rust
 // 计算心跳间隔：取 job_run_timeout 的 1/4，最小 60 秒
-// 为什么用 1/4？因为 1/2 可能仍然有超时风险，用 1/4 保证安全
 let ttl = std::cmp::max(60, cfg.compact.job_run_timeout / 4) as u64;
+let job_ids = merge_jobs.iter().map(|job| job.job_id).collect::<Vec<_>>();
 
-// 启动后台心跳线程
 tokio::task::spawn(async move {
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(ttl)) => {
-                // 定期更新 updated_at
+                // 批量更新所有 job 的 updated_at
                 infra_file_list::update_running_jobs(&job_ids).await;
             }
             _ = rx.recv() => {
-                return; // job 完成，退出心跳
+                return; // 所有 job 完成，退出心跳
             }
         }
     }
 });
 ```
 
-**超时接管逻辑** (`src/infra/src/file_list/sqlite.rs:1187-1221`)：
+**特点**：
+- 为一批 job 共享一个心跳线程
+- 所有 job 的 `updated_at` 同时更新
+- 停止条件：通道接收（所有 job 处理完成）
+
+##### 路径 B：JobScheduler 单 job 心跳 (`compact/worker.rs:94-113`)
+
+在 `JobScheduler::run()` 中，每个 job 单独启动心跳线程：
+
+```rust
+let ttl = std::cmp::max(60, cfg.compact.job_run_timeout / 4) as u64;
+tokio::spawn(async move {
+    loop {
+        let ret = rx.lock().await.recv().await;
+        match ret {
+            Some(job) => {
+                let (_tx, mut rx) = mpsc::channel::<()>(1);
+                tokio::task::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(ttl)) => {}
+                            _ = rx.recv() => { return; }
+                        }
+                        // 只更新当前这个 job
+                        infra::file_list::update_running_jobs(&[job.job_id]).await;
+                    }
+                });
+                // 执行 merge_by_stream
+            }
+        }
+    }
+});
+```
+
+**特点**：
+- 每个 job 独立心跳线程
+- 单独更新单个 job 的 `updated_at`
+- 停止条件：通道接收（单个 job 处理完成）
+
+**注意**：两处路径使用相同的 `ttl` 计算公式，但实际运行中**同时生效**。一个 job 会被两处心跳同时续约。
+
+##### 超时接管逻辑
+
+**check_running_jobs 触发时机** (`job/compactor.rs:141-153`)：
+- 作为独立定时任务运行，间隔 = `job_run_timeout` 秒
+- `before_date` = `now_micros() - (job_run_timeout * 1_000_000)` = `now - job_run_timeout` 微秒
+
+**SQLite 实现** (`infra/src/file_list/sqlite.rs:1187-1221`)：
 ```sql
 -- 将超时的 Running job 重置为 Pending
 UPDATE file_list_jobs 
 SET status = Pending 
 WHERE status = Running AND updated_at < before_date;
-```
-`before_date` = `now - job_run_timeout`，由调用方在每次 run_merge 前传入。
 
-**心跳边界图解**：
-```
-job_run_timeout (秒，如 3600)
-    │
-    │  ┌── ttl = max(60, job_run_timeout / 4) = 900 秒
-    │  │
-    │  │  心跳间隔：900s
-    │  │
-    ▼  ▼
-    ├───┬───┬───┬───┬───┬───┬───┬───┐  时间轴
-        ↑       ↑       ↑       ↑
-      心跳1    心跳2    心跳3    心跳4
-        │
-        ├─ 第一个 900s 窗口，如果节点崩溃
-        │   剩下 3600 - 900 = 2700s 才会被其他节点接管
-        │
-        └─ 安全系数：至少 3 次心跳机会才会超时
+-- 同时重置超时的 dumping job 的 node 字段
+UPDATE file_list_jobs 
+SET node = '' 
+WHERE status = Done AND dumped = false AND node != '' AND updated_at < before_date;
 ```
 
-**设计原因**：用 1/4 的超时时间作为心跳间隔，确保在超时前有多次续约机会，避免因为单次 DB 写入失败导致 job 被错误接管。
+##### 接管窗口的精确计算
+
+**参数定义**：
+- `T` = `job_run_timeout` (秒，如 3600s)
+- `ttl` = `max(60, T / 4)` (心跳间隔)
+
+**接管窗口图解**：
+```
+时间轴:  0 ──── ttl ──── 2ttl ──── 3ttl ──── T ──── (T+ttl)
+         │        │        │        │       │        │
+节点崩溃:  ●
+         │
+         ├─ 最后一次续约更新 updated_at = 0
+         │
+         ├─ check_running_jobs 每 T 秒运行一次
+         │
+         ▼  最快接管时间: 下一次 check_running_jobs 运行时间
+         │
+  最坏情况: 节点崩溃后立即错过了一次 check，需要等 T 秒
+  最好情况: 节点崩溃后立即有 check 运行，需要等 0 秒
+
+  实际接管时间范围: [0, T + ttl) 秒
+
+  例: T=3600s, ttl=900s
+  → 接管时间: 0 ~ 4500 秒 (0 ~ 75 分钟)
+```
+
+**边界情况分析**：
+| 场景 | 接管时间 | 说明 |
+|------|---------|------|
+| 崩溃后立即 check | 0 秒 | `updated_at=0` < `before_date=-T`，立即重置 |
+| 崩溃后错过 check，等下一轮 | T 秒 | check 每 T 秒运行一次 |
+| check 运行时更新心跳失败 | T + ttl 秒 | 心跳 ttl 后重试，再等 check |
+
+**设计权衡**：
+- 用 `T/4` 作为心跳间隔，确保在超时前有多次续约机会
+- 用 `T` 作为 check 间隔，避免频繁扫描 DB
+- 代价是最坏情况下接管延迟可达 `T + ttl`
 
 #### Job 生命周期状态机
 
@@ -1039,19 +1112,22 @@ job_run_timeout (秒，如 3600)
 | 场景 | 是否可能重复 | 处理方式 |
 |-----|------------|---------|
 | WAL replay 重复读取 | 否 | 处理完直接删除 `.wal` |
-| Compactor Job 重复执行 | 是 | 四层幂等保障（唯一约束 + 状态机原子性 + 一致性哈希 + file_list 去重 |
+| Compactor Job 重复执行 | 是 | 四层幂等保障（唯一约束 + 状态机原子性 + 一致性哈希 + file_list 去重） |
 | 合并文件重复上传 | 是 | 文件名含 UUID，旧文件通过 GC 清理 |
-| file_list 重复写入 | 是 | 事务性 batch_process，基于 ID 去重 |
+| file_list 重复写入 ingester 侧 | 是 | `(stream, date, file)` 唯一键，冲突返回 `Ok(0)`，上层无法区分 |
+| file_list 重复写入 compactor 侧 | 是 | 事务性 `batch_process`，旧文件标记 `deleted=true` |
 
 ### 10.5 极端场景：双写冲突
 
 **场景**：节点 A 正在合并，节点 B 因为网络分区也开始合并同一批文件
 
 **防护机制**：
-1. **唯一约束** (`L1 保证同一 offset 只能有一个 Pending/Done job
+1. **唯一约束** (`L1`)：`(org, stream, offsets)` 唯一索引，保证同一 offset 只能有一个 Pending/Done job
 2. **原子状态流转** (`L2`)：`get_pending_jobs()` 在事务内更新，并发领取只能有一个成功
-3. **一致性哈希**：同一 stream 固定路由到同一 compactor 节点
-4. **file_list 去重**：`batch_process` 原子更新，旧文件标记 deleted
+3. **一致性哈希**：同一 stream 固定路由到同一 compactor 节点，减少冲突概率
+4. **file_list 去重**：`batch_process` 原子更新，旧文件标记 `deleted=true`，搜索结果自动过滤
+
+**⚠️ 注意**：没有分布式锁 (`dist_lock`) 保护，极端情况下网络分区可能导致两个节点同时合并同一批文件。此时 L4 的 `deleted=true` 机制保证搜索结果正确，但会产生重复计算和重复文件，需通过 GC 清理。
 
 ---
 
@@ -1059,14 +1135,16 @@ job_run_timeout (秒，如 3600)
 
 | 文件 | 职责 | 关键函数 |
 |------|------|----------|
-| `src/service/compact/mod.rs` | Compactor 主入口 | `run_merge()`, `run_generate_job()` |
+| `src/service/compact/mod.rs` | Compactor 主入口 | `run_merge()`, `run_generate_job()`, 批量心跳 |
 | `src/service/compact/merge.rs` | 合并逻辑 | `generate_job_by_stream()`, `merge_by_stream()`, `merge_files()` |
-| `src/service/compact/worker.rs` | Worker 调度 | `JobScheduler`, `MergeWorker` |
+| `src/service/compact/worker.rs` | Worker 调度 + 单 job 心跳 | `JobScheduler`, `MergeWorker` |
 | `src/service/compact/dump.rs` | File list dump | `dump()`, `generate_dump()` |
 | `src/service/search/datafusion/merge/mod.rs` | DataFusion 合并引擎 | `merge_parquet_files()`, `write_parquet()` |
 | `src/service/file_list/mod.rs` | File list 元数据 | `set()`, `progress()` |
-| `src/service/db/file_list/local.rs` | 本地文件状态管理 | `add_pending_delete()`, `add_removing()` |
-| `src/job/compactor.rs` | Job 总调度 | `run()` 循环调用 run_merge/run_retention |
+| `src/service/db/file_list/mod.rs` | File list service 层 | `set()`, `progress()` (⚠️ 返回语义有缺陷) |
+| `src/infra/file_list/mod.rs` | File list infra 层接口 | `add()`, `batch_process()`, `update_running_jobs()` |
+| `src/infra/file_list/sqlite.rs` | File list SQLite 实现 | `inner_add_with_id()`, `get_pending_jobs()`, `check_running_jobs()` |
+| `src/job/compactor.rs` | Job 总调度 | `run()`, 定时任务: `check_running_jobs`, `clean_done_jobs` |
 | `src/job/files/parquet.rs` | Ingester parquet 上传任务 | `run()`, `move_files()`, `merge_files()` |
 | `src/job/files/mod.rs` | Ingester 文件任务入口 | `run()`, `generate_storage_file_name()` |
 | `src/ingester/src/partition.rs` | Memtable 持久化与分区 | `persist()`, `WAL_PARQUET_METADATA` 写入 |
@@ -1206,60 +1284,172 @@ Step 3: 合并循环
 | 文件存储类型 | `StorageType::Wal` | `StorageType::Wal` |
 | 写入 file_list | `db::file_list::set()` 单条写入 | `write_file_list()` 批量写入 |
 
-### 12.6 file_list 元数据写入
+### 12.6 file_list 元数据写入的完整调用链返回语义
 
-**db::file_list::set()** (`src/service/db/file_list/mod.rs:47-80`)：
+#### 调用链全景
+
+```
+move_files() (job/files/parquet.rs:541-552)
+    │  调用
+    ▼
+db::file_list::set() (service/db/file_list/mod.rs:47-80)
+    │  for 0..5 循环
+    ▼
+db::file_list::progress() (service/db/file_list/mod.rs:82-106)
+    │  调用
+    ▼
+infra::file_list::add() (infra/file_list/mod.rs:220-222)
+    │  调用
+    ▼
+infra/file_list/sqlite.rs inner_add() → inner_add_with_id()
+    │  执行 SQL INSERT
+    └─ 返回 Ok(id=0) 唯一键冲突
+    └─ 返回 Ok(id>0) 成功，返回 rowid
+    └─ 返回 Err(e) 其他错误
+```
+
+#### 各层返回语义详解
+
+**L1: infra::file_list::add()** (`infra/src/file_list/sqlite.rs:1475-1523`)
 
 ```rust
-pub async fn set(account: &str, key: &str, meta: Option<FileMeta>, deleted: bool) -> Result<()> {
-    let mut file_data = FileKey::new(...);
-    
-    // write into file_list storage
-    // retry 5 times
-    for _ in 0..5 {
-        match progress(account, key, meta.as_ref(), deleted).await {
-            Ok(id) => {
-                file_data.id = id;
-                break;
-            }
-            Err(e) => {
-                log::error!("[FILE_LIST] Error saving file to storage, retrying: {e}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
+async fn inner_add_with_id(...) -> Result<i64> {
+    match sqlx::query(INSERT ...).execute(...).await {
+        // ⚠️ 唯一键冲突返回 Ok(0)，不返回错误！
+        Err(sqlx::Error::Database(e)) => if e.is_unique_violation() {
+            Ok(0)
+        } else {
+            Err(Error::Message(e.to_string()))
+        },
+        Err(e) => Err(e.into()),
+        Ok(v) => Ok(v.last_insert_rowid()),  // 成功返回 rowid
     }
-    // notify other nodes...
-    Ok(())
 }
 ```
 
-**⚠️ 重要：`progress()` 的返回语义有问题** (`src/service/db/file_list/mod.rs:82-106`)：
+**返回值含义**：
+- `Ok(id > 0)`: 插入成功，返回新记录的 rowid
+- `Ok(id = 0)`: 唯一键冲突，文件已存在（幂等写入成功）
+- `Err(e)`: 真正的错误（连接失败、语法错误等）
+
+---
+
+**L2: db::file_list::progress()** (`service/db/file_list/mod.rs:82-106`)
 
 ```rust
-async fn progress(account: &str, key: &str, data: Option<&FileMeta>, delete: bool) -> Result<i64> {
+async fn progress(...) -> Result<i64> {
     let mut id = 0;
     if delete {
         if let Err(e) = infra::file_list::remove(key).await {
-            log::error!("service:db:file_list: delete {key}, remove error: {e}");
+            log::error!("delete error: {e}");  // 仅打日志
         }
     } else if let Some(data) = data {
         match infra::file_list::add(account, key, data).await {
             Ok(v) => { id = v; }
             Err(e) => {
-                // ⚠️ 仅打日志，不返回错误！外层重试会认为成功！
-                log::error!("service:db:file_list: add {key}, add error: {e}");
+                // ⚠️ 真正的 DB 错误也仅打日志，不向上返回！
+                log::error!("add error: {e}");
             }
         }
     }
-    Ok(id)  // 无论 DB 操作成功与否，都返回 Ok(id)
+    Ok(id)  // 无论成功失败都返回 Ok(id)
 }
 ```
 
-**关键问题**：即使 `infra::file_list::add()` 失败，`progress()` 仍然返回 `Ok(0)`。这意味着外层的 5 次重试循环**实际上失效**——第一次失败后就会跳出循环，返回 `Ok(())` 给调用者。调用者会认为元数据写入成功，继续删除本地 parquet 文件，但实际上 file_list 表中根本没有记录，对象存储中的文件成为孤立文件。
+**问题**：
+1. 唯一键冲突 `Ok(0)` 被当作成功处理（这是正确的幂等行为）
+2. **真正的 DB 错误 `Err(e)` 被吞掉了！** 只打日志，返回 `Ok(0)`
+3. 外层根本无法区分"唯一键冲突成功"和"DB 连接失败"
 
-**progress() 内部逻辑**：
-- `!deleted` → `infra::file_list::add()` + `incr_stream_stats()`（本地模式）
-- `deleted` → `infra::file_list::remove()`
+---
+
+**L3: db::file_list::set()** (`service/db/file_list/mod.rs:47-80`)
+
+```rust
+pub async fn set(...) -> Result<()> {
+    for _ in 0..5 {
+        match progress(...).await {
+            // progress 永远返回 Ok！所以第一次就 break
+            Ok(id) => { file_data.id = id; break; }
+            Err(e) => { /* 永远不会走到这里 */ }
+        }
+    }
+    Ok(())
+}
+```
+
+**⚠️ 核心缺陷**：`progress()` 永远返回 `Ok`，导致：
+- 5 次重试机制**完全失效**，第一次就跳出循环
+- 调用者无法知道写入是否真正成功
+
+---
+
+**L4: 调用者 move_files()** (`job/files/parquet.rs:541-552`)
+
+```rust
+if let Err(e) = db::file_list::set(...).await {
+    // ⚠️ 这段代码永远不会执行！set() 永远返回 Ok(())
+    log::error!(...);
+    // 释放 PROCESSING_FILES
+    return Ok(());
+};
+// 继续删除本地 parquet 文件...
+```
+
+#### 故障传导路径
+
+```
+DB 连接失败
+    │
+    ▼
+inner_add_with_id() → Err(e)
+    │
+    ▼
+progress() → 打日志 + 返回 Ok(0)
+    │
+    ▼
+set() → 第一次循环就 break + 返回 Ok(())
+    │
+    ▼
+move_files() → 认为写入成功 → 删除本地 .parquet
+    │
+    ▼
+对象存储有文件 + file_list 无记录 + 本地已删除
+    ╰─ 永久数据泄漏！
+```
+
+#### 唯一键冲突的幂等路径（正确路径）
+
+```
+文件已存在（重复上传）
+    │
+    ▼
+inner_add_with_id() → UNIQUE constraint violation
+    │
+    ▼
+返回 Ok(0)  ← 这是正确的幂等行为
+    │
+    ▼
+progress() → id=0 + 返回 Ok(0)
+    │
+    ▼
+set() → break + 返回 Ok(())
+    │
+    ▼
+move_files() → 认为成功 → 删除本地文件
+    │
+    ▼
+✅ 正确行为：重复上传不会产生重复记录
+```
+
+#### 关键配置
+
+| 配置 | 说明 | 位置 |
+|------|------|------|
+| `file_list` 表唯一键 | `(stream, date, file)` | SQLite schema |
+| `compact.file_list_deleted_batch_size` | 批量删除批次大小 | config |
+
+---
 
 ### 12.7 Pending Delete 延迟删除机制
 
@@ -1315,8 +1505,19 @@ scan_pending_delete_files()  （每轮循环执行）
 
 ### 修正 6：db::file_list::progress() 的返回语义实际上失效
 
-**原结论**：`set()` 会重试 5 次写入 file_list 元数据。
-**修正**：`progress()` 函数将 `infra::file_list::add()` 的错误只打日志，然后返回 `Ok(id=0)`。外层重试循环第一次失败就跳出，认为成功了。调用者会继续删除本地 parquet 文件，但 file_list 表中根本没有记录，对象存储中的文件成为孤立文件。这是一个**代码缺陷**。
+**原结论**：`set()` 会重试 5 次写入 file_list 元数据，DB 失败返回错误。
+**修正**：完整的四层调用链返回语义有严重缺陷：
+
+```
+move_files() → set() → progress() → add() → inner_add_with_id()
+               ↓        ↓        ↓        ↓
+            永远Ok   永远Ok  吞掉Err  Ok(0)=冲突 Ok(id)>0=成功 Err=真正错误
+```
+
+1. `inner_add_with_id()` 唯一键冲突返回 `Ok(0)`（正确幂等行为），真正错误返回 `Err(e)`
+2. `progress()` 吞掉 `Err(e)`，只打日志，永远返回 `Ok(id)`
+3. `set()` 的 5 次重试完全失效，第一次就跳出
+4. 调用者永远认为成功，删除本地文件后可能永久数据泄漏
 
 ### 修正 7：Compactor Job 幂等保障是四层机制
 
@@ -1327,7 +1528,41 @@ scan_pending_delete_files()  （每轮循环执行）
 3. **L3 一致性哈希**：同一 stream 路由到同一节点
 4. **L4 file_list 去重**：重复合并的旧文件被标记 `deleted=true`，搜索时自动过滤
 
+**补充**：没有分布式锁 (`dist_lock`) 保护，极端网络分区下仍可能双写，但 L4 保证搜索结果正确。
+
 ### 修正 8：心跳续约的边界参数
 
-**原结论**：心跳间隔 = `max(60, job_run_timeout / 4)`，安全系数 1/4。
-**修正**：补充了 `check_running_jobs()` 的 `before_date = now - job_run_timeout`，以及心跳边界图解。实际上节点崩溃后，其他节点最快需要 `job_run_timeout - job_run_timeout/4 = 3*job_run_timeout/4` 时间才能接管（如 3600s 超时 → 2700s 后接管）。
+**原结论**：心跳间隔 = `max(60, job_run_timeout / 4)`，节点崩溃后 3T/4 后接管。
+**修正**：
+
+1. Compactor 有**两处独立的心跳续约路径**，同一 job 会被两处同时续约：
+   - **路径 A**：`run_merge()` 批量心跳（`compact/mod.rs:360-383`）
+   - **路径 B**：`JobScheduler` 单 job 心跳（`compact/worker.rs:94-113`）
+
+2. 接管窗口精确计算：
+   - `check_running_jobs` 作为独立定时任务，间隔 = `job_run_timeout` 秒
+   - `before_date = now - job_run_timeout` 微秒
+   - 接管时间范围：`[0, T + ttl)` 秒（T=job_run_timeout, ttl=心跳间隔）
+   - 例：T=3600s，ttl=900s → 接管时间 0 ~ 4500 秒（0 ~ 75 分钟）
+
+### 修正 9：file_list 写入的幂等路径与故障路径
+
+**原结论**：未区分唯一键冲突和真正 DB 错误。
+**修正**：
+
+**正确的幂等路径**（唯一键冲突）：
+```
+文件已存在 → inner_add_with_id() → UNIQUE violation → 返回 Ok(0)
+→ progress() → Ok(0) → set() → Ok(()) → 删除本地文件 ✅ 正确
+```
+
+**故障路径**（真正 DB 错误）：
+```
+DB 连接失败 → inner_add_with_id() → Err(e)
+→ progress() → 吞掉错误返回 Ok(0)
+→ set() → 第一次就 break 返回 Ok(())
+→ move_files() → 删除本地文件
+→ 对象存储有文件 + file_list 无记录 → 永久数据泄漏 ❌ 缺陷
+```
+
+两种路径上层完全无法区分，因为 `progress()` 永远返回 `Ok`。
