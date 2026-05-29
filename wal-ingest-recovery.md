@@ -922,43 +922,124 @@ if cfg.common.inverted_index_enabled && stream_type.support_index() && need_inde
 | **write_file_list() 部分成功** | batch_process 事务性操作 | 重试保证最终一致 | 低 |
 | **标记删除旧文件后** | 旧文件 deleted=true 但未物理删除 | delay_delete 后续清理 | 低：存储临时占用 |
 
-### 10.3 Compactor Job 容错机制
+### 10.3 Compactor Job 幂等保障与心跳机制
 
-**Job 状态更新心跳** (`src/service/compact/mod.rs:360-383`)
+#### 幂等保障的四层路径
 
+Compactor 重复执行同一批文件的合并时，通过四层机制保证正确性：
+
+| 层级 | 机制 | 实现位置 | 作用 |
+|------|------|----------|------|
+| **L1 唯一约束** | `(org, stream, offsets)` 唯一索引 | `sqlite.rs:960-1030` | 重复生成同一 job 不会报错，直接复用已存在的 job |
+| **L2 状态机原子流转** | Pending → Running → Done 原子性 | `sqlite.rs:1032-1107` | `get_pending_jobs()` 在事务内更新状态，防止并发领取 |
+| **L3 一致性哈希** | 同一 stream 路由到同一节点 | `compact/mod.rs:63-69` | 避免跨节点竞争同一 job |
+| **L4 file_list 去重** | `deleted=true` 标记 + 事务 | `compact/merge.rs:1035-1078` | 同一文件多次合并时，旧文件被标记删除，搜索结果只取未删除的 |
+
+**L1：唯一约束** (`src/infra/src/file_list/sqlite.rs:960-1030`)
+```sql
+INSERT INTO file_list_jobs (org, stream, offsets, status, node, started_at, updated_at)
+VALUES ($1, $2, $3, $4, '', 0, 0);
+
+-- 违反唯一约束时，检查是否是 Done 状态，如果是则重置为 Pending
+SELECT id, status FROM file_list_jobs WHERE org = $1 AND stream = $2 AND offsets = $3;
+-- 如果是 Done 状态，重置为 Pending 重新执行
+```
+同一 `(org, stream_type, stream_name, hour_offset)` 只能有一条记录，重复 `add_job()` 不会报错。
+
+**L2：原子状态流转** (`sqlite.rs:1032-1107`)
+```
+事务内:
+  1. SELECT max(id) WHERE status = Pending
+  2. UPDATE SET status = Running, node = ?, started_at = now, updated_at = now
+  3. SELECT * 获取完整记录
+  4. COMMIT
+```
+在同一个数据库事务中完成查询和状态更新，防止多个节点同时领取同一 job。
+
+**L4：file_list 去重** (`compact/merge.rs:1035-1078`)
+- 新文件通过 `batch_process` 批量写入
+- 旧文件通过 `batch_add_deleted` 标记为 deleted=true
+- 查询时 `deleted=true` 的文件不会被返回
+
+#### 心跳续约与超时接管
+
+**心跳更新逻辑** (`src/service/compact/mod.rs:360-383`)：
 ```rust
-// 创建后台线程，每隔 ttl 秒更新一次 job 状态
-// ttl = max(60, job_run_timeout / 4)
+// 计算心跳间隔：取 job_run_timeout 的 1/4，最小 60 秒
+// 为什么用 1/4？因为 1/2 可能仍然有超时风险，用 1/4 保证安全
 let ttl = std::cmp::max(60, cfg.compact.job_run_timeout / 4) as u64;
 
+// 启动后台心跳线程
 tokio::task::spawn(async move {
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(ttl)) => {}
-            _ = rx.recv() => { return; }
+            _ = tokio::time::sleep(Duration::from_secs(ttl)) => {
+                // 定期更新 updated_at
+                infra_file_list::update_running_jobs(&job_ids).await;
+            }
+            _ = rx.recv() => {
+                return; // job 完成，退出心跳
+            }
         }
-        // 更新 job 的 updated_at，防止其他节点接管
-        infra_file_list::update_running_jobs(&job_ids).await;
     }
 });
 ```
 
-**Job 超时接管逻辑**：
-1. Job 被节点 A 领取后，持续更新 `updated_at`
-2. 如果节点 A 崩溃，心跳停止
-3. 其他节点通过 `check_running_jobs` 检查超时
-4. 超时后重置 `node` 字段，其他节点可重新领取
+**超时接管逻辑** (`src/infra/src/file_list/sqlite.rs:1187-1221`)：
+```sql
+-- 将超时的 Running job 重置为 Pending
+UPDATE file_list_jobs 
+SET status = Pending 
+WHERE status = Running AND updated_at < before_date;
+```
+`before_date` = `now - job_run_timeout`，由调用方在每次 run_merge 前传入。
 
-**关键配置**：
-- `compact.job_run_timeout`: Job 执行超时时间（秒）
-- `compact.delete_files_delay_hours`: 延迟删除等待时间
+**心跳边界图解**：
+```
+job_run_timeout (秒，如 3600)
+    │
+    │  ┌── ttl = max(60, job_run_timeout / 4) = 900 秒
+    │  │
+    │  │  心跳间隔：900s
+    │  │
+    ▼  ▼
+    ├───┬───┬───┬───┬───┬───┬───┬───┐  时间轴
+        ↑       ↑       ↑       ↑
+      心跳1    心跳2    心跳3    心跳4
+        │
+        ├─ 第一个 900s 窗口，如果节点崩溃
+        │   剩下 3600 - 900 = 2700s 才会被其他节点接管
+        │
+        └─ 安全系数：至少 3 次心跳机会才会超时
+```
+
+**设计原因**：用 1/4 的超时时间作为心跳间隔，确保在超时前有多次续约机会，避免因为单次 DB 写入失败导致 job 被错误接管。
+
+#### Job 生命周期状态机
+
+```
+初始状态 → 插入 → Pending
+    │                     ↑
+    │ get_pending_jobs()  │ check_running_jobs() 超时
+    ▼                     │
+  Running  ←──────────────┘
+    │  节点崩溃
+    │  update_running_jobs() 续约
+    │
+    ▼  merge 成功 → set_job_done()
+  Done
+    │
+    │ clean_done_jobs() 延迟清理
+    ▼
+  [删除]
+```
 
 ### 10.4 幂等性与重复数据
 
 | 场景 | 是否可能重复 | 处理方式 |
 |-----|------------|---------|
 | WAL replay 重复读取 | 否 | 处理完直接删除 `.wal` |
-| Compactor Job 重复执行 | 是 | file_list 版本检查，幂等更新 |
+| Compactor Job 重复执行 | 是 | 四层幂等保障（唯一约束 + 状态机原子性 + 一致性哈希 + file_list 去重 |
 | 合并文件重复上传 | 是 | 文件名含 UUID，旧文件通过 GC 清理 |
 | file_list 重复写入 | 是 | 事务性 batch_process，基于 ID 去重 |
 
@@ -967,10 +1048,10 @@ tokio::task::spawn(async move {
 **场景**：节点 A 正在合并，节点 B 因为网络分区也开始合并同一批文件
 
 **防护机制**：
-1. **分布式锁** (`dist_lock`)：生成 job 前获取锁
-2. **一致性哈希**：同一 stream 固定路由到同一 compactor 节点
-3. **Job 心跳**：超时后才允许其他节点接管
-4. **file_list 事务**：`batch_process` 原子更新，避免部分成功
+1. **唯一约束** (`L1 保证同一 offset 只能有一个 Pending/Done job
+2. **原子状态流转** (`L2`)：`get_pending_jobs()` 在事务内更新，并发领取只能有一个成功
+3. **一致性哈希**：同一 stream 固定路由到同一 compactor 节点
+4. **file_list 去重**：`batch_process` 原子更新，旧文件标记 deleted
 
 ---
 
@@ -1131,27 +1212,52 @@ Step 3: 合并循环
 
 ```rust
 pub async fn set(account: &str, key: &str, meta: Option<FileMeta>, deleted: bool) -> Result<()> {
-    let mut file_data = FileKey::new(0, account, key, meta.unwrap_or_default(), deleted);
+    let mut file_data = FileKey::new(...);
     
-    // 1. 写入 file_list 存储，最多重试 5 次
+    // write into file_list storage
+    // retry 5 times
     for _ in 0..5 {
         match progress(account, key, meta.as_ref(), deleted).await {
-            Ok(id) => { file_data.id = id; break; }
+            Ok(id) => {
+                file_data.id = id;
+                break;
+            }
             Err(e) => {
                 log::error!("[FILE_LIST] Error saving file to storage, retrying: {e}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     }
-    
-    // 2. 通知其他节点（如果 cache_latest_files.enabled）
-    if cfg.cache_latest_files.enabled {
-        broadcast::BROADCAST_QUEUE.write().await.push(file_data);
-    }
+    // notify other nodes...
+    Ok(())
 }
 ```
 
-**progress()** 内部：
+**⚠️ 重要：`progress()` 的返回语义有问题** (`src/service/db/file_list/mod.rs:82-106`)：
+
+```rust
+async fn progress(account: &str, key: &str, data: Option<&FileMeta>, delete: bool) -> Result<i64> {
+    let mut id = 0;
+    if delete {
+        if let Err(e) = infra::file_list::remove(key).await {
+            log::error!("service:db:file_list: delete {key}, remove error: {e}");
+        }
+    } else if let Some(data) = data {
+        match infra::file_list::add(account, key, data).await {
+            Ok(v) => { id = v; }
+            Err(e) => {
+                // ⚠️ 仅打日志，不返回错误！外层重试会认为成功！
+                log::error!("service:db:file_list: add {key}, add error: {e}");
+            }
+        }
+    }
+    Ok(id)  // 无论 DB 操作成功与否，都返回 Ok(id)
+}
+```
+
+**关键问题**：即使 `infra::file_list::add()` 失败，`progress()` 仍然返回 `Ok(0)`。这意味着外层的 5 次重试循环**实际上失效**——第一次失败后就会跳出循环，返回 `Ok(())` 给调用者。调用者会认为元数据写入成功，继续删除本地 parquet 文件，但实际上 file_list 表中根本没有记录，对象存储中的文件成为孤立文件。
+
+**progress() 内部逻辑**：
 - `!deleted` → `infra::file_list::add()` + `incr_stream_stats()`（本地模式）
 - `deleted` → `infra::file_list::remove()`
 
@@ -1206,3 +1312,22 @@ scan_pending_delete_files()  （每轮循环执行）
 
 **原结论**：仅笼统描述"上传中断，下次重新上传"。
 **修正**：详细区分了 DB 健康检查失败（主动跳过）、merge 失败（保留原文件重试）、put 失败（新 UUID 覆盖）、set 失败（孤立文件 + 5 次重试）、索引生成失败（搜索降级）、文件被锁定（pending_delete 延迟删除）等多种场景。
+
+### 修正 6：db::file_list::progress() 的返回语义实际上失效
+
+**原结论**：`set()` 会重试 5 次写入 file_list 元数据。
+**修正**：`progress()` 函数将 `infra::file_list::add()` 的错误只打日志，然后返回 `Ok(id=0)`。外层重试循环第一次失败就跳出，认为成功了。调用者会继续删除本地 parquet 文件，但 file_list 表中根本没有记录，对象存储中的文件成为孤立文件。这是一个**代码缺陷**。
+
+### 修正 7：Compactor Job 幂等保障是四层机制
+
+**原结论**："Job 超时后才允许其他节点接管" + "四重防冲突"。
+**修正**：完整的四层幂等保障路径：
+1. **L1 唯一约束**：`(org, stream, offsets)` 唯一索引，重复 add_job() 不会报错
+2. **L2 状态机原子流转**：`get_pending_jobs()` 在事务内将 Pending → Running，防止并发领取
+3. **L3 一致性哈希**：同一 stream 路由到同一节点
+4. **L4 file_list 去重**：重复合并的旧文件被标记 `deleted=true`，搜索时自动过滤
+
+### 修正 8：心跳续约的边界参数
+
+**原结论**：心跳间隔 = `max(60, job_run_timeout / 4)`，安全系数 1/4。
+**修正**：补充了 `check_running_jobs()` 的 `before_date = now - job_run_timeout`，以及心跳边界图解。实际上节点崩溃后，其他节点最快需要 `job_run_timeout - job_run_timeout/4 = 3*job_run_timeout/4` 时间才能接管（如 3600s 超时 → 2700s 后接管）。
