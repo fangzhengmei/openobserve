@@ -473,3 +473,362 @@ let entry = match reader.read_entry() {
 | `src/ingester/src/lib.rs` | Ingester 初始化入口 | `init()`, `run()` (持久化调度) |
 | `src/ingester/src/memtable.rs` | 内存表实现 | `write()`, `read()`, `persist()` |
 | `src/job/compactor.rs` | Compactor 调度 | `run()` (合并、保留、删除) |
+
+---
+
+## 八、Compactor 数据合并与 Parquet 生成
+
+### 8.1 合并任务调度架构
+
+Compactor 采用**两级 Worker** 架构 (`src/service/compact/mod.rs` + `src/service/compact/worker.rs`)：
+
+```
+                        ┌──────────────────────────────┐
+                        │   run_merge() 主调度器        │
+                        │  从 DB 获取待处理 Jobs        │
+                        │  分发到 JobScheduler         │
+                        └───────────────┬──────────────┘
+                                        │
+                        ┌───────────────▼──────────────┐
+                        │   JobScheduler               │
+                        │  N 个工作线程                │
+                        │  调用 merge_by_stream()      │
+                        └───────────────┬──────────────┘
+                                        │
+                        ┌───────────────▼──────────────┐
+                        │   merge_by_stream()          │
+                        │  按分区 (prefix) 分组        │
+                        │  生成 MergeBatch             │
+                        └───────────────┬──────────────┘
+                                        │
+                        ┌───────────────▼──────────────┐
+                        │   MergeWorker                │
+                        │  N 个工作线程                │
+                        │  调用 merge_files()          │
+                        └───────────────┬──────────────┘
+                                        ▼
+                           合并完成 → 写入 file_list
+```
+
+### 8.2 合并任务生成流程
+
+**generate_job_by_stream()** (`src/service/compact/merge.rs:69-172`)
+
+```rust
+// 关键时间窗口检查：至少等待 3 * max_file_retention_time
+if offset >= time_now_hour
+    || time_now.timestamp_micros() - offset
+        <= Duration::try_seconds(cfg.limit.max_file_retention_time as i64)
+            .unwrap()
+            .num_microseconds()
+            .unwrap()
+            * 3
+{
+    return Ok(()); // 时间窗口还没到，等一等
+}
+
+// 添加合并任务到 DB
+infra_file_list::add_job(org_id, stream_type, stream_name, offset).await?;
+```
+
+**设计原因**（注释说明）：
+- `-- first period`: 最后一小时本地文件上传到存储，写入 file_list
+- `-- second period`: 最后一小时 file_list 上传到存储
+- `-- third period`: 可以开始合并，至少 3 倍 max_file_retention_time
+
+### 8.3 文件分组与合并策略
+
+**merge_by_stream()** (`src/service/compact/merge.rs:395-642`)
+
+```rust
+// Step 1: 按分区前缀分组
+for file in files {
+    let prefix = file_name[..file_name.rfind('/').unwrap()].to_string();
+    partition_files_with_size.entry(prefix).or_default().push(file);
+}
+
+// Step 2: 选择合并策略
+match job_strategy {
+    MergeStrategy::FileSize => files.sort_by_size(),
+    MergeStrategy::FileTime => files.sort_by_time(),
+    MergeStrategy::TimeRange => files = sort_by_time_range(files),
+}
+
+// Step 3: 按文件大小分组（max_file_size）
+for file in files_with_size.iter() {
+    if new_file_size + file.meta.original_size > cfg.compact.max_file_size as i64 {
+        // 生成一个合并批次
+        batch_groups.push(MergeBatch { ... });
+        new_file_size = 0;
+        new_file_list.clear();
+    }
+    new_file_size += file.meta.original_size;
+    new_file_list.push(file.clone());
+}
+
+// Step 4: 分发到 MergeWorker
+for batch in batch_groups.iter() {
+    worker_tx.send((inner_tx.clone(), batch.clone())).await?;
+}
+```
+
+### 8.4 Parquet 文件合并核心
+
+**merge_files()** (`src/service/compact/merge.rs:655-999`)
+
+```
+Step 1: 下载 parquet 文件到本地缓存
+    ↓  cache_remote_files() → 从对象存储下载
+Step 2: Schema 合并
+    ↓  读取所有文件的 Schema → 取并集
+Step 3: DataFusion 查询执行
+    ↓  merge_parquet_files()
+        ├─ SQL: SELECT * FROM tbl ORDER BY _timestamp DESC
+        ├─ UnionTableProvider 读取所有 parquet
+        └─ 执行排序与合并
+Step 4: 写入新的合并 Parquet
+    ↓  write_parquet() → AsyncArrowWriter
+Step 5: 上传到对象存储
+    ↓  storage::put() / storage::put_with_compliance()
+Step 6: 生成倒排索引（可选）
+    ↓  create_tantivy_index()
+Step 7: 更新 file_list 元数据
+    ↓  新增新文件 + 标记旧文件 deleted=true
+```
+
+**DataFusion 合并引擎** (`src/service/search/datafusion/merge/mod.rs:53-175`)
+
+```rust
+pub async fn merge_parquet_files(...) -> Result<MergeParquetResult> {
+    // 1. 构造 SQL 排序查询
+    let sql = format!("SELECT * FROM tbl ORDER BY {TIMESTAMP_COL_NAME} DESC");
+    
+    // 2. 注册 Union Table Provider（读取所有待合并文件）
+    let union_table = Arc::new(NewUnionTable::new(schema.clone(), tables));
+    ctx.register_table("tbl", union_table)?;
+    
+    // 3. 执行查询，读取 batch stream
+    let mut batch_stream = execute_stream(physical_plan, ctx.task_ctx())?;
+    
+    // 4. 写入新的 parquet 文件
+    let mut writer = new_parquet_writer(&mut buf, schema, ...);
+    while let Some(batch) = rx.recv().await {
+        writer.write(&batch).await?;
+    }
+    writer.close().await?;
+    
+    Ok(MergeParquetResult::Single(buf, metadata))
+}
+```
+
+---
+
+## 九、Ingester vs Compactor 职责划分
+
+### 9.1 边界对比
+
+| 维度 | Ingester | Compactor |
+|------|----------|-----------|
+| **数据来源** | HTTP/Ingest API 直接接收用户数据 | 对象存储中的 parquet 文件 |
+| **处理延迟** | 低延迟，近实时处理 | 高延迟，T+N 处理（3*retention_time） |
+| **输出位置** | 本地磁盘 `.parquet` | 对象存储 `s3/gcs/oss` |
+| **文件粒度** | 小文件，频繁生成 | 大文件，按 `max_file_size` 合并 |
+| **Schema 处理** | 动态推断、实时演化 | Schema 并集、规范化 |
+| **索引生成** | 可选（ingester 可配置） | 必选（基于配置的 FTS/Index 字段） |
+| **状态依赖** | 强依赖本地 WAL + Memtable | 依赖 file_list DB 元数据 |
+| **并发模型** | 单 Writer + 多持久化 Worker | JobScheduler + MergeWorker 两级 |
+
+### 9.2 数据流衔接
+
+```
+Ingester 阶段                          Compactor 阶段
+───────────                          ──────────────
+
+Ingest API → [WAL] → Memtable
+                    ↓
+            rotate() 阈值触发
+                    ↓
+          immutable.persist()
+          ├─ .par 临时文件
+          ├─ .lock 文件
+          ├─ 删除 .wal
+          ├─ .par → .parquet
+          └─ 删除 .lock
+                    ↓
+          本地磁盘 .parquet 文件
+                    ↓
+          文件上传到对象存储 ╶╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╴╮
+          写入 file_list 元数据                        │
+                    │                                    │
+                    │  等待 3*max_file_retention_time     │
+                    │                                    │
+                    ▼                                    │
+          generate_job_by_stream()                      │
+                    │                                    │
+                    ▼                                    │
+          run_merge() 拉取 Jobs                          │
+                    │                                    │
+                    ▼                                    │
+          merge_by_stream() 按分区分组                   │
+                    │                                    │
+                    ▼                                    │
+          merge_files()  ────────────────────────────────╯
+          ├─ 下载 parquet 到本地缓存
+          ├─ DataFusion 排序合并
+          ├─ 生成新的大 parquet
+          ├─ 上传到对象存储
+          ├─ 生成倒排索引
+          └─ 更新 file_list（新增+标记删除）
+```
+
+---
+
+## 十、异常场景与恢复衔接分析
+
+### 10.1 文件生命周期状态机
+
+```
+              Ingester 侧                              Compactor 侧
+           ───────────────                           ─────────────
+
+  [0] 初始状态
+    │
+    ▼  ingest 请求
+  [1] WAL 写入中 (.wal.tmp?)
+    │  成功
+    ▼
+  [2] .wal 文件 (完整)
+    │
+    ▼  rotate()
+  [3] IMMUTABLES 队列
+    │
+    ▼  persist() Step 1
+  [4] 写入 .par 临时文件
+    │  ├─ 崩溃 → 重启发现无 .lock → 删 .par
+    │  └─ 成功
+    ▼  persist() Step 2
+  [5] 写入 .lock 文件
+    │  ├─ 崩溃 → .wal + .lock + .par 共存
+    │  │         → 重启补做: 删.wal, .par→.parquet, 删.lock
+    │  └─ 成功
+    ▼  persist() Step 3
+  [6] 删除 .wal 文件
+    │  ├─ 崩溃 → .lock + .par (无 .wal)
+    │  │         → 重启补做: .par→.parquet, 删.lock
+    │  └─ 成功
+    ▼  persist() Step 4
+  [7] .par → .parquet (rename)
+    │  ├─ 崩溃 → .lock + .parquet
+    │  │         → 重启补做: 删.lock
+    │  └─ 成功
+    ▼  persist() Step 5
+  [8] 删除 .lock 文件
+    │
+    ▼  本地文件 → 对象存储
+  [9] 对象存储 .parquet
+    │  ├─ 崩溃 → 上传中断，文件不完整
+    │  │         → 下次重新上传（基于 file_list）
+    │  └─ 成功
+    ▼  写入 file_list
+  [10] file_list 元数据
+    │  ├─ 崩溃 → 元数据未写入，文件孤立
+    │  │         → GC 扫描清理
+    │  └─ 成功
+    ▼  等待 3*retention
+  [11] 生成 compactor job
+    │
+    ▼  merge_files() Step 1
+  [12] 下载 parquet 到缓存
+    │
+    ▼  merge_files() Step 2-4
+  [13] DataFusion 合并 → 新 parquet
+    │
+    ▼  merge_files() Step 5
+  [14] 上传新 parquet
+    │
+    ▼  merge_files() Step 6
+  [15] 更新 file_list（新增+删除标记）
+    │
+    ▼  delay_delete
+  [16] 延迟删除旧文件
+```
+
+### 10.2 异常场景矩阵
+
+| 崩溃位置 | 现场特征 | 恢复策略 | 数据风险 |
+|---------|---------|---------|---------|
+| **WAL 写入中** | `.wal` 文件截断、损坏 | replay 时跳过 CRC/长度错误的条目 | 低：最后几条可能丢失 |
+| **rotate 后 persist 前** | `.wal` 完整，无 `.par` | 正常回放 `.wal` | 无 |
+| **Step 1 写 .par 中** | 存在 `.par` + `.wal`，无 `.lock` | 删 `.par`，回放 `.wal` | 无 |
+| **Step 2 写 .lock 后** | `.lock` + `.wal` + `.par` | 删 `.wal`，`.par`→`.parquet`，删 `.lock` | 无 |
+| **Step 3 删 .wal 后** | `.lock` + `.par`（无 `.wal`） | `.par`→`.parquet`，删 `.lock` | 无 |
+| **Step 4 重命名中** | 部分 `.par` 已重命名 | 遍历 `.lock` 列表，补做重命名 | 无 |
+| **Step 5 删 .lock 前** | `.lock` + `.parquet` | 删 `.lock` | 无 |
+| **上传对象存储中** | 新文件部分上传 | 下次合并重新生成 | 中：可能重复上传 |
+| **更新 file_list 前** | 新文件已上传，元数据未写 | 新文件孤立，GC 清理 | 中：存储泄漏 |
+| **标记删除旧文件后** | 旧文件 deleted=true 但未物理删除 | delay_delete 后续清理 | 低：存储临时占用 |
+| **合并查询执行中** | 新文件未生成 | Job 超时释放，下次重试 | 无 |
+
+### 10.3 Compactor Job 容错机制
+
+**Job 状态更新心跳** (`src/service/compact/mod.rs:360-383`)
+
+```rust
+// 创建后台线程，每隔 ttl 秒更新一次 job 状态
+// ttl = max(60, job_run_timeout / 4)
+let ttl = std::cmp::max(60, cfg.compact.job_run_timeout / 4) as u64;
+
+tokio::task::spawn(async move {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(ttl)) => {}
+            _ = rx.recv() => { return; }
+        }
+        // 更新 job 的 updated_at，防止其他节点接管
+        infra_file_list::update_running_jobs(&job_ids).await;
+    }
+});
+```
+
+**Job 超时接管逻辑**：
+1. Job 被节点 A 领取后，持续更新 `updated_at`
+2. 如果节点 A 崩溃，心跳停止
+3. 其他节点通过 `check_running_jobs` 检查超时
+4. 超时后重置 `node` 字段，其他节点可重新领取
+
+**关键配置**：
+- `compact.job_run_timeout`: Job 执行超时时间（秒）
+- `compact.delete_files_delay_hours`: 延迟删除等待时间
+
+### 10.4 幂等性与重复数据
+
+| 场景 | 是否可能重复 | 处理方式 |
+|-----|------------|---------|
+| WAL replay 重复读取 | 否 | 处理完直接删除 `.wal` |
+| Compactor Job 重复执行 | 是 | file_list 版本检查，幂等更新 |
+| 合并文件重复上传 | 是 | 文件名含 UUID，旧文件通过 GC 清理 |
+| file_list 重复写入 | 是 | 事务性 batch_process，基于 ID 去重 |
+
+### 10.5 极端场景：双写冲突
+
+**场景**：节点 A 正在合并，节点 B 因为网络分区也开始合并同一批文件
+
+**防护机制**：
+1. **分布式锁** (`dist_lock`)：生成 job 前获取锁
+2. **一致性哈希**：同一 stream 固定路由到同一 compactor 节点
+3. **Job 心跳**：超时后才允许其他节点接管
+4. **file_list 事务**：`batch_process` 原子更新，避免部分成功
+
+---
+
+## 十一、关键文件索引（补充）
+
+| 文件 | 职责 | 关键函数 |
+|------|------|----------|
+| `src/service/compact/mod.rs` | Compactor 主入口 | `run_merge()`, `run_generate_job()` |
+| `src/service/compact/merge.rs` | 合并逻辑 | `generate_job_by_stream()`, `merge_by_stream()`, `merge_files()` |
+| `src/service/compact/worker.rs` | Worker 调度 | `JobScheduler`, `MergeWorker` |
+| `src/service/compact/dump.rs` | File list dump | `dump()`, `generate_dump()` |
+| `src/service/search/datafusion/merge/mod.rs` | DataFusion 合并引擎 | `merge_parquet_files()`, `write_parquet()` |
+| `src/service/file_list/mod.rs` | File list 元数据 | `query_for_merge()`, `batch_process()` |
+| `src/job/compactor.rs` | Job 总调度 | `run()` 循环调用 run_merge/run_retention |
