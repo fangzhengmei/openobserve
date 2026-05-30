@@ -269,13 +269,31 @@ if config::cluster::LOCAL_NODE.is_router() {
 
 | 响应细节 | 代码内可验证 | 依赖外部库需确认 | 说明 |
 |---------|-------------|-----------------|------|
-| **状态码 429** | | ✅ | 理论上是标准的 429 Too Many Requests，但项目代码中无直接证据 |
-| **Retry-After 响应头** | | ✅ | 项目代码中无直接证据，由 `o2_ratelimit` 内部实现 |
-| **错误详情 JSON** | | ✅ | 项目代码中无直接证据，由 `o2_ratelimit` 内部实现 |
-| **不调用 next.run()** | ✅ | | 由 axum 中间件机制保证，不调用 next 即短路 |
-| **项目代码无 429 处理** | ✅ | | 全项目搜索无 `StatusCode::TOO_MANY_REQUESTS` 或 `429` 引用 |
+| **状态码 429** | ✅ (业务代码) | ⚠️ (限流库) | 业务代码有多处主动返回429；限流库返回429需确认 |
+| **Retry-After 响应头** | | ⚠️ | 业务代码不设置此头，仅限流库可能设置 |
+| **错误详情 JSON** | ✅ (业务代码) | ⚠️ (限流库) | 业务代码通过 `MetaHttpResponse::error()` 返回JSON；限流库格式需确认 |
+| **不调用 next.run() 短路机制** | ✅ | | 由 axum 中间件机制保证，不调用 next 即短路 |
+| **项目代码无429处理** | ❌（已纠正） | | 项目代码有**30+处**主动返回429的代码点 |
 
-> **重要说明**：项目代码中**没有任何地方**直接处理 429 状态码。所有 429 响应的构建完全由 `o2_ratelimit` 库内部完成。因此，关于 429 响应的具体内容（状态码、响应头、响应体格式）属于外部库行为，需要查阅 `o2_ratelimit` 文档或源码确认。
+> **重要修正**：原结论"全项目无429引用"是错误的。项目代码中有大量主动返回429的代码点，与限流库返回的429是两套独立的机制。详见 [4.7 429状态码返回点汇总](#47-429状态码返回点汇总)。
+
+> **业务代码429响应格式**（✅ 代码可验证）：
+> ```rust
+> // [common/meta/http.rs:217-226]
+> pub fn too_many_requests(error: impl ToString) -> Response {
+>     (
+>         StatusCode::TOO_MANY_REQUESTS,
+>         Json(Self::error(
+>             StatusCode::TOO_MANY_REQUESTS,
+>             error.to_string(),
+>         )),
+>     ).into_response()
+> }
+> ```
+> 业务代码返回的429响应体格式：
+> ```json
+> {"code": 429, "error": "具体错误信息"}
+> ```
 
 ---
 
@@ -428,6 +446,157 @@ if o2cfg.rate_limit.rate_limit_enabled
 
 ---
 
+### 4.7 429状态码返回点汇总
+
+项目中有**两套独立的429返回机制**：
+
+| 机制类型 | 返回位置 | 触发条件 | 验证状态 |
+|---------|---------|---------|---------|
+| **A. 限流库返回** | `o2_ratelimit` 中间件内部 | 四层限流规则超过阈值 | ⚠️ 依赖外部库确认 |
+| **B. 业务代码主动返回** | 多个 handler 中 | 试用期过期、许可证限制、资源不足 | ✅ 代码可验证 |
+
+---
+
+#### A. 限流库返回的429（⚠️ 依赖外部库）
+
+**触发位置**：`o2_ratelimit::middleware::RateLimitLayer` 内部
+
+**触发条件**：
+- 四层限流规则（用户级/角色级/组织级/全局默认）中任意一层计数超过阈值
+- 由 `o2_ratelimit` 库内部计数和判断
+
+**代码证据**：
+```rust
+// [handler/http/router/mod.rs:1105-1109] ✅ 代码可验证（挂载方式）
+router_routes = router_routes.layer(
+    o2_ratelimit::middleware::RateLimitLayer::new_with_extractor(Some(
+        crate::router::ratelimit::resource_extractor::default_extractor,
+    )),
+);
+```
+> 注：429响应的具体内容（响应头、响应体格式）由 `o2_ratelimit` 库内部构建，项目代码不直接参与。
+
+---
+
+#### B. 业务代码主动返回的429（✅ 代码可验证）
+
+**统一响应方法**：
+```rust
+// [common/meta/http.rs:217-226] ✅ 代码可验证
+pub fn too_many_requests(error: impl ToString) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(Self::error(StatusCode::TOO_MANY_REQUESTS, error.to_string())),
+    ).into_response()
+}
+```
+
+**业务代码返回429的三类触发场景**：
+
+| 场景 | 触发条件 | 代码位置 |
+|------|---------|---------|
+| **B1. 试用期过期** | 组织免费试用期已过（cloud feature） | 多处 |
+| **B2. 搜索许可证限制** | 超过摄取限制导致搜索被禁用（enterprise feature） | 多处 |
+| **B3. 模型刷新限流** | 模型定价刷新间隔限制 | 1处 |
+
+---
+
+##### B1. 试用期过期返回429（cloud feature）
+
+**核心检查函数**：
+```rust
+// [service/ingestion/mod.rs:479-484] ✅ 代码可验证
+#[cfg(feature = "cloud")]
+{
+    if !super::organization::is_org_in_free_trial_period(org_id).await? {
+        return Err(Error::TrialPeriodExpired);
+    }
+}
+```
+
+**所有返回点**（✅ 代码可验证）：
+
+| 模块 | 文件 | 行号 | 触发方式 |
+|------|------|------|---------|
+| Metrics JSON | [service/metrics/json.rs](src/service/metrics/json.rs) | 77 | `StatusCode::TOO_MANY_REQUESTS.into()` |
+| Metrics OTLP | [service/metrics/otlp.rs](src/service/metrics/otlp.rs) | 136 | `MetaHttpResponse::too_many_requests(e)` |
+| Traces OTLP | [service/traces/mod.rs](src/service/traces/mod.rs) | 206, 690 | `MetaHttpResponse::too_many_requests(e)` |
+| Traces HTTP | [handler/http/request/traces/mod.rs](src/handler/http/request/traces/mod.rs) | 112 | `MetaHttpResponse::too_many_requests(e)` |
+| Logs Ingest | [handler/http/request/logs/ingest.rs](src/handler/http/request/logs/ingest.rs) | 92-93, 174-175, 262-263, 347-348, 414-415, 493-494, 607-608 | `StatusCode::TOO_MANY_REQUESTS` |
+| Metrics Ingest | [handler/http/request/metrics/ingest.rs](src/handler/http/request/metrics/ingest.rs) | 80, 139 | `MetaHttpResponse::too_many_requests(e)` |
+
+**总计数**：15处代码点
+
+---
+
+##### B2. 搜索许可证限制返回429（enterprise feature）
+
+**核心检查函数**：
+```rust
+// [service/search/mod.rs:1633-1648] ✅ 代码可验证
+pub fn check_search_allowed(_org_id: &str, _stream: Option<&str>) -> Result<(), Error> {
+    #[cfg(feature = "enterprise")]
+    {
+        if _org_id == META_ORG_ID && _stream == Some(USAGE_STREAM) || _stream == Some("audit") {
+            return Ok(());
+        }
+        if !o2_enterprise::enterprise::license::search_allowed() {
+            Err(Error::Message("Search is temporarily disabled due to exceeding allotted ingestion limit..."))
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(feature = "enterprise"))]
+    Ok(())
+}
+```
+
+**所有返回点**（✅ 代码可验证）：
+
+| 模块 | 文件 | 行号 | 触发方式 |
+|------|------|------|---------|
+| Traces DAG | [handler/http/request/traces/dag.rs](src/handler/http/request/traces/dag.rs) | 93 | `MetaHttpResponse::too_many_requests(...)` |
+| Traces Search | [handler/http/request/traces/mod.rs](src/handler/http/request/traces/mod.rs) | 207, 909 | `MetaHttpResponse::too_many_requests(...)` |
+| Traces Session | [handler/http/request/traces/session.rs](src/handler/http/request/traces/session.rs) | 103 | `MetaHttpResponse::too_many_requests(...)` |
+| Traces User | [handler/http/request/traces/user.rs](src/handler/http/request/traces/user.rs) | 98 | `MetaHttpResponse::too_many_requests(...)` |
+| PromQL | [handler/http/request/promql/mod.rs](src/handler/http/request/promql/mod.rs) | 179, 457, 811 | `MetaHttpResponse::too_many_requests(...)` |
+| Search | [handler/http/request/search/mod.rs](src/handler/http/request/search/mod.rs) | 322-326, 600, 722, 826, 1548 | `StatusCode::TOO_MANY_REQUESTS` |
+| Search Stream | [handler/http/request/search/search_stream.rs](src/handler/http/request/search/search_stream.rs) | 253, 783 | `StatusCode::TOO_MANY_REQUESTS` |
+
+**总计数**：14处代码点
+
+---
+
+##### B3. 模型刷新限流返回429
+
+**代码位置**：
+```rust
+// [handler/http/request/model_pricing.rs:557] ✅ 代码可验证
+return MetaHttpResponse::too_many_requests("Rate limit: wait 60s between refreshes");
+```
+
+**触发条件**：模型定价刷新频率限制（60秒内只能刷新一次）
+
+---
+
+#### 429返回点汇总统计
+
+| 类型 | 触发场景 | 代码点数 | 验证状态 |
+|------|---------|---------|---------|
+| 限流库返回 | 四层限流规则超限 | - | ⚠️ 依赖外部库确认 |
+| 业务代码 | 试用期过期 | 15处 | ✅ 代码可验证 |
+| 业务代码 | 搜索许可证限制 | 14处 | ✅ 代码可验证 |
+| 业务代码 | 模型刷新限流 | 1处 | ✅ 代码可验证 |
+| **合计（业务代码）** | | **30处** | ✅ 代码可验证 |
+
+> **关键结论**：
+> 1. ❌ 原结论"全项目无429引用"已纠正，实际有**30+处**业务代码主动返回429
+> 2. 业务代码返回的429与限流库返回的429是**两套独立机制**
+> 3. 业务代码429主要用于**许可证控制**（试用期、搜索限制），而非请求频率控制
+> 4. 限流库429用于**API请求频率控制**（四层限流规则）
+
+---
+
 ## 五、核心代码参考
 
 ### 5.1 限流规则管理
@@ -548,7 +717,9 @@ if o2cfg.rate_limit.rate_limit_enabled
 | | [router/ratelimit/resource_extractor.rs:23](src/router/ratelimit/resource_extractor.rs#L23) | | |
 | **配额计数** | | ✅ 滑动窗口算法实现 | ⚠️ 依赖外部库 |
 | **阈值检查** | | ✅ 四层规则独立检查 | ⚠️ 依赖外部库 |
-| **429 降级返回** | | ✅ 构建 HTTP 429 响应 | ⚠️ 依赖外部库 |
+| **429 降级返回（限流库）** | | ✅ 构建 HTTP 429 响应 | ⚠️ 依赖外部库 |
+| **429 降级返回（业务代码）** | ✅ 许可证控制（试用期/搜索限制） | | ✅ 代码可验证（30+处） |
+| | [common/meta/http.rs:217-226](src/common/meta/http.rs#L217-L226) | | |
 | **分布式同步** | | ✅ Nats 消息队列同步 | ⚠️ 依赖外部库 |
 | **规则 CRUD API** | ✅ HTTP 接口、参数校验 | | ✅ 代码可验证 |
 | | [handler/http/request/ratelimit/mod.rs](src/handler/http/request/ratelimit/mod.rs) | | |
@@ -619,14 +790,19 @@ RateLimitLayer 收到 Request
    ```
    类型定义来自 `o2_ratelimit`，说明结果返回给库处理。
 
-4. **项目代码无 429 处理** ✅ 代码可验证：
-   - 全项目搜索无 `StatusCode::TOO_MANY_REQUESTS` 引用
-   - 全项目搜索无 `429` 状态码引用
-   - 全项目搜索无 `Retry-After` 响应头引用
+4. **项目代码无 429 处理** ❌（已纠正）：
+   > ⚠️ 原结论错误。实际情况：
+   > - ✅ 项目代码中有**30+处**主动返回429的代码点（用于许可证控制）
+   > - ✅ 但这些429是业务代码主动返回的，**不是**限流库返回的
+   > - ✅ 限流库返回的429确实在库内部构建，项目代码不参与
+   > - ✅ 全项目搜索无 `Retry-After` 响应头引用（业务代码不设置此头）
+   >
+   > 详见 [4.7 429状态码返回点汇总](#47-429状态码返回点汇总)
 
 > **关键结论**：
 > - ✅ 可验证：429 短路返回的**机制**（不调用 next.run 导致后续流程终止）由 axum 中间件保证
-> - ⚠️ 需确认：429 响应的**具体内容**（状态码、响应头、响应体）完全在 `o2_ratelimit` 库内部构建，项目代码无直接证据
+> - ✅ 可验证：业务代码有**两套独立的429机制**：许可证控制（30+处）和 API限流（限流库）
+> - ⚠️ 需确认：限流库429响应的**具体内容**（状态码、响应头、响应体格式）由 `o2_ratelimit` 库内部构建，项目代码不直接参与
 
 ---
 
