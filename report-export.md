@@ -137,19 +137,24 @@ service::dashboards::reports::trigger()
 | 入口 | Scheduler Worker | HTTP API |
 | Trigger 状态管理 | ✅ 完整生命周期（Waiting→Processing→Waiting/Completed） | ❌ 无状态变更 |
 | 重试机制 | ✅ 基于 retries 字段，失败自动重试 | ❌ 无重试，直接返回错误 |
-| next_run_at 更新 | ✅ 成功/失败后都推进到下周期 | ❌ 完全不影响 |
+| next_run_at 更新 | ✅ 成功/达到重试上限后推进到下周期 | ❌ 完全不影响 |
+| retries 变化 | ✅ 成功→重置0；未达上限→+1；达上限→重置0 | ❌ 不涉及（trigger 由调度器管理） |
 | run_once 自动禁用 | ✅ 成功后自动设置 `report.enabled = false` | ❌ 不修改 report 任何字段 |
 | TriggerData 自上报 | ✅ 完整指标 | ❌ 不上报 |
+| short_urls 写入 | ⚠️ 本地模式有 | ⚠️ 本地模式有（相同） |
 | 代码位置 | `src/service/alerts/scheduler/handlers.rs:1341` | `src/service/dashboards/reports.rs:349` |
 
 > **重要**：手动触发和定时触发**共享同一个 `report.send_subscribers()` 核心逻辑**，仅外层包装不同。
 > 
-> **send_subscribers 是纯函数**：方法签名为 `async fn send_subscribers(&self)`，使用 `&self` 不可变引用，**不会修改 Report 自身的任何字段**。
+> **send_subscribers 的副作用边界**（详见 3.2 节）：
+> - ✅ 不修改 `&self`（Report 结构体自身）
+> - ✅ 不修改 `scheduled_jobs` 表（调度状态机）
+> - ✅ 不修改 `reports` 表（enabled 等字段）
+> - ⚠️ 本地模式会写入 `short_urls` 表（数据层副作用）
+> - ⚠️ 浏览器访问 Dashboard + SMTP 发邮件（对外交付副作用）
 > 
-> 手动触发是"旁路调用"，对调度器状态机 **零副作用**：
-> - 不修改 scheduled_jobs 表（status/retries/next_run_at 都不变）
-> - 不修改 reports 表（enabled 字段不变）
-> - 即使是 run_once 的 report，手动触发成功也不会自动禁用
+> 手动触发对调度器状态机**零副作用**（不修改 scheduled_jobs/reports 表），
+> 但不是完全无副作用（本地模式有 short_urls 写入 + 对外交付）。
 
 ### 2.5 状态流转与重试机制
 
@@ -171,59 +176,53 @@ pub enum TriggerStatus {
 Waiting ──────────────────→ Processing
   ↑                              │
   │                              │ 成功
-  │  run_once=true               ├────────→ Completed (停留在该状态)
+  │  run_once=true               ├────────→ Completed (new_trigger.retries=0)
   │                              │
   │  run_once=false              │
-  ├──────────────────────────────┘ (retries=0, next_run_at 前进)
+  ├──────────────────────────────┘ (new_trigger.retries=0, next_run_at 前进)
   │
   │ 失败 & retries+1 < max_retries
   ├──────────────────────────────┐ (retries+1, next_run_at 不变)
   │                              │
   │ 失败 & retries+1 >= max_retries
-  └──────────────────────────────┘ (retries 不变, next_run_at 前进)
+  └──────────────────────────────┘ (retries=0, next_run_at 前进)
 ```
 
-#### 失败路径不一致分析 — 两处失败分支的行为差异
+> **关键修正**：`new_trigger` 初始化时 `retries: 0`（`handlers.rs:1367`），因此成功或达到重试上限后通过 `update_trigger(new_trigger, true)` 写回 DB 时，retries 都会被**重置为 0**。
+> 之前的结论"retries 不变"是错误的。
 
-代码中存在**两处独立的失败分支**，行为不一致，需要特别注意：
+#### 失败路径不一致分析 — 三处分支的 retries 和 next_run_at 变化
 
-| 失败场景 | 达到重试上限的处理 | 未达到重试上限的处理 |
-|---------|-------------------|---------------------|
-| **获取 report 配置失败** (`handlers.rs:1375-1398`) | `next_run_at = now + 5 分钟`（硬编码） | `update_status(status=Waiting, retries+1)`，next_run_at 不变 |
-| **send_subscribers 执行失败** (`handlers.rs:1628-1656`) | `next_run_at = 按频率计算的下一周期` | `update_status(status=Waiting, retries+1)`，next_run_at 不变 |
+代码中存在**三处独立的决策分支**，retries 和 next_run_at 的实际变化如下：
 
-**代码证据 1 — 获取 report 配置失败**（`src/service/alerts/scheduler/handlers.rs:1375-1398`）：
+| 分支 | 条件 | DB 写入方法 | retries 实际值 | next_run_at |
+|------|------|------------|---------------|-------------|
+| **前置跳过** (`handlers.rs:1574`) | `trigger.retries >= max_retries` | `update_trigger(new_trigger)` | **0**（new_trigger.retries） | 按频率计算的下一周期 |
+| **获取 report 失败，达到上限** (`handlers.rs:1380`) | `trigger.retries+1 >= max_retries` | `update_trigger(new_trigger)` | **0**（new_trigger.retries） | `now + 5 分钟`（硬编码） |
+| **获取 report 失败，未达上限** (`handlers.rs:1385`) | `trigger.retries+1 < max_retries` | `update_status(..., retries+1)` | **trigger.retries+1** | 不变 |
+| **send_subscribers 失败，达到上限** (`handlers.rs:1632`) | `trigger.retries+1 >= max_retries && !run_once` | `update_trigger(new_trigger)` | **0**（new_trigger.retries） | 按频率计算的下一周期 |
+| **send_subscribers 失败，未达上限** (`handlers.rs:1640`) | else | `update_status(..., retries+1)` | **trigger.retries+1** | 不变 |
+
+**最小代码证据**（`handlers.rs:1362-1368`）：
 ```rust
-Err(e) => {
-    // if trigger max retries is reached, update the next run at
-    if trigger.retries + 1 >= max_retries {
-        // next run at is after 5mins  ← 硬编码 5 分钟！
-        let next_run_at = now + Duration::minutes(5).num_microseconds().unwrap();
-        new_trigger.next_run_at = next_run_at;
-        db::scheduler::update_trigger(new_trigger, true, &query_trace_id).await?;
-    } else {
-        // Mark the trigger as failed
-        db::scheduler::update_status(..., TriggerStatus::Waiting, trigger.retries + 1, ...).await?;
-    }
-}
+let mut new_trigger = db::scheduler::Trigger {
+    next_run_at: now,
+    is_realtime: false,
+    is_silenced: false,
+    status: db::scheduler::TriggerStatus::Waiting,
+    retries: 0,             // ← 关键：初始化为 0
+    ..trigger.clone()
+};
 ```
 
-**代码证据 2 — send_subscribers 执行失败**（`src/service/alerts/scheduler/handlers.rs:1628-1656`）：
-```rust
-Err(e) => {
-    if trigger.retries + 1 >= max_retries && !run_once {
-        // next_run_at 推进到按频率计算的下一周期 (new_trigger 在之前已预计算)
-        db::scheduler::update_trigger(new_trigger, true, &query_trace_id).await?;
-    } else {
-        if run_once {
-            report.enabled = true;  // run_once 失败时恢复 enabled=true
-        }
-        db::scheduler::update_status(..., TriggerStatus::Waiting, trigger.retries + 1, ...).await?;
-    }
-}
-```
+> **核心区分**：`update_trigger(new_trigger, true)` 会将 `new_trigger` 的全部字段（含 `retries=0`）写回 DB；而 `update_status()` 只更新 status 和 retries 两个字段，显式传入 `trigger.retries + 1`。
 
-> **设计不一致性**：获取 report 配置失败时，达到重试上限后 5 分钟后重试；send_subscribers 失败时，达到重试上限后推进到下一频率周期。前者是"快速重试"策略，后者是"跳过本次"策略。
+#### 两类失败场景的 next_run_at 不一致
+
+| 失败场景 | 达到重试上限时 next_run_at | 设计意图 |
+|---------|--------------------------|---------|
+| 获取 report 配置失败 | `now + 5 分钟`（硬编码，`handlers.rs:1382`） | 快速重试：配置可能在短时间内恢复 |
+| send_subscribers 执行失败 | 按频率计算的下一周期（`new_trigger.next_run_at` 已预计算） | 跳过本次：渲染/邮件失败等下次周期再试 |
 
 #### 重试次数配置
 
@@ -290,7 +289,51 @@ if !cfg.common.report_server_url.is_empty() {
 }
 ```
 
-### 3.2 本地模式 — 内嵌渲染
+### 3.2 send_subscribers 的副作用边界
+
+方法签名 `async fn send_subscribers(&self)` 使用 `&self`，不修改 Report 结构体自身，
+但内部调用的子函数有**不可忽略的外部副作用**。按影响范围分为两类：
+
+#### 数据层副作用（修改本服务持久化状态）
+
+| 子函数 | 副作用 | 代码位置 | 条件 |
+|--------|--------|----------|------|
+| `short_url::shorten()` | **写入 `short_urls` 表**（生成短链接记录） | `src/service/dashboards/reports.rs:944` | 仅本地模式 + PDF 模式（recipients > 0） |
+
+> 这是 `send_subscribers` 调用链中**唯一修改本服务 DB 的操作**。
+> 短链接写入发生在 `generate_report()` 返回之后、`send_email()` 之前。
+
+#### 对外交付副作用（向外部系统发送数据）
+
+| 子函数 | 副作用 | 代码位置 | 条件 |
+|--------|--------|----------|------|
+| **远程模式** `Client.put(url).json(&report_data).send()` | 向 report_server 发送 HTTP 请求（含 recipients、title、message 等） | `reports.rs:587-596` | `ZO_REPORT_SERVER_URL` 非空 |
+| **本地模式** `generate_report()` 内部 | 浏览器访问 Dashboard URL → 触发前端搜索请求 → 写入搜索日志/缓存 | `reports.rs:728` | 本地模式 |
+| **本地模式** `send_email()` → `SMTP_CLIENT.send()` | 通过 SMTP 发送邮件（含 PDF 附件） | `reports.rs:683` | recipients 非空 |
+| **远程模式** report_server 的 `send_email()` | 通过 SMTP 发送邮件（含 PDF 附件） | `report_server/src/report.rs:436` | recipients 非空 |
+
+#### 副作用边界总结
+
+```
+send_subscribers(&self)          ← 不修改 &self，不修改 scheduled_jobs，不修改 reports 表
+  │
+  ├─ 远程模式
+  │   ├─ HTTP PUT → report_server  [对外交付：网络请求]
+  │   └─ (report_server 内部: 浏览器渲染 + SMTP 发邮件) [对外交付：浏览器+邮件]
+  │
+  └─ 本地模式
+      ├─ generate_report()
+      │   ├─ Browser::launch() + 导航  [对外交付：浏览器访问 Dashboard]
+      │   └─ short_url::shorten()       [数据层：写入 short_urls 表]
+      └─ send_email()
+          └─ SMTP_CLIENT.send()         [对外交付：发送邮件]
+```
+
+> **关键结论**：`send_subscribers` 不修改 `scheduled_jobs` 和 `reports` 表。
+> 这两个表的修改全部由外层 `handle_report_triggers()` 完成。
+> 因此手动触发调用 `send_subscribers()` 不会产生任何调度状态副作用。
+
+### 3.3 本地模式 — 内嵌渲染
 
 **位置**：`src/service/dashboards/reports.rs:728` `generate_report()`
 
@@ -318,7 +361,7 @@ if !cfg.common.report_server_url.is_empty() {
 8. **返回**：`(pdf_data: Vec<u8>, email_dashb_url: String)`
    - **email_dashb_url 会经过短链接处理**（本地模式独有）
 
-### 3.3 远程模式 — 独立 report_server
+### 3.4 远程模式 — 独立 report_server
 
 **位置**：`src/report_server/src/`
 
@@ -358,7 +401,7 @@ Client::builder()
     .send().await
 ```
 
-### 3.4 Cache 与 PDF 模式 — 渲染参数差异
+### 3.5 Cache 与 PDF 模式 — 渲染参数差异
 
 两种模式由 `report.destinations` 是否为空决定，共享浏览器渲染流程，但参数和行为有显著差异：
 
@@ -372,7 +415,7 @@ Client::builder()
 | 邮件发送 | `send_email()` 中 `recipients.is_empty()` 直接返回 `Ok(())` | 构建邮件 + PDF 附件 + SMTP 发送 |
 | 用途 | 预热仪表盘数据到缓存，加速用户访问 | 定时推送报表邮件给用户 |
 
-### 3.5 浏览器配置
+### 3.6 浏览器配置
 
 **位置**：`src/report_server/src/report.rs:34` / `config` crate 的 `get_chrome_launch_options()`
 
@@ -647,16 +690,17 @@ if !cfg.common.report_server_url.is_empty() {
 
 | 之前的结论 | 修正后的准确描述 | 代码证据 |
 |----------|-----------------|----------|
-| "send_subscribers 生成 PDF 作为附件" | 根据 `no_of_recipients` 判断：0 → Cache 模式返回 `vec![]`，不生成 PDF；>0 → 生成 PDF | `src/service/dashboards/reports.rs:801` |
-| "report_server 的 send_email 使用 SMTP_CLIENT" | 正确，但需补充：使用独立的静态 SMTP_CLIENT，与主服务是两个实例 | `src/report_server/src/report.rs:115` |
-| "Cache 模式仅预加载数据" | 正确，但需补充：search_type=ui 伪装成普通用户访问，不生成 report_id 标记 | `src/service/dashboards/reports.rs:801` |
-| 未提到手动触发 | 手动触发是独立旁路调用，直接调用 `send_subscribers()`，不经过调度器状态机，**零副作用** | `src/service/dashboards/reports.rs:349-364` |
-| 未提到短链接差异 | 本地模式生成短链接，远程模式使用原始 URL | `src/service/dashboards/reports.rs:943` vs `src/report_server/src/report.rs:392` |
-| "定时触发更新状态" | pull() 原子更新 Waiting→Processing；成功后 run_once→Completed，否则→Waiting 前进；失败重试→Waiting retries+1 | `src/infra/src/scheduler/sqlite.rs:405` |
-| "ZO_REPORT_SCHEDULER_TIMEOUT"（配置名错误） | 正确配置名是 `ZO_REPORT_SCHEDULE_TIMEOUT`（SCHEDULE，不是 SCHEDULER），默认 300 秒 | `src/config/src/config.rs:1677` |
-| "默认 600 秒"（超时默认值错误） | 默认值是 300 秒（5 分钟），不是 600 秒 | `src/config/src/config.rs:1677` |
-| 未提到失败路径不一致 | 获取 report 配置失败→5 分钟后重试；send_subscribers 失败→推进到下一周期 | `handlers.rs:1380-1384` vs `handlers.rs:1632-1639` |
-| "run_once 手动触发也会自动禁用" | 手动触发**不会**自动禁用 run_once 的 report，只有定时触发成功才会 | `src/service/dashboards/reports.rs:349-364` |
+| "达到重试上限后 retries 不变" | ❌ **错误**。`new_trigger.retries` 初始化为 0（`handlers.rs:1367`），达到重试上限后调用 `update_trigger(new_trigger)` 会将 retries **重置为 0** | `handlers.rs:1367` + `infra/src/scheduler/sqlite.rs:274` |
+| "send_subscribers 是纯函数，无副作用" | ❌ **不完整**。不修改 `&self` 和调度表，但本地模式会写入 `short_urls` 表（数据层副作用），以及浏览器访问/SMTP 发邮件（对外交付副作用） | `reports.rs:944` (shorten), `reports.rs:683` (SMTP) |
+| "send_subscribers 生成 PDF 作为附件" | 根据 `no_of_recipients` 判断：0 → Cache 模式返回 `vec![]`，不生成 PDF；>0 → 生成 PDF | `reports.rs:801` |
+| "report_server 的 send_email 使用 SMTP_CLIENT" | 正确，但需补充：使用独立的静态 SMTP_CLIENT，与主服务是两个实例 | `report_server/src/report.rs:115` |
+| "Cache 模式仅预加载数据" | 正确，但需补充：search_type=ui 伪装成普通用户访问，不生成 report_id 标记 | `reports.rs:801` |
+| 未提到手动触发 | 手动触发是独立旁路调用，直接调用 `send_subscribers()`，不经过调度器状态机，**零调度副作用** | `reports.rs:349-364` |
+| 未提到短链接差异 | 本地模式生成短链接，远程模式使用原始 URL | `reports.rs:944` vs `report_server/src/report.rs:392` |
+| "定时触发更新状态" | pull() 原子更新 Waiting→Processing；成功后 run_once→Completed(retries=0)，否则→Waiting(retries=0, next_run_at 前进)；失败重试→Waiting(retries+1) | `infra/src/scheduler/sqlite.rs:405` |
+| "ZO_REPORT_SCHEDULER_TIMEOUT" | 正确配置名 `ZO_REPORT_SCHEDULE_TIMEOUT`（SCHEDULE，不是 SCHEDULER），默认 300 秒 | `config.rs:1677` |
+| 未提到失败路径不一致 | 获取 report 配置失败→next_run_at=now+5min(retries=0)；send_subscribers 失败→next_run_at=下一周期(retries=0) | `handlers.rs:1380-1384` vs `handlers.rs:1632-1639` |
+| "run_once 手动触发也会自动禁用" | 手动触发**不会**自动禁用 run_once 的 report，只有定时触发成功才会 | `reports.rs:349-364` |
 
 ### 7.10 关键配置项索引
 
