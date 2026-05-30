@@ -197,37 +197,43 @@ if config::cluster::LOCAL_NODE.is_router() {
 │  客户端请求                                                │
 │      │                                                    │
 │      ▼                                                    │
-│  限流中间件 (RateLimitLayer)                               │
+│  DefaultBodyLimit [L1140]                                 │
+│      │  限制请求体大小                                    │
+│      ▼                                                    │
+│  CORS [L1139]                                             │
+│      │  处理跨域请求                                      │
+│      ▼                                                    │
+│  限流中间件 (RateLimitLayer) [L1105]                       │
 │      │  • 调用 default_extractor 提取规则                  │
 │      │  • o2_ratelimit 内部执行配额计数检查                 │
 │      │                                                    │
-│      ├─ 超过阈值 → 返回 429 Too Many Requests ◀───┐       │
-│      │                                            │       │
-│      ▼                                            │       │
-│  认证中间件                                        │       │
-│      │                                            │       │
-│      ▼                                            │       │
-│  审计中间件                                        │       │
-│      │                                            │       │
-│      ▼                                            │       │
-│  resolve_target() 确定目标节点                     │       │
-│      │  • 判断是 Querier 还是 Ingester 路由        │       │
-│      │  • 选择对应节点池                           │       │
-│      │  • 按策略选择节点（随机/最佳节点）          │       │
-│      │                                            │       │
-│      ▼                                            │       │
-│  proxy_request() / proxy_with_body_routing()       │       │
-│      │  • 转发请求到后端节点                       │       │
-│      │  • 处理流式响应                             │       │
-│      │                                            │       │
-│      ▼                                            │       │
-│  返回响应给客户端 ◀────────────────────────────────┘       │
+│      ├─ 超过阈值 → 短路返回 429 ◀──────────────┐           │
+│      │                                         │           │
+│      ▼                                         │           │
+│  路由匹配                                      │           │
+│      │                                         │           │
+│      ├─ /api/*, /aws/*, /gcp/*, /rum/*       │           │
+│      │    → dispatch() → 转发到后端节点        │           │
+│      │      （后端节点执行认证/审计）           │           │
+│      │                                         │           │
+│      ├─ /config/*                              │           │
+│      │    → config_routes() 直接处理           │           │
+│      │                                         │           │
+│      └─ /proxy/*                               │           │
+│           → proxy_auth_middleware → proxy()   │           │
+│              → 转发到后端节点                  │           │
+│                （限流后仍有认证）              │           │
+│                                                        │  │
+│      ▼                                         │           │
+│  返回响应给客户端 ◀─────────────────────────────┘           │
 │                                                           │
 └───────────────────────────────────────────────────────────┘
 ```
 
 **关键衔接点**：
-- 限流检查在 **最外层**，被限流的请求不会消耗后端资源
+- 限流检查在 **路由分发之前**，被限流的请求不会消耗后端资源
+- Router 节点本身**不做认证/审计**（`/proxy/*` 除外），认证由后端节点完成
+- 只有 `/proxy/*` 路由在限流后还有 `proxy_auth_middleware`
 - 限流通过后，才会执行 `resolve_target()` 进行路由决策
 - 对于需要解析请求体的路由（如搜索），限流在 body 解析前完成
 
@@ -237,24 +243,160 @@ if config::cluster::LOCAL_NODE.is_router() {
 
 ### 4.1 触发条件
 
-当任意一层限流规则的计数超过阈值时，触发降级响应。`o2_ratelimit` 中间件内部会：
-1. 对四层规则分别进行计数累加
-2. 检查是否有任意一层超过阈值
-3. 只要有一层超过阈值，立即触发降级
+当任意一层限流规则的计数超过阈值时，触发降级响应。
+
+| 行为 | 代码内可验证 | 依赖外部库需确认 | 代码证据 |
+|------|-------------|-----------------|---------|
+| 对四层规则分别进行计数累加 | | ✓ | 由 `o2_ratelimit` 内部实现 |
+| 检查是否有任意一层超过阈值 | | ✓ | 由 `o2_ratelimit` 内部实现 |
+| 只要有一层超过阈值，立即触发降级 | | ✓ | 由 `o2_ratelimit` 内部实现 |
+| 限流通过后才会执行后续路由 | ✅ | | [handler/http/router/mod.rs:1105](src/handler/http/router/mod.rs#L1105)：限流 layer 包裹 router_routes |
+
+> **代码证明 - 短路机制**：
+> axum 中间件通过 `next.run(request)` 调用后续流程。如果限流中间件不调用 `next.run()`，后续的路由匹配和分发逻辑**完全不会执行**。这一点由 axum 中间件机制保证，是可验证的。
+>
+> 项目代码将 `default_extractor` 传入 `RateLimitLayer`，但**不参与**计数和阈值检查逻辑：
+> ```rust
+> // [handler/http/router/mod.rs:1105-1109]
+> RateLimitLayer::new_with_extractor(Some(
+>     crate::router::ratelimit::resource_extractor::default_extractor,
+> ))
+> ```
+
+---
 
 ### 4.2 降级响应内容
 
-由 `o2_ratelimit` 库内部处理，返回标准的 HTTP 429 响应：
-- **状态码**：`429 Too Many Requests`
-- **响应头**：包含 `Retry-After`（建议重试等待时间）
-- **响应体**：包含错误详情的 JSON
+| 响应细节 | 代码内可验证 | 依赖外部库需确认 | 说明 |
+|---------|-------------|-----------------|------|
+| **状态码 429** | | ✅ | 理论上是标准的 429 Too Many Requests，但项目代码中无直接证据 |
+| **Retry-After 响应头** | | ✅ | 项目代码中无直接证据，由 `o2_ratelimit` 内部实现 |
+| **错误详情 JSON** | | ✅ | 项目代码中无直接证据，由 `o2_ratelimit` 内部实现 |
+| **不调用 next.run()** | ✅ | | 由 axum 中间件机制保证，不调用 next 即短路 |
+| **项目代码无 429 处理** | ✅ | | 全项目搜索无 `StatusCode::TOO_MANY_REQUESTS` 或 `429` 引用 |
 
-### 4.3 分层限流的降级策略
+> **重要说明**：项目代码中**没有任何地方**直接处理 429 状态码。所有 429 响应的构建完全由 `o2_ratelimit` 库内部完成。因此，关于 429 响应的具体内容（状态码、响应头、响应体格式）属于外部库行为，需要查阅 `o2_ratelimit` 文档或源码确认。
 
-**多层规则同时存在时的检查逻辑**：
-- **并行检查**：四层规则的计数独立累加，并行检查
-- **快速失败**：任意一层超过阈值立即返回
-- **最严优先**：实际上用户级规则阈值通常最小，会最先触发
+---
+
+### 4.3 限流拒绝路径（429）完整流程
+
+```
+客户端请求
+    │
+    ▼
+1. DefaultBodyLimit [L1140] ✅ 代码可验证
+    │  限制请求体大小
+    │  代码：app.layer(DefaultBodyLimit::max(...))
+    │
+    ▼
+2. CORS [L1139] ✅ 代码可验证
+    │  处理跨域请求，添加 CORS 响应头
+    │  代码：app.layer(cors_layer())
+    │
+    ▼
+3. RateLimitLayer [L1105]
+    │
+    ├─ 3.1 调用 default_extractor() ✅ 代码可验证
+    │    ├─ [router/ratelimit/resource_extractor.rs:134-139]
+    │    ├─ 提取 headers/path/method
+    │    ├─ 提取 org_id、用户邮箱、角色
+    │    ├─ 匹配 OpenAPI 分组
+    │    ├─ 查找四层限流规则
+    │    └─ 返回 ExtractorRuleResult 四元组
+    │
+    ├─ 3.2 o2_ratelimit 内部处理 ⚠️ 依赖外部库
+    │    ├─ 对四层规则分别执行配额计数
+    │    ├─ 检查每层计数是否超过阈值
+    │    └─ 任意一层超过阈值 → 触发短路
+    │
+    └─ 3.3 短路返回 ✅ 代码可验证（机制上）
+         │  不调用 next.run(request)
+         │  后续所有流程完全终止
+         │
+         ├─ 构建 HTTP 响应 ⚠️ 依赖外部库
+         │    ├─ 状态码：429（推测）
+         │    ├─ 响应头：Retry-After（推测）
+         │    └─ 响应体：错误 JSON（推测）
+         │
+         └─ 直接返回 Response
+```
+
+---
+
+### 4.4 限流通过路径完整流程
+
+```
+客户端请求
+    │
+    ▼
+1. DefaultBodyLimit [L1140] ✅ 代码可验证
+    │
+    ▼
+2. CORS [L1139] ✅ 代码可验证
+    │
+    ▼
+3. RateLimitLayer [L1105]
+    │
+    ├─ 3.1 调用 default_extractor() ✅ 代码可验证
+    │    └─ （同上，提取规则）
+    │
+    ├─ 3.2 o2_ratelimit 内部处理 ⚠️ 依赖外部库
+    │    ├─ 对四层规则分别执行配额计数
+    │    ├─ 检查每层计数是否超过阈值
+    │    └─ 全部未超过阈值 → 继续执行
+    │
+    └─ 3.3 调用 next.run(request) ✅ 代码可验证（机制上）
+         │  进入后续路由匹配
+         │
+         ▼
+4. 路由匹配 ✅ 代码可验证
+    │
+    ├─ 4.1 /api/*, /aws/*, /gcp/*, /rum/*
+    │    │  [router/http/mod.rs:649-654]
+    │    │  路由直接指向 dispatch()
+    │    │  无认证/审计中间件
+    │    ▼
+    │    dispatch() [router/http/mod.rs:84-114]
+    │    ├─ resolve_target() 选择目标节点
+    │    └─ proxy_request() / proxy_with_body_routing()
+    │       └─ 转发到后端节点
+    │          （后端节点执行认证/审计）
+    │
+    ├─ 4.2 /config/*
+    │    │  [handler/http/router/mod.rs:560-570]
+    │    │  由 config_routes() 直接处理
+    │    │  无认证/审计中间件
+    │    ▼
+    │    直接响应（如 /config/logout, /config/runtime 等）
+    │
+    └─ 4.3 /proxy/*
+         │  [handler/http/router/mod.rs:455-463]
+         │  有 proxy_auth_middleware（限流后认证）
+         ▼
+         proxy_auth_middleware [L459] ✅ 代码可验证
+         │  验证 proxy URL 权限
+         ▼
+         proxy() [L456]
+         └─ 转发到目标 URL
+```
+
+> **关键区别**：
+> - `/api/*` 等路由：Router 节点不做认证，直接转发
+> - `/proxy/*` 路由：Router 节点在限流后还有 `proxy_auth_middleware` 做认证
+> - `/config/*` 路由：Router 节点直接处理，不转发
+
+---
+
+### 4.5 分层限流的降级策略
+
+| 策略 | 代码内可验证 | 依赖外部库需确认 | 说明 |
+|------|-------------|-----------------|------|
+| 四层规则独立匹配 | ✅ | | [router/ratelimit/resource_extractor.rs:141-201] |
+| 规则优先级（用户 > 角色 > 组织 > 全局） | ✅ | | [router/ratelimit/resource_extractor.rs:203-262] |
+| 四层规则的计数独立累加 | | ✅ | 由 `o2_ratelimit` 内部实现 |
+| 快速失败（任意一层超过阈值立即返回） | | ✅ | 由 `o2_ratelimit` 内部实现 |
+| 多角色时选 threshold 最大的 | ✅ | | [router/ratelimit/resource_extractor.rs:238] `max_by_key(|rule| rule.threshold)` |
 
 **示例场景**：
 ```
@@ -264,13 +406,15 @@ if config::cluster::LOCAL_NODE.is_router() {
 全局默认：threshold=100000, interval=1s
 
 当用户1秒内发起11次请求：
-  ✓ 用户级计数=11 → 超过阈值10 → 触发429
-  （角色级、组织级、全局默认的检查不再执行）
+  ⚠️ 用户级计数=11 → 超过阈值10 → 触发429（依赖外部库确认计数逻辑）
+  （角色级、组织级、全局默认的检查是否继续执行，依赖外部库实现）
 ```
 
-### 4.4 初始化与配置验证
+---
 
-**初始化入口**：`main.rs` ([main.rs:1584](src/main.rs#L1584-L1587))
+### 4.6 初始化与配置验证
+
+**初始化入口**：`main.rs` ([main.rs:1584](src/main.rs#L1584-L1587)) ✅ 代码可验证
 ```rust
 if o2cfg.rate_limit.rate_limit_enabled 
    && o2_openfga::config::get_config().enabled {
@@ -278,7 +422,7 @@ if o2cfg.rate_limit.rate_limit_enabled
 }
 ```
 
-**配置验证**：`check_ratelimit_config()` ([main.rs:1593](src/main.rs#L1593-L1610))
+**配置验证**：`check_ratelimit_config()` ([main.rs:1593](src/main.rs#L1593-L1610)) ✅ 代码可验证
 1. 启用限流式必须使用 Nats 作为队列存储
 2. 规则刷新间隔必须 ≥ 2秒
 
@@ -376,40 +520,40 @@ if o2cfg.rate_limit.rate_limit_enabled
 
 ### A.2 配额计数责任归属
 
-**责任划分表**：
+**责任划分表**（✅ 代码内可验证 / ⚠️ 依赖外部库）：
 
-| 责任模块 | 项目代码（openobserve） | o2_ratelimit 企业库 |
-|---------|------------------------|---------------------|
-| **规则数据结构** | ✓ `RatelimitRule` 定义 | |
-| | [config/src/meta/ratelimit.rs:32-54](src/config/src/meta/ratelimit.rs#L32-L54) | |
-| **资源标识生成** | ✓ `get_resource_from_params()` | |
-| | [config/src/meta/ratelimit.rs:163-172](src/config/src/meta/ratelimit.rs#L163-L172) | |
-| **请求信息提取** | ✓ 从 Request 提取 headers/path/method | |
-| | [router/ratelimit/resource_extractor.rs:134-139](src/router/ratelimit/resource_extractor.rs#L134-L139) | |
-| **org_id 提取** | ✓ `extract_org_id()` 解析路径 | |
-| | [router/ratelimit/resource_extractor.rs:40-59](src/router/ratelimit/resource_extractor.rs#L40-L59) | |
-| **OpenAPI 分组** | ✓ 调用 `find_group_by_openapi()` | ✓ 提供 `find_group_by_openapi` 函数 |
-| | [router/ratelimit/resource_extractor.rs:88](src/router/ratelimit/resource_extractor.rs#L88) | [导入自 o2_ratelimit](src/router/ratelimit/resource_extractor.rs#L26) |
-| **认证信息解析** | ✓ `extract_auth_str_from_headers()` | |
-| | [router/ratelimit/resource_extractor.rs:76](src/router/ratelimit/resource_extractor.rs#L76) | |
-| | ✓ `get_user_email_from_auth_str()` | |
-| | [router/ratelimit/resource_extractor.rs:77-79](src/router/ratelimit/resource_extractor.rs#L77-L79) | |
-| | ✓ `get_user_roles()` 查询用户角色 | |
-| | [router/ratelimit/resource_extractor.rs:83](src/router/ratelimit/resource_extractor.rs#L83) | |
-| **规则匹配逻辑** | ✓ `find_matching_rule()` Exact/Regex 匹配 | |
-| | [router/ratelimit/resource_extractor.rs:264-306](src/router/ratelimit/resource_extractor.rs#L264-L306) | |
-| **四层规则选择** | ✓ `select_final_rule_resource()` 优先级逻辑 | |
-| | [router/ratelimit/resource_extractor.rs:203-262](src/router/ratelimit/resource_extractor.rs#L203-L262) | |
-| **规则缓存** | ✓ 使用 `RATELIMIT_RULES_CACHE` | ✓ 管理缓存刷新 |
-| | [router/ratelimit/resource_extractor.rs:23](src/router/ratelimit/resource_extractor.rs#L23) | |
-| **配额计数** | | ✓ 滑动窗口算法实现 |
-| **阈值检查** | | ✓ 四层规则独立检查 |
-| **429 降级返回** | | ✓ 构建 HTTP 429 响应 |
-| **分布式同步** | | ✓ Nats 消息队列同步 |
-| **规则 CRUD API** | ✓ HTTP 接口、参数校验 | |
-| | [handler/http/request/ratelimit/mod.rs](src/handler/http/request/ratelimit/mod.rs) | |
-| **超集群同步** | ✓ 处理 `RatelimitAdd/Update/Delete` 消息 | |
-| | [super_cluster_queue/ratelimit.rs:22-82](src/super_cluster_queue/ratelimit.rs#L22-L82) | |
+| 责任模块 | 项目代码（openobserve） | o2_ratelimit 企业库 | 验证状态 |
+|---------|------------------------|---------------------|---------|
+| **规则数据结构** | ✅ `RatelimitRule` 定义 | | ✅ 代码可验证 |
+| | [config/src/meta/ratelimit.rs:32-54](src/config/src/meta/ratelimit.rs#L32-L54) | | |
+| **资源标识生成** | ✅ `get_resource_from_params()` | | ✅ 代码可验证 |
+| | [config/src/meta/ratelimit.rs:163-172](src/config/src/meta/ratelimit.rs#L163-L172) | | |
+| **请求信息提取** | ✅ 从 Request 提取 headers/path/method | | ✅ 代码可验证 |
+| | [router/ratelimit/resource_extractor.rs:134-139](src/router/ratelimit/resource_extractor.rs#L134-L139) | | |
+| **org_id 提取** | ✅ `extract_org_id()` 解析路径 | | ✅ 代码可验证 |
+| | [router/ratelimit/resource_extractor.rs:40-59](src/router/ratelimit/resource_extractor.rs#L40-L59) | | |
+| **OpenAPI 分组** | ✅ 调用 `find_group_by_openapi()` | ✅ 提供 `find_group_by_openapi` 函数 | ✅ 代码可验证 |
+| | [router/ratelimit/resource_extractor.rs:88](src/router/ratelimit/resource_extractor.rs#L88) | [导入自 o2_ratelimit](src/router/ratelimit/resource_extractor.rs#L26) | |
+| **认证信息解析** | ✅ `extract_auth_str_from_headers()` | | ✅ 代码可验证 |
+| | [router/ratelimit/resource_extractor.rs:76](src/router/ratelimit/resource_extractor.rs#L76) | | |
+| | ✅ `get_user_email_from_auth_str()` | | ✅ 代码可验证 |
+| | [router/ratelimit/resource_extractor.rs:77-79](src/router/ratelimit/resource_extractor.rs#L77-L79) | | |
+| | ✅ `get_user_roles()` 查询用户角色 | | ✅ 代码可验证 |
+| | [router/ratelimit/resource_extractor.rs:83](src/router/ratelimit/resource_extractor.rs#L83) | | |
+| **规则匹配逻辑** | ✅ `find_matching_rule()` Exact/Regex 匹配 | | ✅ 代码可验证 |
+| | [router/ratelimit/resource_extractor.rs:264-306](src/router/ratelimit/resource_extractor.rs#L264-L306) | | |
+| **四层规则选择** | ✅ `select_final_rule_resource()` 优先级逻辑 | | ✅ 代码可验证 |
+| | [router/ratelimit/resource_extractor.rs:203-262](src/router/ratelimit/resource_extractor.rs#L203-L262) | | |
+| **规则缓存** | ✅ 使用 `RATELIMIT_RULES_CACHE` | ✅ 管理缓存刷新 | ✅ 项目代码侧可验证读取 |
+| | [router/ratelimit/resource_extractor.rs:23](src/router/ratelimit/resource_extractor.rs#L23) | | |
+| **配额计数** | | ✅ 滑动窗口算法实现 | ⚠️ 依赖外部库 |
+| **阈值检查** | | ✅ 四层规则独立检查 | ⚠️ 依赖外部库 |
+| **429 降级返回** | | ✅ 构建 HTTP 429 响应 | ⚠️ 依赖外部库 |
+| **分布式同步** | | ✅ Nats 消息队列同步 | ⚠️ 依赖外部库 |
+| **规则 CRUD API** | ✅ HTTP 接口、参数校验 | | ✅ 代码可验证 |
+| | [handler/http/request/ratelimit/mod.rs](src/handler/http/request/ratelimit/mod.rs) | | |
+| **超集群同步** | ✅ 处理 `RatelimitAdd/Update/Delete` 消息 | | ✅ 代码可验证 |
+| | [super_cluster_queue/ratelimit.rs:22-82](src/super_cluster_queue/ratelimit.rs#L22-L82) | | |
 
 ---
 
@@ -417,39 +561,41 @@ if o2cfg.rate_limit.rate_limit_enabled
 
 **触发位置**：`o2_ratelimit::middleware::RateLimitLayer` 内部
 
-**执行流程**：
+**执行流程**（✅ 代码可验证 / ⚠️ 依赖外部库）：
 ```
 RateLimitLayer 收到 Request
     │
-    ├─ 1. 调用 extractor 函数（项目代码提供）
-    │     │
+    ├─ 1. 调用 extractor 函数（项目代码提供） ✅ 代码可验证
+    │     │  [router/ratelimit/resource_extractor.rs:134-139]
     │     └─ default_extractor(req)
     │         └─ rule_extractor(headers, path, method)
-    │             └─ 返回 ExtractorRuleResult 四元组
+    │             └─ 返回 ExtractorRuleResult 四元组 ✅ 代码可验证
+    │                [router/ratelimit/resource_extractor.rs:29] 类型来自 o2_ratelimit
     │
-    ├─ 2. o2_ratelimit 内部处理（黑盒）
+    ├─ 2. o2_ratelimit 内部处理 ⚠️ 依赖外部库
     │     │
-    │     ├─ 对四层规则分别执行配额计数
+    │     ├─ 对四层规则分别执行配额计数 ⚠️
     │     │   (DefaultOrgGlobal, OrgLevel, UserRole, UserId)
     │     │
-    │     ├─ 检查每层计数是否超过阈值
+    │     ├─ 检查每层计数是否超过阈值 ⚠️
     │     │
-    │     └─ 任意一层超过阈值 → 触发短路
+    │     └─ 任意一层超过阈值 → 触发短路 ⚠️
     │
-    ├─ 3A. 未超过阈值 → 调用 next.run(request)
-    │     │
-    │     └─ 继续执行后续中间件和路由分发
+    ├─ 3A. 未超过阈值 → 调用 next.run(request) ✅ 代码可验证（机制上）
+    │     │  axum 中间件机制保证
+    │     └─ 继续执行后续中间件和路由分发 ✅
     │
-    └─ 3B. 超过阈值 → 短路返回
+    └─ 3B. 超过阈值 → 短路返回 ✅ 代码可验证（机制上）
+          │  不调用 next.run(request) → 后续流程完全终止 ✅
           │
-          ├─ 构建 429 Too Many Requests 响应
-          ├─ 设置 Retry-After 响应头
-          ├─ 构建错误详情 JSON 响应体
-          └─ 直接返回 Response（不调用 next.run）
+          ├─ 构建 429 Too Many Requests 响应 ⚠️ 依赖外部库
+          ├─ 设置 Retry-After 响应头 ⚠️ 依赖外部库
+          ├─ 构建错误详情 JSON 响应体 ⚠️ 依赖外部库
+          └─ 直接返回 Response ✅ 代码可验证（机制上）
 ```
 
 **代码证明**：
-1. **extractor 函数签名**：
+1. **extractor 函数签名** ✅ 代码可验证：
    ```rust
    // [router/ratelimit/resource_extractor.rs:134-139]
    pub fn default_extractor(req: &axum::extract::Request) 
@@ -457,7 +603,7 @@ RateLimitLayer 收到 Request
    ```
    返回 `ExtractorRuleResult` 四元组给 `o2_ratelimit`。
 
-2. **RateLimitLayer 构造**：
+2. **RateLimitLayer 构造** ✅ 代码可验证：
    ```rust
    // [handler/http/router/mod.rs:1105-1109]
    RateLimitLayer::new_with_extractor(Some(
@@ -466,33 +612,43 @@ RateLimitLayer 收到 Request
    ```
    项目代码只提供 extractor，计数和检查由库内部完成。
 
-3. **ExtractorRuleResult 类型**：
+3. **ExtractorRuleResult 类型** ✅ 代码可验证：
    ```rust
    // [router/ratelimit/resource_extractor.rs:29]
    use o2_ratelimit::middleware::{ExtractorRule, ExtractorRuleResult};
    ```
    类型定义来自 `o2_ratelimit`，说明结果返回给库处理。
 
-> **关键结论**：429 短路返回完全在 `o2_ratelimit` 库内部触发，项目代码不直接处理 429 响应构建。
+4. **项目代码无 429 处理** ✅ 代码可验证：
+   - 全项目搜索无 `StatusCode::TOO_MANY_REQUESTS` 引用
+   - 全项目搜索无 `429` 状态码引用
+   - 全项目搜索无 `Retry-After` 响应头引用
+
+> **关键结论**：
+> - ✅ 可验证：429 短路返回的**机制**（不调用 next.run 导致后续流程终止）由 axum 中间件保证
+> - ⚠️ 需确认：429 响应的**具体内容**（状态码、响应头、响应体）完全在 `o2_ratelimit` 库内部构建，项目代码无直接证据
 
 ---
 
 ### A.4 限流与路由分发的顺序关系
 
-**Router 节点 vs 非 Router 节点对比**：
+**Router 节点 vs 非 Router 节点对比**（✅ 代码可验证）：
 
 | 阶段 | Router 节点（代理模式） | 非 Router 节点（直连模式） |
 |------|------------------------|--------------------------|
-| 1 | DefaultBodyLimit | DefaultBodyLimit |
-| 2 | CORS | CORS |
-| 3 | **限流检查** (RateLimitLayer) | 预编码处理 |
-| 4 | 路由匹配 → dispatch() | 请求解压 |
-| 5 | 转发到后端节点 | **认证中间件** |
-| 6 | （后端节点执行认证） | **审计中间件** |
-| 7 | （后端节点执行业务） | 组织拦截 |
+| 1 | DefaultBodyLimit ✅ [L1140] | DefaultBodyLimit ✅ [L1140] |
+| 2 | CORS ✅ [L1139] | CORS ✅ [L1139] |
+| 3 | **限流检查** (RateLimitLayer) ✅ [L1105] | 预编码处理 ✅ [L1027-1029] |
+| 4 | 路由匹配 → dispatch() ✅ [L649-654] | 请求解压 ✅ [L1026] |
+| 5 | 转发到后端节点 ✅ [L84-114] | **认证中间件** ✅ [L1025] |
+| 6 | （后端节点执行认证） | **审计中间件** ✅ [L1024] |
+| 7 | （后端节点执行业务） | 组织拦截 ✅ [L1023] |
 | 8 | 返回响应 | 业务处理 |
 
-**代码证明 - Router 节点无认证中间件**：
+> **注意**：认证/审计中间件是**非 Router 节点**的 `service_routes()` 的中间件链，不要混淆到 Router 节点。
+> 代码：[handler/http/router/mod.rs:1022-1041](src/handler/http/router/mod.rs#L1022-L1041)
+
+**代码证明 - Router 节点无认证中间件** ✅ 代码可验证：
 ```rust
 // [router/http/mod.rs:645-655]
 pub fn create_router_routes() -> axum::Router {
@@ -504,10 +660,11 @@ pub fn create_router_routes() -> axum::Router {
         .route("/gcp/{*path}", any(dispatch))
         .route("/rum/{*path}", any(dispatch))
     // 注意：这里没有 .layer(auth_middleware)！
+    // 认证/审计中间件在 service_routes() 中，非 Router 节点使用
 }
 ```
 
-**代码证明 - dispatch() 直接转发**：
+**代码证明 - dispatch() 直接转发** ✅ 代码可验证：
 ```rust
 // [router/http/mod.rs:84-114]
 pub async fn dispatch(req: Request) -> Response {
@@ -525,13 +682,29 @@ pub async fn dispatch(req: Request) -> Response {
 }
 ```
 
-> **关键结论**：Router 节点的限流在路由分发**之前**，且 Router 节点本身不做认证，认证由后端节点完成。这意味着被限流的请求甚至不会触发后端节点的认证检查。
+**代码证明 - 非 Router 节点有完整中间件链** ✅ 代码可验证：
+```rust
+// [handler/http/router/mod.rs:1022-1041] service_routes() 的中间件
+router
+    .layer(middleware::from_fn(blocked_orgs_middleware))      // 组织拦截
+    .layer(middleware::from_fn(audit_middleware))             // 审计
+    .layer(middleware::from_fn(auth_middleware))              // 认证
+    .layer(RequestDecompressionLayer::new())                   // 解压
+    .layer(middleware::from_fn(preprocess_encoding_middleware)) // 预编码处理
+    // ...
+```
+
+> **关键结论**：
+> - ✅ 可验证：Router 节点的限流在路由分发**之前**，且 Router 节点本身不做认证
+> - ✅ 可验证：认证/审计中间件是**非 Router 节点**的 `service_routes()` 的中间件链
+> - ✅ 可验证：被限流的请求不会触发 `dispatch()`，也不会触发后端节点的认证检查
+> - 只有 `/proxy/*` 路由在限流后还有 `proxy_auth_middleware` 做认证 ✅ [L459]
 
 ---
 
 ### A.5 限流覆盖的路由范围
 
-**经过限流的路由**（RateLimitLayer 包裹）：
+**经过限流的路由**（RateLimitLayer 包裹）✅ 代码可验证：
 | 路由前缀 | 处理器 | 代码位置 |
 |---------|--------|---------|
 | `/config/*` | `config_routes()` | [L560-L570](src/handler/http/router/mod.rs#L560-L570) |
@@ -541,7 +714,7 @@ pub async fn dispatch(req: Request) -> Response {
 | `/rum/*` | `dispatch()` | [router/http/mod.rs:654](src/router/http/mod.rs#L654) |
 | `/proxy/*` | `proxy()` + `proxy_auth_middleware` | [L455-L463](src/handler/http/router/mod.rs#L455-L463) |
 
-**不经过限流的路由**（在 `basic_routes()` 中，未被 RateLimitLayer 包裹）：
+**不经过限流的路由**（在 `basic_routes()` 中，未被 RateLimitLayer 包裹）✅ 代码可验证：
 | 路由前缀 | 说明 |
 |---------|------|
 | `/healthz` | 健康检查 |
@@ -553,7 +726,7 @@ pub async fn dispatch(req: Request) -> Response {
 | `/docs` | API 文档重定向 |
 | `/web/*` | UI 前端资源 |
 
-**代码证明**：
+**代码证明** ✅ 代码可验证：
 ```rust
 // [handler/http/router/mod.rs:1092-1113]
 if config::cluster::LOCAL_NODE.is_router() {
@@ -570,4 +743,10 @@ if config::cluster::LOCAL_NODE.is_router() {
     Router::new().merge(basic_routes()).merge(router_routes)
 }
 ```
+
+> **验证方法**：
+> 1. ✅ 可验证：`basic_routes()` 返回的路由在 `Router::new().merge(basic_routes()).merge(router_routes)` 中先 merge，说明不在 `router_routes` 的限流 layer 包裹范围内
+> 2. ✅ 可验证：`router_routes` 在 merge 完所有业务路由后才 layer 限流中间件，说明这些业务路由都经过限流
+> 3. ✅ 可验证：`create_router_routes()` 返回的路由直接指向 `dispatch()`，无认证中间件
+> 4. ✅ 可验证：`proxy_routes(true)` 返回的路由有 `proxy_auth_middleware`，在限流之后执行
 
