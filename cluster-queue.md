@@ -382,7 +382,371 @@ loop {
 - 连续失败达到阈值后从哈希环移除
 - 从本地缓存中删除失效节点
 
-## 9. 总结
+## 9. 节点职责边界分析
+
+### 9.1 节点角色 (Role) 职责范围
+
+系统定义了 8 种节点角色，每种角色有明确的职责边界 (`src/config/src/meta/cluster.rs:201-210`)：
+
+| 角色 | 职责范围 | 队列消费职责 |
+|------|---------|------------|
+| **All** | 全能节点，承担所有角色职责 | 消费所有类型队列消息 |
+| **Ingester** | 数据写入、WAL 管理、数据压缩触发 | 消费文件列表广播、元数据变更事件 |
+| **Querier** | 查询执行、缓存管理、结果聚合 | 消费查询任务、文件列表变更 |
+| **Compactor** | 文件压缩、数据保留策略执行 | 消费压缩任务队列 |
+| **Router** | 请求路由、负载均衡 | 不消费业务队列 |
+| **AlertManager** | 告警评估、通知发送、告警调度 | 消费告警事件队列 |
+| **FlattenCompactor** | 扁平化数据压缩 | 消费扁平化压缩任务 |
+| **ActionServer** | 脚本执行、动作处理 | 消费动作执行队列 |
+
+**角色判定逻辑** (`src/config/src/meta/cluster.rs:103-138`)：
+```rust
+pub fn is_querier(&self) -> bool {
+    self.role.contains(&Role::Querier) || self.role.contains(&Role::All)
+}
+```
+
+**关键设计**：
+- **单角色节点**：只执行特定职责，资源隔离性好
+- **多角色节点**：节省资源但存在资源竞争
+- **Router 节点**：仅做路由，不消费业务队列
+
+### 9.2 角色组 (RoleGroup) 职责划分
+
+角色组用于对 Querier 节点的细粒度任务优先级划分：
+
+| 角色组 | 职责范围 | 典型任务类型 |
+|--------|---------|-----------|
+| **None** | 承担所有查询任务 | 通用查询节点 |
+| **Interactive** | 高优先级交互式查询 | UI查询、仪表盘、值查询、RUM、下载 |
+| **Background** | 低优先级后台任务 | 报表、告警、派生流、搜索作业 |
+
+**角色组映射关系** (`src/config/src/meta/cluster.rs:269-279`)：
+```rust
+impl From<SearchEventType> for RoleGroup {
+    fn from(value: SearchEventType) -> Self {
+        match value {
+            SearchEventType::Reports | SearchEventType::Alerts 
+            | SearchEventType::DerivedStream 
+            | SearchEventType::SearchJob => RoleGroup::Background,
+            _ => RoleGroup::Interactive,
+        }
+    }
+}
+```
+
+### 9.3 节点注册的职责边界
+
+**节点注册阶段各组件的职责划分**：
+
+| 组件 | 职责范围 | 关键操作 |
+|------|---------|---------|
+| **分布式锁** | 保证节点注册互斥 | `/nodes/register` 锁保护 |
+| **NATS KV** | 存储节点元数据 | `/nodes/{uuid}` 存储节点信息 |
+| **节点列表 Watcher** | 监听节点变更 | `watch_node_list` 实时更新 |
+| **一致性哈希** | 构建任务分配环 | `add_node_to_consistent_hash` |
+| **心跳协程** | 维持节点在线状态 | 定期更新 TTL |
+
+**注册时序中的职责隔离** (`src/common/infra/cluster/nats.rs:86-201`)：
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│  分布式锁模块   │───▶│   NATS KV 存储   │───▶│  一致性哈希模块  │
+│  (互斥保护)     │    │  (元数据持久化 │    │  (任务分配)    │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+                                 │
+                                 ▼
+                        ┌─────────────────┐
+                        │  心跳协程     │
+                        │  (保活机制)   │
+                        └─────────────────┘
+```
+
+### 9.4 主从决策触发机制
+
+系统采用**无中心的主从决策模式**，不同场景采用不同的选举策略：
+
+**策略 1: ID 最小节点选举** (`src/job/mod.rs:83-95`)
+- **适用场景**：一次性迁移任务、数据补丁执行
+- **选举逻辑**：
+  ```rust
+  let is_leader = infra::cluster::get_cached_online_nodes()
+      .await
+      .and_then(|mut nodes| {
+          nodes.sort_by_key(|n| n.id);
+          nodes.into_iter().next()
+      })
+      .map(|first| first.id == LOCAL_NODE.id)
+      .unwrap_or(true);
+  ```
+- **特点**：稳定可预测，节点重启后 leader 不变
+
+**策略 2: UUID 排序选举** (`src/job/mod.rs:826-832`)
+- **适用场景**：定期清理任务
+- **选举逻辑**：
+  ```rust
+  let is_leader = match infra::cluster::get_cached_online_ingester_nodes().await {
+      Some(mut nodes) if !nodes.is_empty() => {
+          nodes.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+          nodes[0].uuid == LOCAL_NODE.uuid
+      }
+      _ => true,
+  };
+  ```
+- **特点**：随机性好，负载均衡
+
+**策略 3: 特定角色节点执行** (`src/job/mod.rs:64-66`)
+- **适用场景**：告警管理、计量计费
+- **判定逻辑**：
+  ```rust
+  if LOCAL_NODE.is_alert_manager() {
+      // 只有 AlertManager 角色才执行
+  }
+  ```
+
+### 9.5 一致性哈希分配的职责范围
+
+**文件广播中的一致性哈希路由** (`src/service/db/file_list/broadcast.rs:42-120`)：
+
+```
+文件列表变更事件
+        │
+        ▼
+┌─────────────────────────────────────────┐
+│  按文件 ID 计算哈希值            │
+└─────────────────────────────────────────┘
+        │
+        ├───────────────────────────┐
+        ▼                           ▼
+┌─────────────────────┐     ┌─────────────────────┐
+│ Interactive 角色组    │     │ Background 角色组    │
+│ 哈希环查询       │     │ 哈希环查询       │
+└─────────────────────┘     └─────────────────────┘
+        │                           │
+        ▼                           ▼
+┌─────────────────────┐     ┌─────────────────────┐
+│ 目标节点 A        │     │ 目标节点 B        │
+│ (可能相同)       │     │ (可能不同)       │
+└─────────────────────┘     └─────────────────────┘
+```
+
+**企业版增强路由策略** (`src/service/db/file_list/broadcast.rs:59-93`)：
+- **策略 A（默认）**：全局哈希环，所有节点参与
+- **策略 B（企业版）**：按插槽选择，仅选择部分节点
+
+```rust
+// OSS / strategy=all: use the global ring unchanged.
+if let Some(node_name) = cluster::get_node_from_consistent_hash(
+    &item.id.to_string(),
+    &Role::Querier,
+    Some(RoleGroup::Interactive),
+)
+    && node_name.eq(&node.name)
+{
+    node_items.push(item.clone());
+}
+```
+
+## 10. 确认回执失败完整流程
+
+### 10.1 消息投递生命周期
+
+```
+┌──────────────┐
+│  消息发布  │
+└──────┬───┘
+       │ 发布确认 (Publish ACK)
+       ▼
+┌──────────────┐
+│ NATS JetStream │  ── 持久化存储
+└──────┬───┘
+       │
+       │ 消息投递
+       ▼
+┌──────────────┐
+│  消费者 A     │
+└──────┬───┘
+       │
+       ├───────────────────────────┐
+       │ 处理成功               │ 处理失败/超时
+       ▼                           ▼
+┌──────────────┐             ┌──────────────┐
+│ 发送 ACK    │             │ 不发送 ACK  │
+└──────┬───┘             └──────┬───┘
+       │                           │
+       ▼                           │
+┌──────────────┐             ┌──────────────┐
+│ 消息删除    │             │ 等待 ACK 超时 │
+└──────────────┘             └──────┬───┘
+                                   │
+                                   ▼
+                             ┌──────────────┐
+                             │ 消息重投      │
+                             └──────┬───┘
+                                    │
+                                    ├──────────────────────────┐
+                                    │ 重投次数 < 上限       │ 超过上限
+                                    ▼                           ▼
+                              ┌──────────────┐             ┌──────────────┐
+                              │ 投递到消费者 │             │ 消息丢弃/死信 │
+                              │ (可能是其他节点) │             │ 队列        │
+                              └──────────────┘             └──────────────┘
+```
+
+### 10.2 ACK 超时与消息重投机制
+
+**NATS JetStream 重投触发条件**：
+
+1. **消费者离线重投**：消费者断开连接，消息未 ACK
+2. **ACK 超时重投**：消费者在线但处理超时未 ACK
+3. **NAK 主动重投**：消费者发送 NAK 要求重投
+
+**重投后的节点变化流程** (`src/infra/src/queue/nats.rs:128-202`)：
+
+```
+消费者 A 接收消息
+      │
+      ▼
+开始业务处理
+      │
+      ├──────────┐
+      │ 成功      │ 失败/超时
+      ▼           ▼
+   发送 ACK    不发送 ACK
+      │           │
+      ▼           │
+   消息删除      │
+                  │
+                  ▼
+          NATS 等待 ack_wait 超时
+                  │
+                  ▼
+          消息变为待投递状态
+                  │
+                  ▼
+          NATS 选择消费者
+                  │
+                  ├──────────────────────────┐
+                  │ 消费者 A 在线           │ 消费者 A 离线
+                  ▼                           ▼
+            重新投递到消费者 A         投递到其他在线消费者
+            (同节点重投)            (节点切换)
+```
+
+### 10.3 节点离线后的责任转移
+
+**节点离线检测流程** (`src/infra/src/cluster/mod.rs:406-481`)：
+
+```
+节点心跳更新 TTL
+      │
+      ▼
+NATS KV TTL 过期
+      │
+      ▼
+节点状态变为 Offline
+      │
+      ▼
+健康检查连续失败
+      │
+      ▼
+从一致性哈希环移除节点
+      │
+      ▼
+触发哈希环重平衡
+      │
+      ▼
+原节点的任务重新分配
+```
+
+**文件列表广播中的节点变化** (`src/service/db/file_list/broadcast.rs:193-210`)：
+
+```rust
+loop {
+    // 等待节点恢复在线
+    loop {
+        match cluster::get_node_by_uuid(&node.uuid).await {
+            None => {
+                EVENTS.write().await.remove(&node.uuid);
+                log::error!("[broadcast] node[{}] leaved cluster, dropping events",
+                    &node.grpc_addr,
+                );
+                return Ok(());
+            }
+            Some(v) => {
+                if v.status == NodeStatus::Online {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
+}
+```
+
+### 10.4 消息重投的完整生命周期
+
+**阶段 1: 消息入列与初始投递**
+- 消息发布到 NATS JetStream
+- 持久化存储（File 存储类型）
+- 推送到第一个消费者
+
+**阶段 2: 处理与 ACK**
+- 消费者接收消息
+- 业务逻辑处理
+- 成功 → 发送 ACK → 消息删除
+- 失败 → 不发送 ACK → 等待超时
+
+**阶段 3: 重投决策**
+- NATS 检测未 ACK 消息
+- 检查消费者在线状态
+- 选择目标消费者（可能切换节点）
+
+**阶段 4: 重新投递**
+- 投递到新消费者
+- 重复阶段 2-3 直到成功或超过最大投递次数
+
+**阶段 5: 最终处理**
+- 成功处理 → ACK → 删除
+- 超过最大次数 → 丢弃或进入死信队列
+
+### 10.5 重试与退避策略
+
+**文件广播中的指数退避** (`src/service/db/file_list/broadcast.rs:261-294`)：
+
+```rust
+let mut wait_ttl = 1;
+let mut retry_ttl = 0;
+loop {
+    if retry_ttl >= 1800 {
+        log::error!("[broadcast] to node[{}] timeout, dropping event, already retried for 30 minutes",
+            &node.grpc_addr
+        );
+        break;
+    }
+    match client.send_file_list(request).await {
+        Ok(_) => break,
+        Err(e) => {
+            log::error!("[broadcast] send event to node[{}] failed: {}, retrying...",
+                &node.grpc_addr,
+                e
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(wait_ttl)).await;
+            retry_ttl += wait_ttl;
+            if wait_ttl < 60 {
+                wait_ttl *= 2  // 指数退避: 1s, 2s, 4s, 8s, 16s, 32s, 60s, 60s...
+            };
+        }
+    }
+}
+```
+
+**退避策略特点**：
+- 初始等待：1 秒
+- 指数增长：每次重试等待时间翻倍
+- 最大等待：60 秒
+- 总超时：30 分钟（1800 秒）
+
+## 11. 总结
 
 OpenObserve 集群队列系统的核心设计原则：
 
@@ -395,3 +759,13 @@ OpenObserve 集群队列系统的核心设计原则：
 - **消息入列**是数据入口，提供基础的可靠性保证
 - **节点选举**决定了消息的消费主体和任务分配
 - **确认回执**是消息状态流转的关键，驱动消息投递生命周期
+
+**节点职责边界总结：**
+
+| 组件 | 核心职责 | 边界 |
+|------|---------|------|
+| **节点角色** | 执行特定类型任务 | 按 Role/RoleGroup 严格划分 |
+| **一致性哈希** | 任务分配路由 | 仅负责映射，不负责执行 |
+| **分布式锁** | 关键操作互斥 | 仅保护原子性，不负责业务逻辑 |
+| **NATS JetStream** | 消息可靠投递 | 仅负责传输，不负责业务处理 |
+| **心跳机制** | 维持节点状态 | 仅保活，不决定任务分配 |
