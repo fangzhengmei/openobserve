@@ -556,13 +556,13 @@ SET status = 0           -- Pending
 WHERE id IN (...);
 ```
 
-注意：`set_job_pending` **只修改 status，不修改 node 和 updated_at**。`check_running_jobs` 同样只修改 status（见 §10.3 详细分析）。`get_pending_jobs` 在分配 Running 状态时会重新设置 node 和 updated_at，因此残留的旧 node 值不会造成问题。
+注意：`set_job_pending` **只修改 status，不修改 node 和 updated_at**。`check_running_jobs` 对 Running 超时任务同样只修改 status（见 §10.4 详细分析）。`get_pending_jobs` 在分配 Running 状态时会重新设置 node 和 updated_at，因此残留的旧 node 值不会造成问题。
 
 **不更新 updated_at 的调度影响**：
 - 被 `set_job_pending` 释放的 job，其 `updated_at` 仍保留 Running 时期的值
 - 由于 `check_running_jobs` 只处理 `status = Running` 的记录，Pending 状态下 updated_at 陈旧无影响
 - 当下一轮 `get_pending_jobs` 重新拾取该 job 时，会在 UPDATE 语句中**同时更新 node、started_at、updated_at** 三个字段（`postgres.rs:1353-1366`）
-- 真正的风险：如果 `set_job_pending` 本身执行失败，job 卡在 Running 状态，则陈旧的 updated_at 会让 `check_running_jobs` 更快检测到超时
+- 真正的风险：如果 `set_job_pending` 本身执行失败，job 卡在 Running 状态，由于心跳线程不工作（见 §10.5），`updated_at` 不会被刷新，会在 `job_run_timeout` 后被 `check_running_jobs` 检测到超时回滚
 
 **对后续重试的影响**：
 - 释放回 Pending 后，下一轮 `get_pending_jobs` 可再次拾取
@@ -761,6 +761,98 @@ check_running_jobs(before_date)
 1. **SQL 1**：节点崩溃后，其 Running job 应被回收供其他节点执行——只需要 status 回到 Pending
 2. **SQL 2**：dump 流程需要以 node 字段作为分布式锁——Done 状态下如果 dump 超时，应释放这个锁
 
+### 10.5 两处 update_running_jobs 心跳线程的生命周期差异
+
+代码中存在**两处独立的心跳线程**，分别在不同层级启动，行为完全不同：
+
+#### 第一处：run_merge 中的批量心跳线程（mod.rs:360-383）
+
+```rust
+// run_merge 内，分流完成后启动
+let ttl = max(60, cfg.compact.job_run_timeout / 4) as u64;
+let job_ids = merge_jobs.iter().map(|job| job.job_id).collect::<Vec<_>>();
+let (_tx, mut rx) = mpsc::channel::<()>(1);  // ★ _tx 未被 move 到闭包
+tokio::task::spawn(async move {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(ttl)) => {}
+            _ = rx.recv() => { return; }  // 接收端在闭包内
+        }
+        infra_file_list::update_running_jobs(&job_ids).await;
+    }
+});
+```
+
+**生命周期分析**：
+- `_tx` 定义在 spawn 外部，未被 move 到闭包
+- spawn 执行后 `_tx` 立即超出作用域被 drop → channel 发送端关闭
+- `rx.recv()` 检测到发送端关闭 → 返回 `None`
+- `tokio::select!` 中 `rx.recv()` 始终就绪 → **立即选择此分支 return**
+- ✅ **结论**：这个心跳线程**一次 update 都不会执行**，直接退出
+
+**对超时窗口的影响**：无任何影响——形同虚设。
+
+---
+
+#### 第二处：JobScheduler 中的单 job 心跳线程（worker.rs:94-113）
+
+```rust
+// JobScheduler::run 内，每个 job 启动一个独立的心跳线程
+let (_tx, mut rx) = mpsc::channel::<()>(1);  // ★ 同样的问题：_tx 未 move
+tokio::task::spawn(async move {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(ttl)) => {}
+            _ = rx.recv() => { return; }
+        }
+        infra::file_list::update_running_jobs(&[job.job_id]).await;
+    }
+});
+// 然后同步调用 merge_by_stream
+merge_by_stream(...).await;
+```
+
+**生命周期分析**：
+- 同样的问题：`_tx` 未被 move，spawn 后立即 drop
+- `rx.recv()` 立即就绪 → select 立即 return
+- ✅ **结论**：这个心跳线程**同样一次 update 都不会执行**
+
+**对超时窗口的影响**：
+- 两处心跳都不工作 → job 的 `updated_at` 字段**在 `get_pending_jobs` 之后再也不会被更新**
+- 实际上的超时窗口 = **固定的 `job_run_timeout`**
+- 如果 `merge_by_stream` 执行时间超过 `job_run_timeout`，即使它还在正常运行，也会被 `check_running_jobs` 回滚为 Pending
+- 这可能导致**同一个 job 被多个节点并发执行**——虽然文件清单更新是幂等的，但会造成计算资源浪费
+
+---
+
+#### 心跳线程问题的根本原因
+
+两处代码都犯了同一个错误：
+
+```rust
+let (_tx, mut rx) = mpsc::channel::<()>(1);
+//    ^^^
+//    下划线前缀意味着"这个变量我不打算使用"
+//    它在 spawn 之后立即被 drop，因为没有被 move 到闭包
+```
+
+正确写法应该是：
+
+```rust
+let (tx, mut rx) = mpsc::channel::<()>(1);
+let handle = tokio::task::spawn(async move {
+    // ... 心跳逻辑 ...
+});
+// ... 执行合并 ...
+tx.send(()).await;  // 发送停止信号
+handle.await;       // 等待心跳线程退出
+```
+
+**代码位置说明**：
+- 第一处在 `src/service/compact/mod.rs:370-383`
+- 第二处在 `src/service/compact/worker.rs:95-113`
+- 两处均存在相同的 channel 生命周期问题
+
 ---
 
 ## 11. Offset 前移与时间窗口漏处理防护
@@ -822,14 +914,24 @@ ON CONFLICT DO NOTHING;
 
 #### 机制二：add_job 的去重与复活
 
-`add_job` 的实现中有一个**关键的复活逻辑**（`postgres.rs:1277-1293`）：
+`add_job` 的实现中有一个**关键的复活逻辑**（`postgres.rs:1277-1293`），但有严格的触发条件：
 
 ```rust
+// 步骤 1: 尝试 INSERT（ON CONFLICT DO NOTHING）
+// 如果记录已存在（唯一键冲突），则不插入但也不报错
+sqlx::query("INSERT ... ON CONFLICT DO NOTHING").execute(&mut *tx).await;
+
+// 步骤 2: 查询已存在的记录（无论是刚插入的还是之前就有的）
+let ret = sqlx::query("SELECT id, status FROM file_list_jobs WHERE ...").fetch_one(&mut *tx).await;
+
+// 步骤 3: 仅当记录已存在且当前状态为 Done 时，才尝试复活
+let id = ret.try_get::<i64, &str>("id").unwrap_or_default();
 let status = ret.try_get::<i64, &str>("status").unwrap_or_default();
 if id > 0
     && FileListJobStatus::from(status) == FileListJobStatus::Done
-    // 如果该 offset 的 job 已经是 Done 状态，则复活为 Pending
 {
+    // ★ 关键: UPDATE 语句中额外加了 WHERE status = Done 条件
+    // 防止并发场景下的竞态
     sqlx::query("UPDATE file_list_jobs SET status = $1 WHERE status = $2 AND id = $3;")
         .bind(FileListJobStatus::Pending)
         .bind(FileListJobStatus::Done)
@@ -839,7 +941,18 @@ if id > 0
 }
 ```
 
-这意味着：即使某个 offset 的 job 被标记为 Done（例如通过 `need_done_ids`），如果后续 `generate_old_data_job_by_stream` 发现该小时仍有旧数据需要合并，`add_job` 会**将 Done 状态复活为 Pending**，重新触发合并。
+**复活条件的准确描述**：
+
+| 条件 | 说明 |
+|-----|------|
+| 记录已存在 | INSERT 触发了 `ON CONFLICT DO NOTHING`（即该 org/stream/offsets 已有 job） |
+| `id > 0` | 查询成功返回了有效记录 |
+| `status == Done` | 该记录当前确实是 Done 状态 |
+| UPDATE 时 `status == Done` | 防止查询后到更新前的这段时间内 status 被其他节点修改 |
+
+**复活时修改的字段**：**只改 `status = Pending`**，不修改 `node`、`started_at`、`updated_at`。
+
+这意味着：即使某个 offset 的 job 被标记为 Done（例如通过 `need_done_ids`），如果后续 `generate_old_data_job_by_stream` 发现该小时仍有旧数据需要合并，`add_job` 会**将 Done 状态复活为 Pending**，重新触发合并。但复活操作本身也是幂等的——如果复活期间其他节点已重新运行该 job，UPDATE 会因 `WHERE status = Done` 条件不满足而静默跳过。
 
 #### 机制三：历史数据扫描覆盖
 
