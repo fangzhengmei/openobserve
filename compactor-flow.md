@@ -507,7 +507,8 @@ get_pending_jobs() 返回的每个 job
         ▼                    ▼                          ▼
   job_tx.send()       set_job_done()            set_job_pending()
   → JobScheduler      → status = Done(2)        → status = Pending(0)
-  → 实际合并           → node = ''               → node = ''
+  → 实际合并           → node = ''               → node 保持原值
+                       → updated_at = now        → updated_at 不变
 ```
 
 ### 9.1 need_done_ids：直接标记完成的条件
@@ -555,7 +556,13 @@ SET status = 0           -- Pending
 WHERE id IN (...);
 ```
 
-注意：`set_job_pending` **不清除 node 字段**（与 `check_running_jobs` 不同），因为 `get_pending_jobs` 在分配 Running 状态时会重新设置 node。
+注意：`set_job_pending` **只修改 status，不修改 node 和 updated_at**。`check_running_jobs` 同样只修改 status（见 §10.3 详细分析）。`get_pending_jobs` 在分配 Running 状态时会重新设置 node 和 updated_at，因此残留的旧 node 值不会造成问题。
+
+**不更新 updated_at 的调度影响**：
+- 被 `set_job_pending` 释放的 job，其 `updated_at` 仍保留 Running 时期的值
+- 由于 `check_running_jobs` 只处理 `status = Running` 的记录，Pending 状态下 updated_at 陈旧无影响
+- 当下一轮 `get_pending_jobs` 重新拾取该 job 时，会在 UPDATE 语句中**同时更新 node、started_at、updated_at** 三个字段（`postgres.rs:1353-1366`）
+- 真正的风险：如果 `set_job_pending` 本身执行失败，job 卡在 Running 状态，则陈旧的 updated_at 会让 `check_running_jobs` 更快检测到超时
 
 **对后续重试的影响**：
 - 释放回 Pending 后，下一轮 `get_pending_jobs` 可再次拾取
@@ -607,14 +614,14 @@ Daily 分区流 job 到达 run_merge
               ▼                   ▼                       ▼
        set_job_done()      执行合并逻辑           set_job_pending()
        status = Done(2)    ┌────┴────┐           status = Pending(0)
-       node = ''           │成功     │失败         node 不变
+       node = ''           │成功     │失败         node 保持原值
        dumped = ~dump_en   │         │             (node 仍为当前节点
-       更新 updated_at     ▼         ▼              但 Pending 状态下
+       updated_at = now     ▼         ▼              但 Pending 状态下
        ★ 终态，不可重入   set_job   job 超时后    get_pending_jobs 会
-                          _done()   check_running  重新设置 node)
-                          同左     _jobs 兜底
+                          _done()   check_running  重新设置 node +
+                          同左     _jobs 兜底       updated_at
                                    status → Pending
-                                   node → ''
+                                   node 保持原值 ★
 ```
 
 | 维度 | set_job_done | set_job_pending |
@@ -646,7 +653,7 @@ Daily 分区流 job 到达 run_merge
               ┌──────────┐                                       │
               │ Running  │──── 超时 ──── check_running_jobs ────┘
               │  (1)     │                    (status→Pending,
-              └────┬─────┘                     node→'')
+              └────┬─────┘                     node 保持不变)
                    │
         ┌──────────┼──────────┐
         ▼          ▼          ▼
@@ -690,7 +697,7 @@ job 被释放回队列。由于 `set_job_pending` 不清空 node，但 `get_pend
 ```
 Pending → Running → (节点崩溃/心跳中断) → check_running_jobs → Pending → ...
 ```
-这是最关键的安全网。`check_running_jobs` 不仅重置 status，还会清空 node，确保其他节点可以立即拾取。
+这是最关键的安全网。`check_running_jobs` **只重置 status 为 Pending，不清空 node**（见 §10.4 详细分析），但由于 `get_pending_jobs` 会在分配时重新设置 node，因此其他节点仍可正常拾取。
 
 **路径 D：直接标记完成（need_done_ids）**
 ```
@@ -709,6 +716,50 @@ if let Err(e) = infra_file_list::set_job_pending(&need_release_ids, 0, None).awa
 ```
 
 后果是：这些 job 仍然处于 Running(1) 状态，绑定在当前节点上。它们不会被任何正常流程重新拾取，只能等待 `check_running_jobs` 超时兜底。这引入了一个**最长等待窗口 = job_run_timeout** 的延迟。
+
+### 10.4 check_running_jobs 的实际处理逻辑
+
+`check_running_jobs`（`postgres.rs:1485-1523`）实际上包含**两条独立的 UPDATE 语句**，分别针对不同状态的 job，修改的字段完全不同：
+
+```
+check_running_jobs(before_date)
+        │
+        ├─ SQL 1: 处理超时的 Running job
+        │   └─ UPDATE file_list_jobs
+        │      SET status = 0 (Pending)
+        │      WHERE status = 1 (Running)
+        │        AND updated_at < before_date
+        │
+        │      ✓ 只改 status = Pending
+        │      ✗ 不修改 node
+        │      ✗ 不修改 updated_at
+        │
+        └─ SQL 2: 处理超时的 Dump 相关 Done job
+            └─ UPDATE file_list_jobs
+               SET node = ''
+               WHERE status = 2 (Done)
+                 AND dumped = false          ★ 只针对未完成 dump 的 job
+                 AND node != ''
+                 AND updated_at < before_date
+
+               ✓ 只改 node = ''
+               ✗ 不修改 status
+               ✗ 不修改 updated_at
+```
+
+| SQL 语句 | 触发条件 | 修改字段 | 用途 |
+|---------|---------|---------|------|
+| SQL 1 | `status = Running AND updated_at < before_date` | `status → Pending` | Running job 超时回滚 |
+| SQL 2 | `status = Done AND dumped = false AND node != '' AND updated_at < before_date` | `node → ''` | Done job 超时后释放 dump 锁 |
+
+**关键澄清**：
+- 之前的理解"check_running_jobs 会清空 node"只适用于 `Done + dumped=false` 的情况（dump 流程的超时释放）
+- **对于 Running 超时的合并 job，check_running_jobs 只改 status，不改 node**
+- 但这不影响调度，因为 `get_pending_jobs` 在将 Pending 转为 Running 时，会用新的 node 值覆盖旧值
+
+**两条 SQL 的设计意图**：
+1. **SQL 1**：节点崩溃后，其 Running job 应被回收供其他节点执行——只需要 status 回到 Pending
+2. **SQL 2**：dump 流程需要以 node 字段作为分布式锁——Done 状态下如果 dump 超时，应释放这个锁
 
 ---
 
