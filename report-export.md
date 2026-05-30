@@ -141,7 +141,7 @@ service::dashboards::reports::trigger()
 | retries 变化 | ✅ 成功→重置0；未达上限→+1；达上限→重置0 | ❌ 不涉及（trigger 由调度器管理） |
 | run_once 自动禁用 | ✅ 成功后自动设置 `report.enabled = false` | ❌ 不修改 report 任何字段 |
 | TriggerData 自上报 | ✅ 完整指标 | ❌ 不上报 |
-| short_urls 写入 | ⚠️ 本地模式有 | ⚠️ 本地模式有（相同） |
+| short_urls 写入 | ⚠️ 本地模式：无论 recipients 是否为 0，无条件写入 | ⚠️ 本地模式：无论 recipients 是否为 0，无条件写入（相同） |
 | 代码位置 | `src/service/alerts/scheduler/handlers.rs:1341` | `src/service/dashboards/reports.rs:349` |
 
 > **重要**：手动触发和定时触发**共享同一个 `report.send_subscribers()` 核心逻辑**，仅外层包装不同。
@@ -298,17 +298,18 @@ if !cfg.common.report_server_url.is_empty() {
 
 | 子函数 | 副作用 | 代码位置 | 条件 |
 |--------|--------|----------|------|
-| `short_url::shorten()` | **写入 `short_urls` 表**（生成短链接记录） | `src/service/dashboards/reports.rs:944` | 仅本地模式 + PDF 模式（recipients > 0） |
+| `short_url::shorten()` | **写入 `short_urls` 表**（生成短链接记录） | `src/service/dashboards/reports.rs:944` | 仅**本地模式**（无论 recipients 是否为 0，无条件调用） |
 
-> 这是 `send_subscribers` 调用链中**唯一修改本服务 DB 的操作**。
-> 短链接写入发生在 `generate_report()` 返回之后、`send_email()` 之前。
+> **修正**：之前误以为只有 recipients > 0 时才调用 shorten。实际代码（第 944 行）中 shorten 调用**没有**任何条件判断，在 generate_report 返回前无条件执行。
+>
+> 远程模式（report_server）不调用 shorten，见 `src/report_server/src/report.rs:392`。
 
 #### 对外交付副作用（向外部系统发送数据）
 
 | 子函数 | 副作用 | 代码位置 | 条件 |
 |--------|--------|----------|------|
 | **远程模式** `Client.put(url).json(&report_data).send()` | 向 report_server 发送 HTTP 请求（含 recipients、title、message 等） | `reports.rs:587-596` | `ZO_REPORT_SERVER_URL` 非空 |
-| **本地模式** `generate_report()` 内部 | 浏览器访问 Dashboard URL → 触发前端搜索请求 → 写入搜索日志/缓存 | `reports.rs:728` | 本地模式 |
+| **本地模式** `generate_report()` 内部 | 浏览器访问 Dashboard URL → 触发前端搜索请求 → 写入搜索日志/缓存 | `reports.rs:728` | 本地模式（无论 recipients 是否为 0） |
 | **本地模式** `send_email()` → `SMTP_CLIENT.send()` | 通过 SMTP 发送邮件（含 PDF 附件） | `reports.rs:683` | recipients 非空 |
 | **远程模式** report_server 的 `send_email()` | 通过 SMTP 发送邮件（含 PDF 附件） | `report_server/src/report.rs:436` | recipients 非空 |
 
@@ -324,9 +325,9 @@ send_subscribers(&self)          ← 不修改 &self，不修改 scheduled_jobs�
   └─ 本地模式
       ├─ generate_report()
       │   ├─ Browser::launch() + 导航  [对外交付：浏览器访问 Dashboard]
-      │   └─ short_url::shorten()       [数据层：写入 short_urls 表]
+      │   └─ short_url::shorten()       [数据层：无条件写入 short_urls 表]
       └─ send_email()
-          └─ SMTP_CLIENT.send()         [对外交付：发送邮件]
+          └─ SMTP_CLIENT.send()         [对外交付：发送邮件（仅 recipients>0）]
 ```
 
 > **关键结论**：`send_subscribers` 不修改 `scheduled_jobs` 和 `reports` 表。
@@ -412,8 +413,80 @@ Client::builder()
 | search_type | `search_type=ui` | `search_type=reports&report_id={org_id}-{report_name}` |
 | PDF 生成 | `vec![]`（空数组，跳过 CDP 调用） | `page.pdf()`（实际生成 PDF 字节） |
 | 浏览器行为 | 完整导航 + 等待数据加载 | 完整导航 + 等待数据加载 + 调用 PrintToPdf |
+| **short_url 写入** | ✅ 本地模式：无条件写入 short_urls 表<br>❌ 远程模式：不写入 | ✅ 本地模式：无条件写入 short_urls 表<br>❌ 远程模式：不写入 |
 | 邮件发送 | `send_email()` 中 `recipients.is_empty()` 直接返回 `Ok(())` | 构建邮件 + PDF 附件 + SMTP 发送 |
 | 用途 | 预热仪表盘数据到缓存，加速用户访问 | 定时推送报表邮件给用户 |
+
+### 3.5.1 no_of_recipients=0 时的调用链路（Cache 模式）
+
+**本地模式下的完整调用链**（`no_of_recipients = 0`）：
+
+```
+send_subscribers(&self)
+  ├─ recipients = vec![] (self.destinations 为空)
+  │   no_of_recipients = 0
+  │
+  └─ 本地模式分支 (report_server_url 为空)
+      ├─ generate_report(dashboard, ..., no_of_recipients=0)
+      │   ├─ Browser::launch() + 登录
+      │   ├─ 构造 URL: search_type=ui (no_of_recipients == 0)
+      │   ├─ page.goto(dashb_url) → 导航到 Dashboard
+      │   ├─ wait_for_panel_data_load() → 轮询 span 元素
+      │   ├─ pdf_data = vec![] → 跳过 page.pdf()  [代码: reports.rs:924]
+      │   ├─ browser.close()
+      │   └─ short_url::shorten(org_id, email_dashb_url)
+      │       └─ 无条件写入 short_urls 表  [代码: reports.rs:944, 无任何条件包裹]
+      ├─ 返回 (vec![], short_url)
+      └─ send_email(self, &vec![], short_url)
+          ├─ 重新计算 recipients → []
+          └─ recipients.is_empty() → return Ok(())  [代码: reports.rs:648]
+```
+
+**远程模式下的完整调用链**（`no_of_recipients = 0`）：
+
+```
+send_subscribers(&self)
+  ├─ recipients = vec![]
+  │   no_of_recipients = 0
+  │
+  └─ 远程模式分支 (report_server_url 非空)
+      └─ HTTP PUT → report_server/api/{org}/reports/{name}/send
+          ├─ report_server: recipients.len() == 0 → ReportType::Cache
+          ├─ generate_report(..., ReportType::Cache)
+          │   ├─ Browser::launch() + 登录
+          │   ├─ 构造 URL: search_type=ui
+          │   ├─ page.goto() + wait_for_panel_data_load()
+          │   ├─ pdf_data = vec![]
+          │   └─ 返回 (vec![], email_dashb_url)  ← 不调用 shorten
+          └─ ReportType::Cache → 直接返回 200 OK，不调用 send_email()
+```
+
+**数据层影响总结**（no_of_recipients=0 时）：
+
+| 影响 | 本地模式 | 远程模式 |
+|------|----------|----------|
+| 写入 short_urls 表 | ✅ 无条件写入，即使结果被 send_email 丢弃 | ❌ 不写入 |
+| 生成 PDF | ❌ 返回空 vec![] | ❌ 返回空 vec![] |
+| 发送邮件 | ❌ send_email 直接返回 Ok(()) | ❌ 根本不调用 send_email |
+| 浏览器渲染 Dashboard | ✅ 完整渲染，数据加载完成 | ✅ 完整渲染，数据加载完成 |
+| 触发前端搜索请求 | ✅ 预热数据缓存 | ✅ 预热数据缓存 |
+| 修改 scheduled_jobs 表 | ❌ 由外层 handle_report_triggers() 控制 | ❌ 由外层 handle_report_triggers() 控制 |
+| 修改 reports 表 | ❌ | ❌ |
+
+**代码证据 — shorten 无条件调用**（`reports.rs:943-950`）：
+```rust
+// convert to short_url
+let email_dashb_url = match short_url::shorten(org_id, &email_dashb_url).await {
+    Ok(short_url) => short_url,
+    Err(e) => {
+        log::error!("Error shortening email dashboard url: {e}");
+        email_dashb_url
+    }
+};
+// ↑ 整个 match 表达式被直接赋值，没有任何 if 条件包裹
+```
+
+> **设计冗余**：本地 Cache 模式下，`short_url::shorten()` 写入的短链接会被 `send_email()` 直接丢弃（因为 recipients 为空），导致 **short_urls 表中存在大量无用的短链接记录**。
 
 ### 3.6 浏览器配置
 
@@ -678,20 +751,38 @@ if !cfg.common.report_server_url.is_empty() {
 
 当前代码中 `dashboard.tabs` 虽然是 `Vec<String>`，但实际只使用 `tabs[0]`（`src/service/dashboards/reports.rs:749` / `src/report_server/src/report.rs:166`）。
 
-### 7.7 媒体类型扩展
+### 7.7 short_url 无条件调用的设计冗余
+
+**问题**：本地模式下，`short_url::shorten()` 在 `generate_report` 末尾**无条件调用**（`reports.rs:943-950`），不被 `no_of_recipients != 0` 条件包裹。
+
+**影响**：
+- **Cache 模式（no_of_recipients=0）**：生成的短链接会被 `send_email()` 丢弃（`reports.rs:648`），因为 recipients 为空，直接返回 `Ok(())`。
+- **结果**：`short_urls` 表中存在大量无用的短链接记录，造成存储空间浪费。
+
+**代码对比**：
+| 位置 | shorten 调用条件 |
+|------|-----------------|
+| 本地主服务 `reports.rs:944` | 无条件（无论 recipients 是否为 0） |
+| 远程服务 `report_server/src/report.rs:392` | 不调用（不依赖 short_urls 表） |
+
+**优化建议**：将 shorten 调用移入 `send_email()` 或添加 `if no_of_recipients > 0` 条件。
+
+### 7.8 媒体类型扩展
 
 `ReportMediaType` 支持 PDF（默认）、PNG、CSV 三种类型（`src/config/src/meta/dashboards/reports.rs:29`），但当前渲染抓取链路仅实现了 PDF 路径（`page.pdf()`）。PNG/CSV 的抓取逻辑尚未在 `generate_report()` 中实现。
 
-### 7.8 邮件附件模式
+### 7.9 邮件附件模式
 
 `ReportEmailAttachmentType` 支持 Standard（默认附件）和 Inline（内嵌）两种模式。Inline 仅对 PNG 类型生效，PDF 使用 Inline 会返回错误 `InlineAttachmentTypeNotSupportedForPdf`。
 
-### 7.9 错误结论修正汇总
+### 7.10 错误结论修正汇总
 
 | 之前的结论 | 修正后的准确描述 | 代码证据 |
 |----------|-----------------|----------|
 | "达到重试上限后 retries 不变" | ❌ **错误**。`new_trigger.retries` 初始化为 0（`handlers.rs:1367`），达到重试上限后调用 `update_trigger(new_trigger)` 会将 retries **重置为 0** | `handlers.rs:1367` + `infra/src/scheduler/sqlite.rs:274` |
-| "send_subscribers 是纯函数，无副作用" | ❌ **不完整**。不修改 `&self` 和调度表，但本地模式会写入 `short_urls` 表（数据层副作用），以及浏览器访问/SMTP 发邮件（对外交付副作用） | `reports.rs:944` (shorten), `reports.rs:683` (SMTP) |
+| "send_subscribers 是纯函数，无副作用" | ❌ **不完整**。不修改 `&self` 和调度表，但本地模式**无条件**写入 `short_urls` 表（数据层副作用），以及浏览器访问/SMTP 发邮件（对外交付副作用） | `reports.rs:944` (shorten), `reports.rs:683` (SMTP) |
+| "shorten 仅在 recipients > 0 时调用" | ❌ **错误**。`short_url::shorten()` 在 `generate_report` 末尾**无条件**调用，不被 `no_of_recipients != 0` 包裹 | `reports.rs:943-950` |
+| "Cache 模式不写入 DB" | ❌ **错误**。本地 Cache 模式仍会写入 `short_urls` 表，且写入的短链接会被 `send_email()` 丢弃，造成 DB 冗余 | `reports.rs:944` + `reports.rs:648` |
 | "send_subscribers 生成 PDF 作为附件" | 根据 `no_of_recipients` 判断：0 → Cache 模式返回 `vec![]`，不生成 PDF；>0 → 生成 PDF | `reports.rs:801` |
 | "report_server 的 send_email 使用 SMTP_CLIENT" | 正确，但需补充：使用独立的静态 SMTP_CLIENT，与主服务是两个实例 | `report_server/src/report.rs:115` |
 | "Cache 模式仅预加载数据" | 正确，但需补充：search_type=ui 伪装成普通用户访问，不生成 report_id 标记 | `reports.rs:801` |
@@ -702,7 +793,7 @@ if !cfg.common.report_server_url.is_empty() {
 | 未提到失败路径不一致 | 获取 report 配置失败→next_run_at=now+5min(retries=0)；send_subscribers 失败→next_run_at=下一周期(retries=0) | `handlers.rs:1380-1384` vs `handlers.rs:1632-1639` |
 | "run_once 手动触发也会自动禁用" | 手动触发**不会**自动禁用 run_once 的 report，只有定时触发成功才会 | `reports.rs:349-364` |
 
-### 7.10 关键配置项索引
+### 7.11 关键配置项索引
 
 | 配置项 | 作用 | 默认值 | 代码位置 |
 |--------|------|--------|----------|
