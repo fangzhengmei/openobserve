@@ -47,24 +47,161 @@ pub struct Trigger {
 
 | 步骤 | 代码位置 | 说明 |
 |------|----------|------|
-| Job Puller 拉取 | `src/service/db/scheduler.rs:111` `pull()` → `infra_scheduler::pull()` | 从 DB 批量拉取 status=Waiting 且 next_run_at ≤ now 的 Trigger |
+| Job Puller 拉取 | `src/service/db/scheduler.rs:111` `pull()` → `infra_scheduler::pull()` | 从 DB 批量拉取 status=Waiting 且 next_run_at ≤ now 的 Trigger，**原子更新**为 Processing |
 | Worker 消费 | `src/service/alerts/scheduler/worker.rs:76` `SchedulerWorker::run()` | 从 mpsc channel 接收 job，调用 `handle_triggers()` |
 | 路由分发 | `src/service/alerts/scheduler/handlers.rs:64` `handle_triggers()` | 根据 `trigger.module` 分发，Report 走 `handle_report_triggers()` |
+
+**pull() 原子更新细节**（`src/infra/src/scheduler/sqlite.rs:405`）：
+```sql
+UPDATE scheduled_jobs
+SET status = 'Processing', start_time = now,
+    end_time = CASE WHEN module = 'Report' THEN now + report_timeout ELSE now + alert_timeout END
+WHERE id IN (
+    SELECT id FROM scheduled_jobs
+    WHERE status = 'Waiting' AND next_run_at <= now
+    ORDER BY next_run_at LIMIT concurrency
+)
+RETURNING *;
+```
 
 ### 2.3 handle_report_triggers 核心逻辑
 
 **位置**：`src/service/alerts/scheduler/handlers.rs:1341`
 
-1. 从 DB 读取 report 配置（`db::dashboards::reports::get_by_id()`）
-2. 根据 `report.frequency.frequency_type` 计算 `next_run_at`：
+1. 前置检查：
+   - `trigger.retries >= max_retries` → 跳过本次，直接推进 `next_run_at` 到下周期
+   - 从 DB 读取 report 配置，失败则根据重试次数决定重试或跳到下周期
+   - `report.enabled = false` → +7 天后再检查
+   - Cloud 版本 free trial 过期 → 禁用 report 并删除 trigger
+2. 根据 `report.frequency.frequency_type` 预计算 `next_run_at`：
    - `Hours` / `Days` / `Weeks` / `Months` → 当前时间 + interval
    - `Once` → +7天，并标记 `run_once=true`
    - `Cron` → `Schedule::from_str().upcoming().next()`
 3. 若 `align_time=true`，则对齐到频率边界
 4. 调用 `report.send_subscribers()`（关键分支点，见下文）
-5. 成功/失败后更新 Trigger 状态（`update_trigger` / `update_status`）
-6. 若 `run_once=true` 且发送成功，自动 `report.enabled = false`
-7. 发布 TriggerData 到自上报流（`publish_triggers_usage`）
+5. 成功：
+   - `run_once=true` → 设置 `status=Completed`，`report.enabled=false`
+   - 否则 → 设置 `next_run_at` 到下一周期，`retries=0`，`status=Waiting`
+6. 失败：
+   - `retries + 1 < max_retries` → `status=Waiting`，`retries+1`，`next_run_at` 不变（立即重试）
+   - 达到最大重试 → `next_run_at` 推进到下一周期，放弃本次
+7. 发布 TriggerData 到自上报流
+
+### 2.4 手动触发 vs 定时触发 — 流程关系
+
+#### 定时触发（完整调度链路）
+```
+scheduled_jobs (status=Waiting)
+  ↓ pull() [原子 SQL]
+scheduled_jobs (status=Processing, start_time=now, end_time=now+timeout)
+  ↓
+handle_report_triggers()
+  ├─ 检查 retries、enabled、free trial
+  ├─ 预计算 next_run_at
+  ├─ report.send_subscribers()
+  ├─ 根据结果更新 trigger 状态/重试次数/next_run_at
+  └─ publish_triggers_usage()
+```
+
+#### 手动触发（极简链路）
+
+**位置**：`src/service/dashboards/reports.rs:349` `trigger()` / `trigger_by_id()`
+
+```
+HTTP PUT /{org_id}/reports/{name}/trigger
+  ↓
+service::dashboards::reports::trigger()
+  ├─ 从 DB 读取 report
+  └─ 直接调用 report.send_subscribers()
+  ↓
+返回成功/失败（无状态持久化）
+```
+
+**关键差异表**：
+
+| 维度 | 定时触发 | 手动触发 |
+|------|----------|----------|
+| 入口 | Scheduler Worker | HTTP API |
+| Trigger 状态管理 | ✅ 完整生命周期（Waiting→Processing→Waiting/Completed） | ❌ 无状态变更 |
+| 重试机制 | ✅ 基于 retries 字段，失败自动重试 | ❌ 无重试，直接返回错误 |
+| next_run_at 更新 | ✅ 成功/失败后都推进到下周期 | ❌ 不影响调度 |
+| run_once 自动禁用 | ✅ 成功后自动禁用 report | ❌ 不修改 report.enabled |
+| TriggerData 自上报 | ✅ 完整指标 | ❌ 不上报 |
+| 代码位置 | `src/service/alerts/scheduler/handlers.rs:1341` | `src/service/dashboards/reports.rs:349` |
+
+> **重要**：手动触发和定时触发**共享同一个 `report.send_subscribers()` 核心逻辑**，仅外层包装不同。
+> 手动触发是"旁路调用"，不会干扰调度器的状态机。
+
+### 2.5 状态流转与重试机制
+
+#### TriggerStatus 枚举
+
+**位置**：`src/config/src/meta/triggers.rs:22`
+```rust
+pub enum TriggerStatus {
+    Waiting,     // 0 — 待执行
+    Processing,  // 1 — 执行中
+    Completed,   // 2 — 已完成（仅用于 run_once）
+}
+```
+
+#### 状态流转图
+
+```
+         pull() 原子更新
+Waiting ──────────────────→ Processing
+  ↑                              │
+  │                              │ 成功
+  │  run_once=true               ├────────→ Completed (停留在该状态)
+  │                              │
+  │  run_once=false              │
+  ├──────────────────────────────┘ (retries=0, next_run_at 前进)
+  │
+  │ 失败 & retries+1 < max_retries
+  ├──────────────────────────────┐ (retries+1, next_run_at 不变)
+  │                              │
+  │ 失败 & retries+1 >= max_retries
+  └──────────────────────────────┘ (retries 不变, next_run_at 前进)
+```
+
+#### 重试次数配置
+
+**位置**：`src/infra/src/scheduler/mod.rs:235` `get_scheduler_max_retries()`
+```rust
+pub fn get_scheduler_max_retries() -> (bool, i32) {
+    let max_retries = config::get_config().limit.scheduler_max_retries;
+    (max_retries > 0, max_retries.unsigned_abs() as i32)
+}
+```
+
+- `ZO_SCHEDULER_MAX_RETRIES > 0` → 启用重试限制，最多重试 N 次
+- `ZO_SCHEDULER_MAX_RETRIES <= 0` → 不限制重试（无限重试）
+- Report 超时时间：`ZO_REPORT_SCHEDULER_TIMEOUT`（默认 600 秒）
+
+#### 超时检测（watch_timeout）
+
+**位置**：`src/infra/src/scheduler/sqlite.rs:523`
+
+后台任务每 30 秒执行：
+```sql
+UPDATE scheduled_jobs
+SET status = 'Waiting', retries = retries + 1
+WHERE status = 'Processing' AND end_time <= now;
+```
+
+> 执行超过 `end_time` 的任务会被自动重置为 `Waiting`，重试次数 +1，等待下次 pull。
+
+#### 已完成任务清理（clean_complete）
+
+**位置**：`src/infra/src/scheduler/sqlite.rs:498`
+
+```sql
+DELETE FROM scheduled_jobs
+WHERE (status = 'Completed' OR retries >= max_retries)
+  AND module != 'Alert';
+```
+
+> `run_once` 的 report 成功后进入 `Completed` 状态，会被后台清理任务删除。
 
 ---
 
@@ -88,15 +225,27 @@ if !cfg.common.report_server_url.is_empty() {
 
 1. **启动浏览器**：`Browser::launch(get_chrome_launch_options())` — 使用 `chromiumoxide` 库
 2. **登录**：导航到 `{web_url}/login?login_as_internal_user=true`，填写 email + password
-3. **构造 Dashboard URL**：
+3. **构造 Dashboard URL**（关键参数根据 `search_type_params` 变化）：
    - Relative 时间：`period={period}&timezone={timezone}`
    - Absolute 时间：`from={from}&to={to}&timezone={timezone}`
-   - 附加参数：`print=true`、`var-Dynamic+filters=%255B%255D`、`search_type=reports`
+   - 附加参数：`print=true`、`var-Dynamic+filters=%255B%255D`、`refresh=Off`
+   - **search_type 参数**（根据收件人数量动态切换）：
+     ```rust
+     // src/service/dashboards/reports.rs:801
+     let search_type_params = if no_of_recipients == 0 {
+         "search_type=ui".to_string()                  // Cache 模式
+     } else {
+         format!("search_type=reports&report_id={org_id}-{report_name}")  // PDF 模式
+     };
+     ```
 4. **导航**：先切 org（`?org_identifier={org_id}`），再打开 Dashboard URL
 5. **等待数据加载**：`wait_for_panel_data_load()` — 轮询查找 `span#dashboardVariablesAndPanelsDataLoaded`，超时由 `ZO_CHROME_SLEEP_SECS` 控制
 6. **验证渲染**：检查 `<main>` 和 `div.displayDiv` 元素存在
-7. **PDF 抓取**：`page.pdf(PrintToPdfParams { landscape: true, .. })` — 通过 CDP 协议 `PrintToPdf`
+7. **PDF 抓取**（根据 ReportType 决定）：
+   - PDF 模式：`page.pdf(PrintToPdfParams { landscape: true, .. })` — 通过 CDP 协议 `PrintToPdf`
+   - Cache 模式：`vec![]` — 返回空字节数组，不生成 PDF
 8. **返回**：`(pdf_data: Vec<u8>, email_dashb_url: String)`
+   - **email_dashb_url 会经过短链接处理**（本地模式独有）
 
 ### 3.3 远程模式 — 独立 report_server
 
@@ -106,11 +255,27 @@ if !cfg.common.report_server_url.is_empty() {
 |------|----------|------|
 | 服务启动 | `src/report_server/src/server.rs:7` `spawn_server()` | 绑定端口，启动 axum 服务 |
 | 路由 | `src/report_server/src/router.rs:142` `create_router()` | `PUT /api/:org_id/reports/:name/send` |
-| 请求处理 | `src/report_server/src/router.rs:59` `send_report()` | 解析请求，调用 `generate_report()` + `send_email()` |
-| 渲染逻辑 | `src/report_server/src/report.rs:141` `generate_report()` | 与本地模式几乎相同，使用 chromiumoxide 渲染 |
+| 请求处理 | `src/report_server/src/router.rs:59` `send_report()` | 解析请求，判断 ReportType，调用 generate_report() + send_email() |
+| 渲染逻辑 | `src/report_server/src/report.rs:141` `generate_report()` | 与本地模式类似，使用 chromiumoxide 渲染 |
+
+**ReportType 判断**（`src/report_server/src/router.rs:70`）：
+```rust
+let report_type = if report.email_details.recipients.is_empty() {
+    ReportType::Cache
+} else {
+    ReportType::PDF
+};
+```
+
+**search_type 参数**（`src/report_server/src/report.rs:233`）：
+```rust
+let search_type_params = match report_type.clone() {
+    ReportType::Cache => "search_type=ui".to_string(),
+    _ => format!("search_type=reports&report_id={org_id}-{report_name}"),
+};
+```
 
 **主服务调用远程的代码**（`src/service/dashboards/reports.rs:569`）：
-
 ```rust
 let url = format!("{}/api/{}/reports/{}/send", &cfg.common.report_server_url, &self.org_id, &self.name);
 Client::builder()
@@ -122,7 +287,21 @@ Client::builder()
     .send().await
 ```
 
-### 3.4 浏览器配置
+### 3.4 Cache 与 PDF 模式 — 渲染参数差异
+
+两种模式由 `report.destinations` 是否为空决定，共享浏览器渲染流程，但参数和行为有显著差异：
+
+| 维度 | Cache 模式（无收件人） | PDF 模式（有收件人） |
+|------|----------------------|---------------------|
+| 触发条件 | `no_of_recipients == 0` | `no_of_recipients > 0` |
+| ReportType 枚举 | `ReportType::Cache` | `ReportType::PDF` |
+| search_type | `search_type=ui` | `search_type=reports&report_id={org_id}-{report_name}` |
+| PDF 生成 | `vec![]`（空数组，跳过 CDP 调用） | `page.pdf()`（实际生成 PDF 字节） |
+| 浏览器行为 | 完整导航 + 等待数据加载 | 完整导航 + 等待数据加载 + 调用 PrintToPdf |
+| 邮件发送 | `send_email()` 中 `recipients.is_empty()` 直接返回 `Ok(())` | 构建邮件 + PDF 附件 + SMTP 发送 |
+| 用途 | 预热仪表盘数据到缓存，加速用户访问 | 定时推送报表邮件给用户 |
+
+### 3.5 浏览器配置
 
 **位置**：`src/report_server/src/report.rs:34` / `config` crate 的 `get_chrome_launch_options()`
 
@@ -142,25 +321,76 @@ Client::builder()
 **位置**：`src/service/dashboards/reports.rs:631` `send_email()`
 
 1. 检查 `smtp_enabled`
-2. 构建 `lettre::Message`：
+2. 检查 `recipients.is_empty()` — 如果为空（Cache 模式），直接返回 `Ok(())`
+3. 构建 `lettre::Message`：
    - From: `ZO_SMTP_FROM_EMAIL`
    - To: `report.destinations` 中的所有 Email 地址
    - Reply-To: `ZO_SMTP_REPLY_TO`
    - 主体：`MultiPart::mixed()` + HTML 正文 + PDF 附件
-3. 附件内容：
+4. 附件内容：
    - 文件名：`{sanitize_filename(report.title)}.pdf`
    - MIME: `application/pdf`
-   - 数据：`pdf_data: &[u8]`（从 `generate_report()` 返回的 `Vec<u8>`）
-4. 发送：`SMTP_CLIENT.send(email).await`
-5. URL 缩短：`short_url::shorten(org_id, &email_dashb_url)` 缩短邮件中的 Dashboard 链接
+   - 数据：`pdf_data: &[u8]`（从 `generate_report()` 返回的 `Vec<u8>`，Cache 模式为空）
+5. 发送：`SMTP_CLIENT.send(email).await`
+
+**关键前置：短链接生成**（`src/service/dashboards/reports.rs:943`）
+```rust
+// convert to short_url
+let email_dashb_url = match short_url::shorten(org_id, &email_dashb_url).await {
+    Ok(short_url) => short_url,
+    Err(e) => {
+        log::error!("Error shortening email dashboard url: {e}");
+        email_dashb_url
+    }
+};
+```
+> **本地模式独有**：邮件中的 Dashboard URL 会经过短链接服务缩短，失败时回退到原始 URL。
 
 ### 4.2 远程模式邮件发送
 
 **位置**：`src/report_server/src/report.rs:396` `send_email()`
 
-逻辑与本地模式一致，使用 `SMTP_CLIENT` 全局静态实例（`src/report_server/src/report.rs:115`）。
+逻辑与本地模式类似，但有两个关键差异：
 
-### 4.3 仪表盘 JSON 导出（前端直接导出）
+1. **不做短链接处理**：`email_dashboard_url` 直接从 `generate_report()` 返回的原始 URL 传给 `send_email()`，**不调用 `short_url::shorten()`**
+2. **独立 SMTP 客户端**：使用 `report_server/src/report.rs:115` 初始化的独立 `SMTP_CLIENT` 静态实例，与主服务的 SMTP_CLIENT 是独立的
+
+**邮件正文 HTML**（`src/report_server/src/report.rs:421`）：
+```rust
+format!(
+    "{}\n\n<p><a href='{}' target='_blank'>Link to dashboard</a></p>",
+    email_details.message, email_details.dashb_url  // 这里是原始长 URL
+)
+```
+
+### 4.3 短链接处理逻辑
+
+**位置**：`src/service/short_url.rs`
+
+#### shorten() 流程（`src/service/short_url.rs:64`）：
+
+1. 基于原始 URL 生成 XXHash 64 位 short_id
+2. 检查 DB 中是否已存在相同 short_id → 存在且 URL 匹配则复用
+3. 不存在则存储到 DB：
+   - 冲突（UniqueViolation）→ 加入时间戳重新生成 short_id，重试存储
+4. 构造短链接格式：`{base_url}api/{org_id}/short/{short_id}`
+5. 保留期由 `ZO_SHORT_URL_RETENTION_DAYS` 控制，到期后后台清理
+
+#### 短链接重定向：
+- HTTP 路由：`GET /{org_id}/short/{short_id}` → `short_url::retrieve()`
+- 从 DB 取出 original_url，返回 302 重定向
+
+### 4.4 本地模式 vs 远程模式 — 短链接差异
+
+| 维度 | 本地模式 | 远程模式 |
+|------|----------|----------|
+| 短链接生成 | ✅ 调用 `short_url::shorten()` | ❌ 不生成，直接用原始 URL |
+| 邮件中的链接 | `https://.../api/{org}/short/abc123` | `https://.../dashboards/view?org_identifier=...&dashboard=...&from=...&to=...` |
+| 失败回退 | ✅ 短链接失败回退到原始 URL | N/A |
+| 依赖 | 依赖主服务的 `short_urls` 表 | 无依赖 |
+| 代码位置 | `src/service/dashboards/reports.rs:943` | 无（直接透传 URL） |
+
+### 4.5 仪表盘 JSON 导出（前端直接导出）
 
 **位置**：`web/src/components/dashboards/ExportDashboard.vue`
 
@@ -177,48 +407,70 @@ Client::builder()
 ## 五、关键衔接关系总览
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        前端 (Vue)                                │
-│  reports.ts → POST/PUT /api/{org}/reports                       │
-│  reports.ts → PUT /api/{org}/reports/{name}/trigger             │
-│  ExportDashboard.vue → 浏览器端 JSON 下载（独立链路）             │
-└───────────────────────────┬──────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                           前端 (Vue)                                  │
+│  reports.ts → POST/PUT /api/{org}/reports  (创建/更新)                │
+│  reports.ts → PUT /api/{org}/reports/{name}/trigger  (手动触发)       │
+│  ExportDashboard.vue → 浏览器端 JSON 下载（独立链路）                   │
+└───────────────────────────┬────────────────────────────────────────────┘
                             │ HTTP
                             ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                  主服务 (OpenObserve Server)                      │
-│                                                                  │
-│  HTTP Handler (reports.rs)                                       │
-│    → service::dashboards::reports::save()                        │
-│      → db::dashboards::reports::create()                         │
-│        ├─ ORM: INSERT INTO reports                               │
-│        └─ db::scheduler::push(Trigger{module=Report})            │
-│           └─ ORM: INSERT INTO scheduled_jobs                     │
-│                                                                  │
-│  Scheduler Worker                                                │
-│    → pull() 从 scheduled_jobs 拉取到期任务                        │
-│    → handle_report_triggers()                                    │
-│      → 计算 next_run_at，更新 Trigger                            │
-│      → report.send_subscribers()  ◄──── 关键分支点 ────┐        │
-│        ├─ report_server_url 非空?                       │        │
-│        │   YES → HTTP PUT → report_server               │        │
-│        │   NO  → generate_report() (内嵌)               │        │
-│        └─ send_email()                                  │        │
-└─────────────────────────────┬────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                    主服务 (OpenObserve Server)                          │
+│                                                                      │
+│  【创建/更新链路】                                                    │
+│  HTTP Handler (reports.rs)                                            │
+│    → service::dashboards::reports::save()                             │
+│      → db::dashboards::reports::create()                              │
+│        ├─ ORM: INSERT INTO reports                                    │
+│        └─ db::scheduler::push(Trigger{module=Report, status=Waiting})│
+│           └─ ORM: INSERT INTO scheduled_jobs                          │
+│                                                                      │
+│  【定时触发链路】                                                    │
+│  Scheduler Worker                                                     │
+│    → pull() [原子 SQL] 从 scheduled_jobs 拉取                          │
+│       (status: Waiting → Processing, 同时设置 start_time/end_time)    │
+│    → handle_report_triggers()                                         │
+│       ├─ 前置检查 (retries/enabled/free trial)                        │
+│       ├─ 预计算 next_run_at                                           │
+│       ├─ report.send_subscribers()  ◄── 关键分支点 ───┐              │
+│       │   ├─ report_server_url 非空?                   │              │
+│       │   │   YES → HTTP PUT → report_server           │              │
+│       │   │   NO  → generate_report() (内嵌)            │              │
+│       │   │       └─ [本地模式独有] short_url::shorten()│              │
+│       │   └─ send_email()                               │              │
+│       ├─ 根据结果更新 trigger (status/retries/next_run_at)           │
+│       └─ publish_triggers_usage()                                     │
+│                                                                      │
+│  【手动触发链路】                                                    │
+│  HTTP PUT /{org}/reports/{name}/trigger                               │
+│    → service::dashboards::reports::trigger()                          │
+│       ├─ 从 DB 读 report                                              │
+│       └─ 直接调用 report.send_subscribers()  (旁路调用，不触状态机)   │
+└─────────────────────────────┬──────────────────────────────────────────┘
                               │ HTTP PUT (远程模式)
                               ▼
-┌──────────────────────────────────────────────────────────────────┐
-│              独立报表服务 (report_server)                          │
-│                                                                  │
-│  PUT /api/:org_id/reports/:name/send                             │
-│    → generate_report()                                           │
-│      → Browser::launch() → 登录 → 导航到 Dashboard               │
-│      → wait_for_panel_data_load() (轮询 span 元素)               │
-│      → page.pdf() (CDP PrintToPdf)                               │
-│    → send_email()                                                │
-│      → lettre SMTP → PDF 附件投递到收件人                          │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                   独立报表服务 (report_server)                          │
+│                                                                      │
+│  PUT /api/:org_id/reports/:name/send                                  │
+│    → 判断 recipients 数量 → ReportType (Cache/PDF)                    │
+│    → generate_report()                                                │
+│       ├─ Browser::launch() → 登录 → 导航到 Dashboard                  │
+│       ├─ wait_for_panel_data_load() (轮询 span 元素)                  │
+│       ├─ ReportType::PDF  → page.pdf() (CDP PrintToPdf)               │
+│       └─ ReportType::Cache → vec![]  (不生成 PDF)                     │
+│    → ReportType::Cache → 直接返回 200 OK (不发邮件)                   │
+│    → ReportType::PDF → send_email()                                   │
+│       └─ lettre SMTP → PDF 附件投递到收件人 (使用原始长 URL)          │
+└──────────────────────────────────────────────────────────────────────┘
 ```
+
+### 三大核心衔接点
+
+1. **send_subscribers() 公共入口**：手动触发和定时触发最终都调用这个方法
+2. **search_type_params 动态切换**：根据收件人数量，URL 参数在 `search_type=ui` 和 `search_type=reports` 间切换
+3. **本地/远程模式分支**：`ZO_REPORT_SERVER_URL` 配置决定是内嵌渲染还是转发到独立服务
 
 ---
 
@@ -228,17 +480,23 @@ Client::builder()
 |------|----------|
 | HTTP 请求处理 (V1/V2) | `src/handler/http/request/dashboards/reports.rs` |
 | HTTP 响应模型 | `src/handler/http/models/reports.rs` |
-| 业务逻辑（save/get/trigger/enable） | `src/service/dashboards/reports.rs` |
+| 业务逻辑（save/get/trigger/enable/send_subscribers） | `src/service/dashboards/reports.rs` |
 | DB 层（create/update/delete + 同步 Trigger） | `src/service/db/dashboards/reports.rs` |
 | 数据模型（Report/ReportDashboard/ReportFrequency 等） | `src/config/src/meta/dashboards/reports.rs` |
-| Trigger 模型 | `src/config/src/meta/triggers.rs` |
-| Scheduler DB 操作 | `src/service/db/scheduler.rs` |
-| 调度 Worker | `src/service/alerts/scheduler/worker.rs` |
+| Trigger 模型（Trigger/TriggerStatus/TriggerModule） | `src/config/src/meta/triggers.rs` |
+| Scheduler DB 操作封装 | `src/service/db/scheduler.rs` |
+| Scheduler 核心实现（pull/update_status/clean_complete） | `src/infra/src/scheduler/mod.rs` |
+| Scheduler SQLite 实现 | `src/infra/src/scheduler/sqlite.rs` |
+| Scheduler Postgres 实现 | `src/infra/src/scheduler/postgres.rs` |
+| 调度 Worker（循环拉取+分发） | `src/service/alerts/scheduler/worker.rs` |
 | Trigger 处理路由 + Report 触发逻辑 | `src/service/alerts/scheduler/handlers.rs:1341` |
+| 短链接服务（shorten/retrieve） | `src/service/short_url.rs` |
+| 短链接 DB 层 | `src/service/db/short_url.rs` |
+| 短链接数据表定义 | `src/infra/src/table/short_urls.rs` |
 | 独立报表服务 - 入口 | `src/report_server/src/server.rs` |
 | 独立报表服务 - 路由 | `src/report_server/src/router.rs` |
 | 独立报表服务 - 渲染+邮件 | `src/report_server/src/report.rs` |
-| 独立报表服务 - 数据模型 | `src/report_server/src/models.rs` |
+| 独立报表服务 - 数据模型（ReportType/Report/EmailDetails） | `src/report_server/src/models.rs` |
 | ORM 实体 | `src/infra/src/table/entity/reports.rs` |
 | DB 迁移 | `src/infra/src/table/migration/m20250611_000001_create_reports_table.rs` |
 | 前端服务层 | `web/src/services/reports.ts` |
@@ -263,18 +521,79 @@ if !cfg.common.report_server_url.is_empty() {
 - 本地模式要求：`ZO_CHROME_ENABLED=true` + `ZO_CHROME_PATH` + `ZO_REPORT_USER_NAME` + `ZO_REPORT_USER_PASSWORD`
 - 远程模式要求：`ZO_REPORT_SERVER_URL` 已配置，独立服务要求 `ZO_REPORT_USER_EMAIL` + `ZO_REPORT_USER_PASSWORD`
 
-### 7.2 Cache 类型报表
+### 7.2 ReportType 判断逻辑
 
-当 `report.destinations` 为空时，报表仍会触发浏览器渲染但不生成 PDF 也不发邮件（`ReportType::Cache`），仅为了预加载仪表盘数据到缓存。
+两种模式判断 ReportType 的逻辑**等价但实现不同**：
 
-### 7.3 仅支持单 Tab
+| 模式 | 判断逻辑 | 代码位置 |
+|------|----------|----------|
+| 本地模式 | `no_of_recipients == 0` | `src/service/dashboards/reports.rs:801` |
+| 远程模式 | `report.email_details.recipients.is_empty()` | `src/report_server/src/router.rs:70` |
+
+> **修正**：之前文档说"Cache 类型报表"的判断，但实际上没有显式的 `ReportType::Cache` 标记传递给本地模式的 `generate_report()`。本地模式通过 `no_of_recipients` 参数隐式决定行为，只有 `search_type_params` 和是否跳过 `page.pdf()` 两个差异点。
+
+### 7.3 search_type 参数的真实含义
+
+| 值 | 含义 | 影响 |
+|----|------|------|
+| `search_type=ui` | 用户手动访问 | 前端埋点统计为普通用户访问 |
+| `search_type=reports` | 报表服务自动访问 | 前端埋点统计为报表抓取，附带 `report_id` |
+
+> **修正**：之前文档笼统说 `search_type=reports`，实际上根据是否有收件人在两种模式间动态切换。Cache 模式伪装成普通用户访问来预热缓存。
+
+### 7.4 短链接处理差异
+
+| 模式 | 邮件中的 URL | 代码位置 |
+|------|-------------|----------|
+| 本地模式 | 短链接 `https://.../api/{org}/short/abc123` | `src/service/dashboards/reports.rs:943` |
+| 远程模式 | 原始长 URL（包含完整 from/to/period 参数） | `src/report_server/src/report.rs:392` |
+
+> **重要**：远程模式不调用 `short_url::shorten()`，这意味着独立报表服务不依赖主服务的 `short_urls` 表，可以完全独立部署。
+
+### 7.5 状态机完整性 — run_once 的特殊处理
+
+当 `frequency_type = Once` 时：
+
+1. 触发前标记 `run_once = true`
+2. `send_subscribers()` 成功后：
+   - `new_trigger.status = Completed`
+   - `report.enabled = false`（通过 `update_without_updating_trigger` 禁用，不影响已有的 trigger 状态）
+3. 后台 `clean_complete` 任务会删除 `status = Completed` 的 trigger
+
+### 7.6 仅支持单 Tab
 
 当前代码中 `dashboard.tabs` 虽然是 `Vec<String>`，但实际只使用 `tabs[0]`（`src/service/dashboards/reports.rs:749` / `src/report_server/src/report.rs:166`）。
 
-### 7.4 媒体类型扩展
+### 7.7 媒体类型扩展
 
 `ReportMediaType` 支持 PDF（默认）、PNG、CSV 三种类型（`src/config/src/meta/dashboards/reports.rs:29`），但当前渲染抓取链路仅实现了 PDF 路径（`page.pdf()`）。PNG/CSV 的抓取逻辑尚未在 `generate_report()` 中实现。
 
-### 7.5 邮件附件模式
+### 7.8 邮件附件模式
 
 `ReportEmailAttachmentType` 支持 Standard（默认附件）和 Inline（内嵌）两种模式。Inline 仅对 PNG 类型生效，PDF 使用 Inline 会返回错误 `InlineAttachmentTypeNotSupportedForPdf`。
+
+### 7.9 错误结论修正汇总
+
+| 之前的结论 | 修正后的准确描述 |
+|----------|-----------------|
+| "send_subscribers 生成 PDF 作为附件" | 根据 `no_of_recipients` 判断：0 → Cache 模式返回 `vec![]`，不生成 PDF；>0 → 生成 PDF |
+| "report_server 的 send_email 使用 SMTP_CLIENT" | 正确，但需补充：使用独立的静态 SMTP_CLIENT，与主服务是两个实例 |
+| "Cache 模式仅预加载数据" | 正确，但需补充：search_type=ui 伪装成普通用户访问，不生成 report_id 标记 |
+| 未提到手动触发 | 手动触发是独立旁路调用，直接调用 `send_subscribers()`，不经过调度器状态机 |
+| 未提到短链接差异 | 本地模式生成短链接，远程模式使用原始 URL |
+| "定时触发更新状态" | 准确描述：pull() 原子更新 Waiting→Processing，成功后根据 run_once 更新为 Completed 或 Waiting（next_run_at 前进），失败重试则保持 Waiting 但 retries+1 |
+
+### 7.10 关键配置项索引
+
+| 配置项 | 作用 |
+|--------|------|
+| `ZO_REPORT_SERVER_URL` | 非空则启用远程模式 |
+| `ZO_CHROME_ENABLED` | 本地模式必需 |
+| `ZO_CHROME_PATH` | Chrome 可执行文件路径 |
+| `ZO_REPORT_USER_NAME` | 本地模式登录用户名 |
+| `ZO_REPORT_USER_PASSWORD` | 本地模式登录密码 |
+| `ZO_REPORT_USER_EMAIL` | 远程模式登录邮箱 |
+| `ZO_SCHEDULER_MAX_RETRIES` | 最大重试次数（<=0 无限重试） |
+| `ZO_REPORT_SCHEDULER_TIMEOUT` | Report 执行超时（秒） |
+| `ZO_CHROME_SLEEP_SECS` | 等待页面数据加载超时 |
+| `ZO_SHORT_URL_RETENTION_DAYS` | 短链接保留天数 |
