@@ -107,12 +107,25 @@ handle_report_triggers()
 
 **位置**：`src/service/dashboards/reports.rs:349` `trigger()` / `trigger_by_id()`
 
+```rust
+// src/service/dashboards/reports.rs:349-364
+pub async fn trigger(org_id: &str, folder_id: &str, name: &str) -> Result<(), ReportError> {
+    let conn = ORM_CLIENT.get_or_init(connect_to_orm).await;
+    let report = match db::dashboards::reports::get(conn, org_id, folder_id, name).await {
+        Ok(report) => report,
+        _ => return Err(ReportError::ReportNotFound),
+    };
+    report.send_subscribers().await?;  // 直接调用，无后续副作用
+    Ok(())
+}
+```
+
 ```
 HTTP PUT /{org_id}/reports/{name}/trigger
   ↓
 service::dashboards::reports::trigger()
   ├─ 从 DB 读取 report
-  └─ 直接调用 report.send_subscribers()
+  └─ 直接调用 report.send_subscribers()  ◀── 仅此一步！
   ↓
 返回成功/失败（无状态持久化）
 ```
@@ -124,13 +137,19 @@ service::dashboards::reports::trigger()
 | 入口 | Scheduler Worker | HTTP API |
 | Trigger 状态管理 | ✅ 完整生命周期（Waiting→Processing→Waiting/Completed） | ❌ 无状态变更 |
 | 重试机制 | ✅ 基于 retries 字段，失败自动重试 | ❌ 无重试，直接返回错误 |
-| next_run_at 更新 | ✅ 成功/失败后都推进到下周期 | ❌ 不影响调度 |
-| run_once 自动禁用 | ✅ 成功后自动禁用 report | ❌ 不修改 report.enabled |
+| next_run_at 更新 | ✅ 成功/失败后都推进到下周期 | ❌ 完全不影响 |
+| run_once 自动禁用 | ✅ 成功后自动设置 `report.enabled = false` | ❌ 不修改 report 任何字段 |
 | TriggerData 自上报 | ✅ 完整指标 | ❌ 不上报 |
 | 代码位置 | `src/service/alerts/scheduler/handlers.rs:1341` | `src/service/dashboards/reports.rs:349` |
 
 > **重要**：手动触发和定时触发**共享同一个 `report.send_subscribers()` 核心逻辑**，仅外层包装不同。
-> 手动触发是"旁路调用"，不会干扰调度器的状态机。
+> 
+> **send_subscribers 是纯函数**：方法签名为 `async fn send_subscribers(&self)`，使用 `&self` 不可变引用，**不会修改 Report 自身的任何字段**。
+> 
+> 手动触发是"旁路调用"，对调度器状态机 **零副作用**：
+> - 不修改 scheduled_jobs 表（status/retries/next_run_at 都不变）
+> - 不修改 reports 表（enabled 字段不变）
+> - 即使是 run_once 的 report，手动触发成功也不会自动禁用
 
 ### 2.5 状态流转与重试机制
 
@@ -164,6 +183,48 @@ Waiting ──────────────────→ Processing
   └──────────────────────────────┘ (retries 不变, next_run_at 前进)
 ```
 
+#### 失败路径不一致分析 — 两处失败分支的行为差异
+
+代码中存在**两处独立的失败分支**，行为不一致，需要特别注意：
+
+| 失败场景 | 达到重试上限的处理 | 未达到重试上限的处理 |
+|---------|-------------------|---------------------|
+| **获取 report 配置失败** (`handlers.rs:1375-1398`) | `next_run_at = now + 5 分钟`（硬编码） | `update_status(status=Waiting, retries+1)`，next_run_at 不变 |
+| **send_subscribers 执行失败** (`handlers.rs:1628-1656`) | `next_run_at = 按频率计算的下一周期` | `update_status(status=Waiting, retries+1)`，next_run_at 不变 |
+
+**代码证据 1 — 获取 report 配置失败**（`src/service/alerts/scheduler/handlers.rs:1375-1398`）：
+```rust
+Err(e) => {
+    // if trigger max retries is reached, update the next run at
+    if trigger.retries + 1 >= max_retries {
+        // next run at is after 5mins  ← 硬编码 5 分钟！
+        let next_run_at = now + Duration::minutes(5).num_microseconds().unwrap();
+        new_trigger.next_run_at = next_run_at;
+        db::scheduler::update_trigger(new_trigger, true, &query_trace_id).await?;
+    } else {
+        // Mark the trigger as failed
+        db::scheduler::update_status(..., TriggerStatus::Waiting, trigger.retries + 1, ...).await?;
+    }
+}
+```
+
+**代码证据 2 — send_subscribers 执行失败**（`src/service/alerts/scheduler/handlers.rs:1628-1656`）：
+```rust
+Err(e) => {
+    if trigger.retries + 1 >= max_retries && !run_once {
+        // next_run_at 推进到按频率计算的下一周期 (new_trigger 在之前已预计算)
+        db::scheduler::update_trigger(new_trigger, true, &query_trace_id).await?;
+    } else {
+        if run_once {
+            report.enabled = true;  // run_once 失败时恢复 enabled=true
+        }
+        db::scheduler::update_status(..., TriggerStatus::Waiting, trigger.retries + 1, ...).await?;
+    }
+}
+```
+
+> **设计不一致性**：获取 report 配置失败时，达到重试上限后 5 分钟后重试；send_subscribers 失败时，达到重试上限后推进到下一频率周期。前者是"快速重试"策略，后者是"跳过本次"策略。
+
 #### 重试次数配置
 
 **位置**：`src/infra/src/scheduler/mod.rs:235` `get_scheduler_max_retries()`
@@ -174,9 +235,19 @@ pub fn get_scheduler_max_retries() -> (bool, i32) {
 }
 ```
 
+- `ZO_SCHEDULER_MAX_RETRIES`：默认 3 次
 - `ZO_SCHEDULER_MAX_RETRIES > 0` → 启用重试限制，最多重试 N 次
 - `ZO_SCHEDULER_MAX_RETRIES <= 0` → 不限制重试（无限重试）
-- Report 超时时间：`ZO_REPORT_SCHEDULER_TIMEOUT`（默认 600 秒）
+
+**Report 执行超时配置**（`src/config/src/config.rs:1677`）：
+```rust
+#[env_config(name = "ZO_REPORT_SCHEDULE_TIMEOUT", default = 300)]
+pub report_schedule_timeout: i64,
+```
+
+- 配置项：`ZO_REPORT_SCHEDULE_TIMEOUT`（注意是 SCHEDULE，不是 SCHEDULER）
+- 默认值：300 秒（5 分钟）
+- 用途：pull() 时设置 end_time = now + report_schedule_timeout，用于超时检测
 
 #### 超时检测（watch_timeout）
 
@@ -574,26 +645,30 @@ if !cfg.common.report_server_url.is_empty() {
 
 ### 7.9 错误结论修正汇总
 
-| 之前的结论 | 修正后的准确描述 |
-|----------|-----------------|
-| "send_subscribers 生成 PDF 作为附件" | 根据 `no_of_recipients` 判断：0 → Cache 模式返回 `vec![]`，不生成 PDF；>0 → 生成 PDF |
-| "report_server 的 send_email 使用 SMTP_CLIENT" | 正确，但需补充：使用独立的静态 SMTP_CLIENT，与主服务是两个实例 |
-| "Cache 模式仅预加载数据" | 正确，但需补充：search_type=ui 伪装成普通用户访问，不生成 report_id 标记 |
-| 未提到手动触发 | 手动触发是独立旁路调用，直接调用 `send_subscribers()`，不经过调度器状态机 |
-| 未提到短链接差异 | 本地模式生成短链接，远程模式使用原始 URL |
-| "定时触发更新状态" | 准确描述：pull() 原子更新 Waiting→Processing，成功后根据 run_once 更新为 Completed 或 Waiting（next_run_at 前进），失败重试则保持 Waiting 但 retries+1 |
+| 之前的结论 | 修正后的准确描述 | 代码证据 |
+|----------|-----------------|----------|
+| "send_subscribers 生成 PDF 作为附件" | 根据 `no_of_recipients` 判断：0 → Cache 模式返回 `vec![]`，不生成 PDF；>0 → 生成 PDF | `src/service/dashboards/reports.rs:801` |
+| "report_server 的 send_email 使用 SMTP_CLIENT" | 正确，但需补充：使用独立的静态 SMTP_CLIENT，与主服务是两个实例 | `src/report_server/src/report.rs:115` |
+| "Cache 模式仅预加载数据" | 正确，但需补充：search_type=ui 伪装成普通用户访问，不生成 report_id 标记 | `src/service/dashboards/reports.rs:801` |
+| 未提到手动触发 | 手动触发是独立旁路调用，直接调用 `send_subscribers()`，不经过调度器状态机，**零副作用** | `src/service/dashboards/reports.rs:349-364` |
+| 未提到短链接差异 | 本地模式生成短链接，远程模式使用原始 URL | `src/service/dashboards/reports.rs:943` vs `src/report_server/src/report.rs:392` |
+| "定时触发更新状态" | pull() 原子更新 Waiting→Processing；成功后 run_once→Completed，否则→Waiting 前进；失败重试→Waiting retries+1 | `src/infra/src/scheduler/sqlite.rs:405` |
+| "ZO_REPORT_SCHEDULER_TIMEOUT"（配置名错误） | 正确配置名是 `ZO_REPORT_SCHEDULE_TIMEOUT`（SCHEDULE，不是 SCHEDULER），默认 300 秒 | `src/config/src/config.rs:1677` |
+| "默认 600 秒"（超时默认值错误） | 默认值是 300 秒（5 分钟），不是 600 秒 | `src/config/src/config.rs:1677` |
+| 未提到失败路径不一致 | 获取 report 配置失败→5 分钟后重试；send_subscribers 失败→推进到下一周期 | `handlers.rs:1380-1384` vs `handlers.rs:1632-1639` |
+| "run_once 手动触发也会自动禁用" | 手动触发**不会**自动禁用 run_once 的 report，只有定时触发成功才会 | `src/service/dashboards/reports.rs:349-364` |
 
 ### 7.10 关键配置项索引
 
-| 配置项 | 作用 |
-|--------|------|
-| `ZO_REPORT_SERVER_URL` | 非空则启用远程模式 |
-| `ZO_CHROME_ENABLED` | 本地模式必需 |
-| `ZO_CHROME_PATH` | Chrome 可执行文件路径 |
-| `ZO_REPORT_USER_NAME` | 本地模式登录用户名 |
-| `ZO_REPORT_USER_PASSWORD` | 本地模式登录密码 |
-| `ZO_REPORT_USER_EMAIL` | 远程模式登录邮箱 |
-| `ZO_SCHEDULER_MAX_RETRIES` | 最大重试次数（<=0 无限重试） |
-| `ZO_REPORT_SCHEDULER_TIMEOUT` | Report 执行超时（秒） |
-| `ZO_CHROME_SLEEP_SECS` | 等待页面数据加载超时 |
-| `ZO_SHORT_URL_RETENTION_DAYS` | 短链接保留天数 |
+| 配置项 | 作用 | 默认值 | 代码位置 |
+|--------|------|--------|----------|
+| `ZO_REPORT_SERVER_URL` | 非空则启用远程模式 | 空 | - |
+| `ZO_CHROME_ENABLED` | 本地模式必需 | - | - |
+| `ZO_CHROME_PATH` | Chrome 可执行文件路径 | - | - |
+| `ZO_REPORT_USER_NAME` | 本地模式登录用户名 | - | - |
+| `ZO_REPORT_USER_PASSWORD` | 本地模式登录密码 | - | - |
+| `ZO_REPORT_USER_EMAIL` | 远程模式登录邮箱 | - | - |
+| `ZO_SCHEDULER_MAX_RETRIES` | 最大重试次数（<=0 无限重试） | 3 | `src/config/src/config.rs:1681` |
+| `ZO_REPORT_SCHEDULE_TIMEOUT` | Report 执行超时（秒） | 300 | `src/config/src/config.rs:1677` |
+| `ZO_CHROME_SLEEP_SECS` | 等待页面数据加载超时 | - | - |
+| `ZO_SHORT_URL_RETENTION_DAYS` | 短链接保留天数 | - | - |
