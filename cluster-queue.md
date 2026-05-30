@@ -1046,3 +1046,386 @@ loop {
 | **NATS JetStream** | 消息可靠投递 | 仅负责传输存储，不关心业务处理结果 |
 | **心跳机制** | 维持节点在线状态 | 影响哈希环和消费者状态，但不直接处理消息 |
 | **业务代码** | ACK 策略决策 | 最终决定消息是确认丢弃还是等待重投 |
+
+## 12. 最小验证步骤（基于代码实现）
+
+本章节提供可操作的验证步骤，用于验证 `ack_wait`、`max_deliver` 等默认参数的实际行为。
+
+### 12.1 验证前置条件
+
+**环境准备**：
+1. 启动 NATS 服务器（版本 >= 2.8.0）
+2. 安装 NATS CLI 工具（用于查询消费者信息）
+3. 启动 OpenObserve 单个节点（All 角色）
+
+**工具安装**（可选）：
+```bash
+# 安装 NATS CLI
+curl -sfL https://install.nats.io | sh
+```
+
+---
+
+### 12.2 验证一：Consumer 默认参数查询
+
+**验证目标**：确认 OpenObserve 创建的消费者实际参数值。
+
+**代码依据**：
+- `src/infra/src/queue/nats.rs:144-153` - 消费者配置使用 `Default::default()`
+
+#### 验证步骤
+
+**步骤 1：触发消费者创建**
+
+1. 启动 OpenObserve 后，执行任意元数据操作（如创建一个 Stream）
+2. 这将触发 Coordinator Events 队列的消费者创建
+
+**步骤 2：使用 NATS CLI 查询消费者信息**
+
+```bash
+# 列出所有 Stream
+nats stream list
+
+# 查看特定 Stream 的消费者列表
+nats consumer list <stream-name>
+
+# 查看消费者详细配置（验证默认参数）
+nats consumer info <stream-name> <consumer-name>
+```
+
+**预期输出**（关键字段）：
+```
+Information for Consumer <stream-name> > <consumer-name> created ...
+
+Configuration:
+
+         Durable Name: <consumer-name>
+          Description: 
+             Deliver: all
+         Ack Policy: explicit
+           Ack Wait: 30s                   # ⚠️ 验证：默认 30 秒
+      Max Deliveries: -1                    # ⚠️ 验证：-1 表示无限重投
+     Max Ack Pending: 1000                   # ⚠️ 验证：默认 1000
+           Replay: instant
+```
+
+**验证要点**：
+| 参数 | 预期值 | 代码依据 |
+|------|-------|---------|
+| `ack_wait` | 30s | NATS 默认值，代码未配置 |
+| `max_deliver` | -1 | NATS 默认值，代码未配置 |
+| `max_ack_pending` | 1000 | NATS 默认值，代码未配置 |
+| `ack_policy` | explicit | NATS 默认值 |
+
+---
+
+### 12.3 验证二：ack_wait = 30s 超时重投
+
+**验证目标**：验证消息在 30 秒未 ACK 后触发重投。
+
+**代码依据**：
+- `src/infra/src/coordinator/events.rs:178-186` - 反序列化失败时不 ACK，触发重投
+
+#### 验证步骤
+
+**步骤 1：准备测试环境**
+
+修改 `src/infra/src/coordinator/events.rs`，添加测试逻辑（验证后需回滚）：
+
+```rust
+// 在反序列化成功后，添加延迟逻辑用于测试
+let event: CoordinatorEvent = match serde_json::from_slice(&message.payload) {
+    Ok(event) => {
+        // ⚠️ 测试用：延迟 35 秒（超过 ack_wait 30s）再 ACK
+        tokio::time::sleep(tokio::time::Duration::from_secs(35)).await;
+        event
+    }
+    Err(e) => {
+        log::error!("[COORDINATOR::EVENTS] failed to deserialize: {e}");
+        continue;
+    }
+};
+```
+
+**步骤 2：观察重投现象**
+
+1. 编译并启动 OpenObserve
+2. 触发一个 Coordinator 事件（如创建 Stream）
+3. 观察日志输出
+
+**预期现象**：
+- T=0s: 收到消息，开始处理
+- T=30s: NATS 触发重投（消息再次被投递）
+- T=35s: 第一次处理完成，发送 ACK
+- **结果**：同一条消息被处理了两次
+
+**日志验证**：
+```
+# 第一次接收
+INFO [COORDINATOR::EVENTS] received event, seq=12345
+
+# 30 秒后重投
+INFO [COORDINATOR::EVENTS] received event, seq=12345  # 相同 seq 号！
+
+# 35 秒时第一次处理完成 ACK
+INFO [COORDINATOR::EVENTS] processed event successfully
+```
+
+> **说明**：相同 `seq` 号的消息出现两次，证明 ack_wait 超时触发了重投。
+
+---
+
+### 12.4 验证三：max_deliver = -1 无限重投
+
+**验证目标**：验证消息会无限重投，不会因次数过多而停止。
+
+**代码依据**：
+- `src/infra/src/queue/nats.rs:152` - 使用 `Default::default()`，`max_deliver = -1`
+
+#### 验证步骤
+
+**步骤 1：准备测试环境**
+
+修改 `src/infra/src/coordinator/events.rs`，模拟持续失败场景（验证后需回滚）：
+
+```rust
+loop {
+    match receiver.recv().await {
+        Some(message) => {
+            // ⚠️ 测试用：永远不 ACK，观察重投行为
+            log::error!("[TEST] received message but NOT acking, will redeliver");
+            // 不调用 message.ack().await
+            continue;
+        }
+        None => break,
+    }
+}
+```
+
+**步骤 2：观察持续重投**
+
+1. 编译并启动 OpenObserve
+2. 发布一条测试消息到队列
+3. 观察日志至少 5 分钟
+
+**预期现象**：
+- 每 30 秒（ack_wait 默认值）收到同一条消息
+- 重投持续进行，无停止迹象
+- `num_redelivered` 计数器持续增加
+
+**验证命令**：
+```bash
+# 实时查看消费者统计
+watch -n 10 'nats consumer info <stream-name> <consumer-name> | grep -A5 "Delivered"'
+```
+
+**预期统计变化**：
+```
+# T=0s
+  Messages Delivered: 1
+     Num Redelivered: 0
+
+# T=30s
+  Messages Delivered: 2
+     Num Redelivered: 1
+
+# T=60s
+  Messages Delivered: 3
+     Num Redelivered: 2
+
+# ... 无限持续
+```
+
+> **关键结论**：`num_redelivered` 持续增加，没有上限，证明 `max_deliver = -1` 生效。
+
+---
+
+### 12.5 验证四：两种 ACK 策略对比
+
+**验证目标**：对比"失败不 ACK"和"失败主动 ACK"两种策略的行为差异。
+
+**代码依据**：
+- `src/infra/src/coordinator/events.rs:178-186` - 策略 A：失败不 ACK
+- `src/service/trial_quota.rs:439-442` - 策略 B：失败主动 ACK
+
+#### 验证步骤
+
+**测试策略 A：失败不 ACK**
+
+1. 发布一条格式错误的消息到 Coordinator Events 队列
+2. 观察反序列化失败后的行为
+
+**预期**：
+- 日志持续输出 `failed to deserialize` 错误
+- 每 30 秒重投一次
+- 消息永远留在队列中
+
+**测试策略 B：失败主动 ACK**
+
+1. 发布一条格式错误的消息到 Trial Quota HA 队列
+2. 观察反序列化失败后的行为
+
+**预期**：
+- 日志输出 `Failed to deserialize HA message` 一次
+- 消息被主动 ACK 后删除
+- **不会重投**，队列继续处理下一条消息
+
+**对比总结**：
+
+| 策略 | 反序列化失败行为 | 队列状态 | 数据一致性 | 可用性 |
+|------|---------------|---------|-----------|-------|
+| **不 ACK** | 无限重投 | 可能阻塞 | 保证不丢数据 | 低 |
+| **主动 ACK** | 丢弃消息 | 继续运行 | 可能丢数据 | 高 |
+
+---
+
+### 12.6 验证五：Stream max_age 清理机制
+
+**验证目标**：验证超过 `max_age` 的消息被 Stream 自动清理。
+
+**代码依据**：
+- `src/infra/src/queue/nats.rs:92-111` - Stream 配置 max_age
+- `src/config/src/config.rs:2102` - 默认 60 天
+
+#### 验证步骤
+
+**步骤 1：临时修改配置加速验证**
+
+修改 `src/config/src/config.rs:2102`（验证后需回滚）：
+
+```rust
+// 原代码：默认 60 天
+#[env_config(name = "ZO_NATS_QUEUE_MAX_AGE", default = 60)]
+pub queue_max_age: u64,
+
+// 修改为：测试用 60 秒（注意：这是天为单位？需要看代码！）
+// 实际上代码中：max(1, max_age) * 24 * 60 * 60
+// 所以最小是 1 天，测试时需要改为秒级配置
+```
+
+**或者使用环境变量启动**：
+
+注意：查看代码 `src/infra/src/queue/nats.rs:95-96`：
+```rust
+let max_age = config::get_config().nats.queue_max_age; // days
+std::time::Duration::from_secs(max(1, max_age) * 24 * 60 * 60) // seconds
+```
+
+> **重要**：当前代码强制 `max_age >= 1 天`，无法设置更短时间。如需秒级测试，需临时修改代码。
+
+**步骤 2（可选）：修改代码支持秒级测试**
+
+临时修改 `src/infra/src/queue/nats.rs:95-96`：
+
+```rust
+// ⚠️ 测试用：直接使用秒数，验证后改回
+let max_age = 60; // 测试：60 秒
+std::time::Duration::from_secs(max_age)
+```
+
+**步骤 3：验证清理行为**
+
+1. 发布测试消息到队列
+2. 不消费消息（或消费但不 ACK）
+3. 等待超过 max_age 时间
+4. 检查 Stream 中的消息
+
+**验证命令**：
+```bash
+# 查看 Stream 状态
+nats stream info <stream-name>
+
+# 查看消息数量
+nats stream info <stream-name> | grep "Messages:"
+```
+
+**预期现象**：
+- T=0s: 发布消息，`Messages: 1`
+- T=max_age 后: 消息被清理，`Messages: 0`
+
+> **说明**：这是最后的安全网机制，不应该依赖此清理业务消息。
+
+---
+
+### 12.7 验证六：节点离线后的重投转移
+
+**验证目标**：验证消费者节点离线后，未 ACK 消息转移到其他节点。
+
+**代码依据**：
+- `src/super_cluster_queue/mod.rs:139-150` - 仅 Compactor 节点消费
+- NATS JetStream 自动重平衡机制
+
+#### 验证步骤
+
+**环境准备**：
+1. 启动至少 2 个 Compactor 角色节点
+2. 两个节点都加入超级集群队列消费
+
+**步骤 1：发布测试消息**
+
+```bash
+# 发布一条需要长时间处理的消息
+nats pub <super-cluster-topic> '{"test": "long-running-task"}'
+```
+
+**步骤 2：模拟节点离线**
+
+1. 观察哪个节点收到了消息（查看日志）
+2. 在处理完成前，强制终止该节点进程（模拟崩溃）
+
+**步骤 3：观察重投转移**
+
+**预期现象**：
+- 节点 A 接收消息开始处理
+- 节点 A 被强制终止
+- 等待 ack_wait（30 秒）超时
+- **节点 B 接收到同一条消息**并继续处理
+
+**验证日志**：
+```
+# 节点 A 日志（崩溃前）
+INFO [SUPER_CLUSTER:sync] received message seq=999
+
+# 30 秒后，节点 B 日志
+INFO [SUPER_CLUSTER:sync] received message seq=999  # 相同 seq！
+```
+
+> **关键结论**：NATS JetStream 自动检测消费者离线并重投消息到其他在线消费者。
+
+---
+
+### 12.8 验证汇总表
+
+| 验证项 | 预期结果 | 代码依据 | 验证方法 |
+|-------|---------|---------|---------|
+| **ack_wait 默认值** | 30 秒 | NATS 默认 | `nats consumer info` |
+| **max_deliver 默认值** | -1（无限） | NATS 默认 | `nats consumer info` |
+| **max_ack_pending 默认值** | 1000 | NATS 默认 | `nats consumer info` |
+| **ack_wait 超时重投** | 30 秒后重投 | NATS 机制 | 日志观察重复 seq |
+| **无限重投** | 永不停止 | `max_deliver=-1` | 观察 5+ 分钟重投 |
+| **策略 A（不 ACK）** | 无限重投 | `coordinator/events.rs` | 发布坏消息观察 |
+| **策略 B（主动 ACK）** | 丢弃不重投 | `trial_quota.rs` | 发布坏消息观察 |
+| **Stream 清理** | max_age 后删除 | `queue/nats.rs:95` | 等待后检查消息数 |
+| **节点离线转移** | 重投到其他节点 | NATS 机制 | 强制终止节点观察 |
+
+---
+
+### 12.9 验证后注意事项
+
+1. **回滚测试代码**：所有为验证添加的测试逻辑都需要回滚，避免影响生产环境
+2. **清理测试数据**：验证完成后清理测试消息和临时 Stream
+3. **恢复配置**：如果修改了 max_age 等配置，记得恢复默认值
+4. **文档记录**：将验证结果和现象记录到运维文档中
+
+---
+
+### 12.10 生产环境监控建议
+
+基于上述验证结论，建议在生产环境中监控以下指标：
+
+| 监控指标 | 阈值建议 | 说明 |
+|---------|---------|------|
+| `num_redelivered` | > 100 告警 | 持续重投表明有消费卡住 |
+| `num_ack_pending` | > 800 告警 | 接近流控上限 1000 |
+| 队列消息堆积 | > 10000 告警 | 消费速度跟不上生产 |
+| 坏消息日志 | 每分钟 > 10 条告警 | 大量反序列化失败需关注 |
