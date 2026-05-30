@@ -548,9 +548,9 @@ if let Some(node_name) = cluster::get_node_from_consistent_hash(
 
 ## 10. 确认回执失败完整流程
 
-### 10.1 消费者配置与默认值分析
+### 10.1 消费者配置与默认值分析（基于 NATS 官方文档 + async-nats 0.47.0 源码验证）
 
-**关键发现：所有重投相关参数使用 NATS 默认值** (`src/infra/src/queue/nats.rs:144-153`)
+**关键发现：所有重投相关参数使用 NATS 服务器默认值** (`src/infra/src/queue/nats.rs:144-153`)
 
 ```rust
 let config = jetstream::consumer::pull::Config {
@@ -561,20 +561,108 @@ let config = jetstream::consumer::pull::Config {
         None
     },
     deliver_policy: get_deliver_policy(deliver_policy),
-    ..Default::default()  // ⚠️ 所有其他参数使用 NATS 默认值！
+    ..Default::default()  // ⚠️ 所有其他参数使用 async-nats 0.47.0 的 Default::default()
 };
 ```
 
-**真实配置状态**：
+**NATS JetStream 官方默认值验证**（来源：[NATS 官方文档](https://docs.nats.io/nats-concepts/jetstream/consumers#configuration) + async-nats 0.47.0 源码）：
 
 | 参数 | 配置状态 | NATS 默认值 | 行为 |
-|------|---------|------------|------|
-| `ack_wait` | 未配置 | 30秒 | 消息 30 秒未 ACK 则重投 |
-| `max_deliver` | 未配置 | -1（无限） | **消息无限重投，永不丢弃** |
-| `max_ack_pending` | 未配置 | 1024 | 最多 1024 条待 ACK 消息 |
-| 死信队列 | 未配置 | 无 | **没有死信队列机制** |
+|------|---------|-----------|------|
+| `ack_wait` | 未配置 | **30秒** | 消息 30 秒未 ACK 则触发重投 |
+| `max_deliver` | 未配置 | **-1（无限）** | **消息无限重投，永不丢弃** |
+| `ack_policy` | 未配置 | **AckPolicy::Explicit** | 必须显式 ACK 每条消息 |
+| `max_ack_pending` | 未配置 | **1000** | 最多 1000 条待 ACK 消息（流控） |
+| 死信队列 | 未配置 | **无** | **NATS 原生无死信队列机制** |
+| `inactive_threshold` | 未配置 | **0（永不清理）** | 消费者永久保留（持久化时） |
 
-> ⚠️ **重要修正**：之前关于"重投上限"和"死信队列"的描述是错误的。OpenObserve 代码中**没有配置重投次数限制**，也**没有死信队列**。失败的消息会被**无限次重投**。
+> ⚠️ **重要修正**：OpenObserve 代码中**没有配置重投次数限制**（`max_deliver` 保持默认 -1），也**没有实现死信队列**。失败的消息会被**无限次重投**，除非业务代码主动 ACK 或消息被 Stream 清理。
+>
+> **NATS 服务器行为说明**：即使 `max_deliver` 设置为有限次数，消息达到最大投递次数后**仍然留在 Stream 中**，只是不再投递给该消费者。这与传统"死信队列"概念不同。
+
+### 10.1.1 结束重投的真实条件
+
+**基于代码分析：消息停止重投只有三种可能**（OpenObserve 未配置 `max_deliver` 限制）：
+
+| 结束条件 | 触发方式 | 代码证据位置 | 说明 |
+|---------|---------|------------|------|
+| **业务代码主动 ACK** | 消费成功后调用 `message.ack()` | 多处，如 `src/infra/src/coordinator/events.rs:204` | 正常路径，NATS 服务器删除消息 |
+| **业务代码主动 ACK（丢弃）** | 即使处理失败也调用 `message.ack()` | `src/service/trial_quota.rs:439-442` | 保护性丢弃，防止坏消息阻塞队列 |
+| **Stream 保留策略清理** | 消息超过 `max_age` 或 `max_bytes` | `src/infra/src/queue/nats.rs:92-111` | 被 Stream 整体清理，非消费端控制 |
+
+**详细代码分析**：
+
+1. **正常结束：业务 ACK**
+   - 消费成功 → 调用 `msg.ack().await` → NATS 服务器删除消息
+   - 典型实现：`src/infra/src/coordinator/events.rs:204`
+   ```rust
+   // 处理成功后才 ACK
+   tx.send(event).await?;
+   message.ack().await?;
+   ```
+
+2. **保护性结束：主动丢弃坏消息**
+   - 场景：反序列化失败、格式错误等无法恢复的错误
+   - 实现位置：`src/service/trial_quota.rs:439-442`
+   ```rust
+   let ha_msg: TrialQuotaHaMsg = match json::from_slice(payload) {
+       Ok(m) => m,
+       Err(e) => {
+           log::error!("[TRIAL_QUOTA] Failed to deserialize HA message: {e}");
+           if let Err(e) = msg.ack().await {  // ✅ 主动 ACK 丢弃
+               log::error!("[TRIAL_QUOTA] Failed to ack HA message: {e}");
+           }
+           continue;
+       }
+   };
+   ```
+   - 设计权衡：可能丢失数据，但保证队列可用性
+
+3. **被动结束：Stream 保留策略清理**
+   - 配置位置：`src/infra/src/queue/nats.rs:92-111`
+   - 默认 `max_age = 60 天`（`ZO_NATS_QUEUE_MAX_AGE`，`src/config/src/config.rs:2102`）
+   - 消息在 Stream 中存活超过 60 天后被自动清理
+   - 这是**最后的安全网**，业务逻辑不应该依赖此机制
+
+> ⚠️ **关键结论**：
+> 1. **没有"超过重投次数自动丢弃"的机制**！OpenObserve 使用 NATS 默认值 `max_deliver = -1`，意味着只要消息还在 Stream 中，就会一直尝试重投。
+> 2. **没有死信队列（DLQ）机制**！NATS 原生不支持 DLQ，OpenObserve 也未实现。
+> 3. **max_deliver 的真实含义**：即使配置了有限次数，达到次数后消息**仍然留在 Stream 中**，只是不再投递给该消费者，而非被删除。
+
+### 10.1.2 关于 `max_deliver` 参数的深入说明
+
+**重要概念澄清**：`max_deliver` 参数经常被误解为"最大投递次数，超过则丢弃"，但这是不准确的。
+
+**NATS 官方定义**（来源：[NATS 官方文档](https://docs.nats.io/nats-concepts/jetstream/consumers#configuration)）：
+
+> **MaxDeliver**: The maximum number of times a specific message delivery will be attempted. Applies to any message that is re-sent due to acknowledgment policy (i.e., due to a negative acknowledgment or no acknowledgment sent by the client). **The default is -1 (redeliver until acknowledged)**. **Messages that have reached the maximum delivery count will stay in the stream**.
+
+**关键理解**：
+
+| 误解 | 事实 |
+|-----|------|
+| "达到 max_deliver 后消息被删除" | ❌ 错误 |
+| "达到 max_deliver 后进入死信队列" | ❌ 错误 |
+| "达到 max_deliver 后不再投递给该消费者" | ✅ 正确 |
+| "达到 max_deliver 后消息仍保留在 Stream 中" | ✅ 正确 |
+
+**OpenObserve 中的实际情况**：
+
+```rust
+// src/infra/src/queue/nats.rs:144-153
+let config = jetstream::consumer::pull::Config {
+    name: Some(consumer_name.to_string()),
+    durable_name: if is_durable {
+        Some(consumer_name.to_string())
+    } else {
+        None
+    },
+    deliver_policy: get_deliver_policy(deliver_policy),
+    ..Default::default()  // max_deliver = -1（NATS 默认）
+};
+```
+
+**结论**：由于 `max_deliver = -1`（默认值），OpenObserve 中的消息**永远不会因为投递次数过多而停止重投**。
 
 ### 10.2 两种不同的 ACK 策略对比
 
@@ -890,14 +978,15 @@ loop {
 
 ## 11. 总结：关键发现与修正
 
-### 11.1 核心修正（基于真实代码分析）
+### 11.1 核心修正（基于 NATS 官方文档 + 真实代码分析）
 
 | 之前的错误结论 | 真实代码行为 | 证据位置 |
 |---------------|-------------|---------|
-| 重投有上限配置 | **无重投上限，无限重投** | `src/infra/src/queue/nats.rs:152` 使用 `Default::default()` |
-| 有死信队列机制 | **无死信队列** | 代码中无任何 DLQ 配置 |
-| 超过次数丢弃消息 | **永不丢弃，直到成功或过期** | NATS 默认 `max_deliver = -1` |
-| ack_wait 可配置 | **固定 30 秒** | 使用 NATS 默认值 |
+| 重投有上限配置 | **无重投上限，无限重投** | `src/infra/src/queue/nats.rs:152` 使用 `Default::default()`，NATS 默认 `max_deliver = -1` |
+| 有死信队列机制 | **无死信队列** | NATS 原生不支持 DLQ，OpenObserve 也未实现 |
+| 超过次数丢弃消息 | **永不丢弃，直到成功或被 Stream 清理** | `max_deliver = -1` 无限重投，`max_age = 60` 天（`ZO_NATS_QUEUE_MAX_AGE`） |
+| ack_wait 可配置 | **固定 30 秒（NATS 默认）** | 代码中未配置，使用 NATS 服务器默认值 |
+| max_ack_pending = 1024 | **max_ack_pending = 1000** | NATS 官方文档确认默认值为 1000 |
 
 ### 11.2 两种 ACK 策略的权衡
 
