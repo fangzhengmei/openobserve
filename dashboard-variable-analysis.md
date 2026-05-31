@@ -1101,3 +1101,600 @@ loadData() 被调用
 | **面板级缓存** | IndexedDB 按面板存储 + 标准化缓存键 | 快速恢复仪表盘状态，减少重复请求 |
 | **面板级刷新** | commitScope + currentVariablesDataRef 覆盖 | 细粒度控制刷新范围，不影响其他面板 |
 | **空值级联传播** | 父变量空值递归置空子变量，不发 API | 减少无效请求，避免子变量加载无意义数据 |
+
+---
+
+## 12. 深度分析：SQL 动态过滤器注入是否按 stream 过滤
+
+### 12.1 数据结构：动态过滤器的 streams 属性
+
+每个动态过滤器条目包含 `streams` 数组字段，理论上用于标识该过滤器适用于哪些 stream：
+
+**数据创建** (`VariableAdHocValueSelector.vue:94-103`):
+```typescript
+const addFields = () => {
+  const adhocVariablesTemp = adhocVariables.value;
+  adhocVariablesTemp.push({
+    name: "",
+    operator: operatorOptions[0],  // 默认 "="
+    value: "",
+    streams: [],                    // ← 预留了 streams 字段
+  });
+  emitValue();
+};
+```
+
+单个动态过滤器的完整数据结构：
+```typescript
+{
+  name: "host",          // 字段名
+  operator: "=",         // 操作符（=, != 等）
+  value: "server-01",    // 过滤值
+  streams: [],           // 理论上应关联的 stream 列表，当前始终为空数组
+}
+```
+
+**UI 提供的操作符** (`VariableAdHocValueSelector.vue:84`):
+```typescript
+const operatorOptions = ["=", "!="];
+```
+仅支持 `=` 和 `!=` 两种操作符。
+
+### 12.2 SQL 动态过滤器注入的关键代码
+
+**applyDynamicVariables** (`usePanelVariableSubstitution.ts:674-724`):
+```typescript
+const applyDynamicVariables = async (query: any, queryType: any) => {
+  const adHocVariables = variablesData.value?.values
+    ?.filter((it: any) => it.type === "dynamic_filters")
+    ?.map((it: any) => it?.value)
+    .flat()
+    ?.filter((it: any) => it?.operator && it?.name && it?.value);
+
+  if (!adHocVariables?.length) {
+    return { query, metadata };
+  }
+
+  if (queryType === "sql") {
+    const queryStream = await getStreamFromQuery(query);  // ← 已提取 stream
+
+    const applicableAdHocVariables = adHocVariables;
+    // ⚠️ 以下 stream 过滤逻辑已被注释掉！
+    // .filter((it: any) => {
+    //   return it?.streams?.find((it: any) => it.name == queryStream);
+    // });
+
+    applicableAdHocVariables.forEach((variable: any) => {
+      metadata.push({
+        type: "dynamicVariable",
+        name: variable.name,
+        value: variable.value,
+        operator: variable.operator,
+      });
+    });
+    query = await addLabelsToSQlQuery(query, applicableAdHocVariables);
+  }
+};
+```
+
+### 12.3 关键发现：stream 过滤被禁用
+
+代码中**已经提取了查询的 stream 名称**（`getStreamFromQuery(query)`），但紧接着的 `.filter()` 调用被注释掉了：
+
+```typescript
+const queryStream = await getStreamFromQuery(query);   // ✅ 执行了 stream 提取
+
+const applicableAdHocVariables = adHocVariables;
+// .filter((it: any) => {                               // ❌ 过滤被注释掉
+//   return it?.streams?.find((it: any) => it.name == queryStream);
+// });
+```
+
+这意味着：**当前所有动态过滤器会无条件应用到所有 SQL 查询，不区分 stream。**
+
+### 12.4 对比：PromQL 的处理方式
+
+PromQL 的动态过滤器同样**不做 stream 过滤**：
+
+```typescript
+if (queryType === "promql") {
+  adHocVariables.forEach((variable: any) => {
+    query = addLabelToPromQlQuery(
+      query,
+      variable.name,
+      variable.value,
+      variable.operator,
+    );
+  });
+}
+```
+
+PromQL 没有 stream 概念，所有 label 直接注入到查询表达式中。
+
+### 12.5 SQL 注入的具体方式
+
+**addLabelsToSQlQuery** (`sqlUtils.ts:35-87`) 使用 AST 级别的 WHERE 子句注入：
+
+```typescript
+export const addLabelsToSQlQuery = async (originalQuery, labels) => {
+  // 步骤1: 构建一个包含所有动态过滤条件的 dummy 查询
+  let dummyQuery = "select * from 'default'";
+  for (let i = 0; i < labels.length; i++) {
+    dummyQuery = await addLabelToSQlQuery(
+      dummyQuery,
+      labels[i].name,
+      labels[i].value,
+      labels[i].operator,
+    );
+  }
+
+  // 步骤2: 解析原始查询和 dummy 查询的 AST
+  const astOfOriginalQuery = parser.astify(originalQuery);
+  const astOfDummy = parser.astify(dummyQuery);
+
+  // 步骤3: 合并 WHERE 子句
+  if (astOfOriginalQuery.where) {
+    // 原查询有 WHERE → AND 连接
+    const newWhereClause = {
+      type: "binary_expr",
+      operator: "AND",
+      left: { ...astOfOriginalQuery.where, parentheses: true },
+      right: { ...astOfDummy.where, parentheses: true },
+    };
+  } else {
+    // 原查询无 WHERE → 直接使用 dummy 的 WHERE
+  }
+};
+```
+
+**注入示例**：
+
+```
+原始查询: SELECT host, count(*) FROM "logs" WHERE level='error'
+动态过滤器: [{ name: "host", operator: "=", value: "server-01" }]
+
+注入结果:
+SELECT host, count(*) FROM "logs" WHERE (level='error') AND (host = 'server-01')
+```
+
+### 12.6 不按 stream 过滤的影响分析
+
+| 影响维度 | 具体表现 |
+|---------|---------|
+| **正确性** | 当不同 stream 有同名字段但语义不同时，可能注入不相关的过滤条件，导致查询报错或返回空结果 |
+| **性能** | 对不包含该字段的 stream 查询注入过滤条件，可能导致后端报错（字段不存在）或无效的全文扫描 |
+| **多 stream 面板** | 一个面板的多个查询可能引用不同 stream，所有查询都会被注入相同的动态过滤器 |
+| **JOIN 查询** | 动态过滤条件注入时**不指定表别名**（`table: null`），在 JOIN 查询中可能产生歧义 |
+| **字段不存在** | 如果 stream 中没有动态过滤器指定的字段名，SQL 执行可能报错 |
+
+**JOIN 查询中的歧义示例**：
+```
+原始查询:
+  SELECT a.host, b.status FROM "stream_a" a JOIN "stream_b" b ON a.id = b.id
+
+动态过滤器: { name: "host", operator: "=", value: "server-01" }
+
+注入结果:
+  SELECT a.host, b.status FROM "stream_a" a JOIN "stream_b" b
+    ON a.id = b.id AND host = 'server-01'
+    -- ❌ host 未指定表别名，数据库无法确定是 a.host 还是 b.host
+```
+
+### 12.7 stream 过滤被禁用的原因推测
+
+1. **streams 数组始终为空**：`VariableAdHocValueSelector` 创建新条目时 `streams: []`，没有任何 UI 或逻辑来填充此字段
+2. **过度过滤的风险**：如果启用 stream 过滤但 streams 为空，所有动态过滤器都会被过滤掉，导致功能完全失效
+3. **简化实现**：当前实现选择"全部应用"而非"按 stream 精确匹配"，降低了实现复杂度
+
+### 12.8 getStreamFromQuery 的 stream 提取逻辑
+
+该函数虽然被调用了，但提取结果未被使用，仅做了一次无效计算：
+
+**getStreamFromQuery** (`sqlUtils.ts:261-270`):
+```typescript
+export const getStreamFromQuery = async (query: any) => {
+  await importSqlParser();
+  try {
+    const ast: any = parser.astify(query);
+    return ast?.from[0]?.table || "";  // 取第一个 FROM 表名
+  } catch (e: any) {
+    return "";
+  }
+};
+```
+
+**局限性**：只取 `from[0].table`，对于 UNION、子查询、WITH 子句等复杂 SQL 仅返回第一个表名。
+
+---
+
+## 13. 深度分析：同名变量替换结果的确定机制——完整证据链
+
+### 13.1 证据链概览
+
+同名变量的最终替换结果由**三层机制**共同决定：
+
+```
+第一层：变量命名规范
+  → 限制同名变量能否被创建
+
+第二层：变量合并顺序
+  → 决定同名变量进入替换函数时的数组位置
+
+第三层：替换遍历顺序
+  → 决定最终生效的值（后替换覆盖先替换）
+```
+
+### 13.2 第一层：变量命名规范与同名限制
+
+#### 13.2.1 配置层面：同一 variablesConfig.list 中不允许同名
+
+**addVariable 函数** (`commons.ts:343-381`):
+```typescript
+export const addVariable = async (store, dashboardId, variableData, folderId) => {
+  const currentDashboard = await getDashboard(store, dashboardId, folderId);
+
+  const variableExists = currentDashboard.variables.list.filter(
+    (it) => it.name == variableData.name,
+  );
+
+  if (variableExists.length) {
+    throw new Error("Variable with same name already exists");  // ← 抛出异常
+  }
+
+  currentDashboard.variables.list.push(variableData);
+  return await updateDashboard(...);
+};
+```
+
+**单元测试验证** (`commons.spec.ts:811-828`):
+```typescript
+it("should throw error when variable with same name exists", async () => {
+  const variableData = { name: "var1", type: "query", query: "SELECT 2" };
+  const mockDashboard = {
+    variables: {
+      showDynamicFilters: false,
+      list: [{ name: "var1", type: "query", query: "SELECT 1" }],
+    },
+  };
+
+  await expect(
+    addVariable(mockStore, dashboardId, variableData, folderId)
+  ).rejects.toThrow("Variable with same name already exists");
+});
+```
+
+**AddPanel 模式下的客户端校验** (`AddSettingVariable.vue:1516-1527`):
+```typescript
+if (props.isFromAddPanel && props.dashboardVariablesList) {
+  const isDuplicate = props.dashboardVariablesList.some(
+    (v) => v.name === variableData.name && v.name !== props.variableName,
+  );
+  if (isDuplicate) {
+    showErrorNotification(`Variable with same name already exists.`);
+    return false;
+  }
+}
+```
+
+#### 13.2.2 运行时：展开后可产生同名变量实例
+
+虽然 `variablesConfig.list` 中不允许同名，但**展开后**同一变量名可出现在多个作用域：
+
+**expandVariablesForScopes** (`useVariablesManager.ts:82-176`):
+```
+变量配置: { name: "region", scope: "global" }
+  → 展开: [{ name: "region", scope: "global" }]           // 1个实例
+
+变量配置: { name: "region", scope: "tabs", tabs: ["tab1", "tab2"] }
+  → 展开: [
+      { name: "region", scope: "tabs", tabId: "tab1" },   // 实例1
+      { name: "region", scope: "tabs", tabId: "tab2" },   // 实例2
+    ]
+
+变量配置: { name: "region", scope: "panels", panels: ["panel1"] }
+  → 展开: [{ name: "region", scope: "panels", panelId: "panel1" }]
+```
+
+**关键点**：如果配置了两个不同变量都叫 `region`（一个 global，一个 tabs），这在配置层面**不会**被阻止（因为它们是不同的变量配置项，只是恰好同名）。但这种情况在正常使用中很少见，因为 `addVariable` 检查的是整个 list 中的 name 唯一性。
+
+**更常见的情况**：同一个变量因作用域展开而出现在合并数组中。例如 `region` 变量配置为 `scope: "global"`，但面板查询时通过 `getCommittedVariablesForPanel` 合并时，global 实例和 tab 实例（如果存在同名 tab 变量）会同时出现在合并数组中。
+
+#### 13.2.3 变量标识键（getVariableKey）
+
+运行时使用 `getVariableKey` 唯一标识每个变量实例：
+
+```typescript
+export const getVariableKey = (name, scope, tabId?, panelId?) => {
+  if (scope === "global")   return `${name}@global`;
+  if (scope === "tabs")     return `${name}@tab@${tabId}`;
+  if (scope === "panels")   return `${name}@panel@${panelId}`;
+};
+```
+
+示例：
+- `region@global` — 全局的 region 变量
+- `region@tab@tab1` — tab1 的 region 变量
+- `region@panel@panel1` — panel1 的 region 变量
+
+这三个是**完全独立的运行时实例**，但拥有相同的 `name` 属性。
+
+### 13.3 第二层：变量合并顺序
+
+#### 13.3.1 getCommittedVariablesForPanel 的合并
+
+**代码** (`useVariablesManager.ts:835-848`):
+```typescript
+const getCommittedVariablesForPanel = (panelId, tabId) => {
+  const merged = [
+    ...committedVariablesData.global,                              // 位置: 最前
+    ...(committedVariablesData.tabs[tabId] || []),                 // 位置: 中间
+    ...(committedVariablesData.panels[panelId] || []),             // 位置: 最后
+  ];
+  return merged;
+};
+```
+
+**合并顺序**：`global → tab → panel`
+
+当存在同名变量时，合并数组中会出现多个 `name` 相同但 `value` 不同的元素：
+
+```
+合并结果示例（假设存在同名变量 region）：
+[
+  { name: "env",     value: "prod",   scope: "global" },
+  { name: "region",  value: "us",     scope: "global" },    // global region
+  { name: "region",  value: "eu",     scope: "tabs" },      // tab region（覆盖 global）
+  { name: "host",    value: "srv1",   scope: "panels" },
+  { name: "region",  value: "ap",     scope: "panels" },    // panel region（覆盖 tab）
+]
+```
+
+#### 13.3.2 getVariablesForPanel 的 Live 状态合并
+
+**代码** (`useVariablesManager.ts:817-829`):
+```typescript
+const getVariablesForPanel = (panelId, tabId) => {
+  const merged = [
+    ...variablesData.global,
+    ...(variablesData.tabs[tabId] || []),
+    ...(variablesData.panels[panelId] || []),
+  ];
+  return merged;
+};
+```
+
+与 committed 版本完全相同的合并顺序。
+
+#### 13.3.3 resolvedVarLookup 的合并（VariablesValueSelector 内部）
+
+**代码** (`VariablesValueSelector.vue:247-266`):
+```typescript
+const resolvedVarLookup = computed(() => {
+  const lookup = {};
+  if (useManager && manager) {
+    // 1. 先填 global
+    (manager.variablesData.global || []).forEach((v) => {
+      lookup[v.name] = v.value;        // 写入
+    });
+    // 2. 再填 tab（覆盖同名 global）
+    if (props.tabId && manager.variablesData.tabs?.[props.tabId]) {
+      manager.variablesData.tabs[props.tabId].forEach((v) => {
+        lookup[v.name] = v.value;      // 覆盖
+      });
+    }
+    // 3. 最后填当前作用域（覆盖同名 global/tab）
+    variablesData.values.forEach((v) => {
+      lookup[v.name] = v.value;        // 最终覆盖
+    });
+  }
+  return lookup;
+});
+```
+
+**这里采用了 HashMap 语义**：同名 key 后赋值覆盖先赋值，天然实现 `panel > tab > global` 的优先级。
+
+### 13.4 第三层：替换遍历顺序
+
+#### 13.4.1 replaceQueryValue 的遍历
+
+**代码** (`usePanelVariableSubstitution.ts:547-666`):
+```typescript
+if (currentDependentVariablesData?.length) {
+  currentDependentVariablesData?.forEach((variable) => {
+    // 遍历合并后的变量数组
+    // 每个变量执行 11 种占位符替换
+    query = query.replaceAll(placeHolder, value);
+  });
+}
+```
+
+**关键机制**：`replaceAll` 是幂等操作。对于同名变量，**后遍历的变量会覆盖先遍历的结果**。
+
+**推理示例**：
+
+假设合并数组中有两个同名变量：
+```
+currentDependentVariablesData = [
+  { name: "region", value: "us" },     // global → 先遍历
+  { name: "region", value: "eu" },     // tab → 后遍历
+]
+```
+
+原始查询：`SELECT * FROM logs WHERE region = '$region'`
+
+```
+步骤1: 遍历 global region (value="us")
+  query = "SELECT * FROM logs WHERE region = 'us'"
+
+步骤2: 遍历 tab region (value="eu")
+  query = "SELECT * FROM logs WHERE region = 'eu'"   ← 覆盖
+
+最终结果: region = 'eu'  (tab 值生效)
+```
+
+#### 13.4.2 getDependentVariablesData 的变量提取
+
+**代码** (`usePanelVariableSubstitution.ts:87-98`):
+```typescript
+const getDependentVariablesData = () =>
+  variablesData.value?.values
+    ?.filter((it) => it.type != "dynamic_filters")  // 排除动态过滤器
+    ?.filter((it) => {
+      // 仅保留在面板查询中被引用的变量
+      const regexForVariable = new RegExp(
+        `(?:\\$\\{?\\s*${it.name}\\s*(?::\\s*(?:csv|pipe|doublequote|singlequote)\\s*)?\\}?)|(?:\\{\\{\\s*${it.name}\\s*(?::\\s*(?:csv|pipe|doublequote|singlequote)\\s*)?\\}\\})`,
+      );
+      return panelSchema.value.queries
+        ?.map((q) => regexForVariable.test(q?.query))
+        ?.includes(true);
+    });
+```
+
+此函数**不去重**。如果 `variablesData.values` 中有多个同名变量，且查询中引用了该变量名，则所有同名变量实例都会被保留。
+
+#### 13.4.3 面板特定覆盖的优先级
+
+面板刷新时，`currentVariablesDataRef[panelId]` 存储了面板特定的变量快照：
+
+**RenderDashboardCharts.vue 面板获取变量**：
+```typescript
+const getMergedVariablesForPanel = (panelId) => {
+  // 最高优先级：面板特定覆盖
+  if (currentVariablesDataRef.value?.[panelId]) {
+    return currentVariablesDataRef.value[panelId];
+  }
+  // 默认：全局提交状态
+  return currentVariablesDataRef.value.__global;
+};
+```
+
+面板特定覆盖已经是一个合并后的数组（global+tab+panel），不存在额外的同名问题。
+
+### 13.5 完整证据链：同名变量从配置到最终替换的全路径
+
+```
+[配置层]
+  variablesConfig.list 中不允许同名变量
+  → addVariable() 抛出 "Variable with same name already exists"
+  → 但同一变量可因 scope 展开而产生多实例
+
+      ↓ 展开后
+
+[运行时存储层]
+  variablesData.global  = [{ name: "region", value: "us", scope: "global" }]
+  variablesData.tabs["tab1"] = [{ name: "region", value: "eu", scope: "tabs" }]
+  variablesData.panels["p1"] = [{ name: "region", value: "ap", scope: "panels" }]
+
+      ↓ 合并时
+
+[合并层] getCommittedVariablesForPanel("p1", "tab1")
+  合并顺序: global → tab → panel
+  结果: [
+    { name: "region", value: "us" },   // [0] global
+    { name: "region", value: "eu" },   // [1] tab
+    { name: "region", value: "ap" },   // [2] panel
+  ]
+  ← 数组中三个同名变量，index 递增
+
+      ↓ 提取依赖变量时
+
+[依赖提取层] getDependentVariablesData()
+  不去重，三个同名变量全部保留
+  currentDependentVariablesData = [region:us, region:eu, region:ap]
+
+      ↓ 遍历替换时
+
+[替换层] replaceQueryValue()
+  forEach 顺序遍历:
+    第1次: $region → 'us'
+    第2次: $region → 'eu'    ← 覆盖
+    第3次: $region → 'ap'    ← 最终覆盖
+
+  最终结果: 'ap' (panel 值生效)
+
+      ↓ 同一机制在 VariablesValueSelector 中
+
+[变量解析层] resolvedVarLookup
+  HashMap 语义，后赋值覆盖先赋值:
+    lookup["region"] = "us"    // global
+    lookup["region"] = "eu"    // tab 覆盖
+    lookup["region"] = "ap"    // panel 最终覆盖
+
+  最终结果: "ap" (panel 值生效)
+```
+
+### 13.6 特殊场景分析
+
+#### 场景1：URL 全局变量对同名 Tab/Panel 变量的影响
+
+**loadFromUrl** (`useVariablesManager.ts:878-943`):
+```typescript
+if (parsed.scope === "global") {
+  // 设置 global 变量值
+  globalVar.value = parsedValue;
+  globalVar.isVariablePartialLoaded = true;
+
+  // 同步覆盖所有 tab 同名变量
+  Object.values(variablesData.tabs).forEach((tabVars) => {
+    const tabVar = tabVars.find((v) => v.name === parsed.name);
+    if (tabVar) {
+      tabVar.value = parsedValue;           // ← 直接覆盖 tab 值
+      tabVar.isVariablePartialLoaded = true;
+    }
+  });
+
+  // 同步覆盖所有 panel 同名变量
+  Object.values(variablesData.panels).forEach((panelVars) => {
+    const panelVar = panelVars.find((v) => v.name === parsed.name);
+    if (panelVar) {
+      panelVar.value = parsedValue;         // ← 直接覆盖 panel 值
+      panelVar.isVariablePartialLoaded = true;
+    }
+  });
+}
+```
+
+**效果**：URL 中的 `var-region=apac` 会将 global、所有 tab、所有 panel 中的 `region` 变量统一设为 `apac`。合并后虽然仍有三个实例，但值相同，替换结果不受遍历顺序影响。
+
+**设计意图**：下钻场景中，用户通过 URL 传递变量值，期望所有作用域统一使用该值。
+
+#### 场景2：dynamic_filters 不参与常规替换
+
+**代码** (`usePanelVariableSubstitution.ts:53, 89`):
+```typescript
+// 初始化时过滤
+.filter((it) => it.type != "dynamic_filters")
+
+// 获取时过滤
+const getDependentVariablesData = () =>
+  variablesData.value?.values
+    ?.filter((it) => it.type != "dynamic_filters")
+```
+
+动态过滤器不参与 `replaceQueryValue` 遍历，而是通过独立的 `applyDynamicVariables` 函数注入 WHERE 子句。因此即使 dynamic_filters 变量与常规变量同名，也不会产生替换冲突。
+
+#### 场景3：VariablesValueSelector 中的变量解析跳过 dynamic_filters
+
+**代码** (`VariablesValueSelector.vue:2058-2060`):
+```typescript
+for (const variable of variablesToResolve) {
+  // Skip dynamic_filters as they don't participate in standard variable replacement
+  if (variable.type === "dynamic_filters") continue;
+  // ...
+}
+```
+
+在 `resolveVariableValue`（用于解析 `query_values` 变量的 stream/field/filter 中的变量引用）时也跳过 `dynamic_filters`。
+
+### 13.7 同名变量优先级总结
+
+| 阶段 | 机制 | 优先级规则 | 代码位置 |
+|------|------|-----------|---------|
+| 配置 | `addVariable` 同名检查 | 同一 list 禁止同名 | `commons.ts:361-366` |
+| 合并 | `getCommittedVariablesForPanel` | global → tab → panel 数组拼接 | `useVariablesManager.ts:839-845` |
+| 解析(HashMap) | `resolvedVarLookup` | 后赋值覆盖（panel > tab > global） | `VariablesValueSelector.vue:247-266` |
+| 替换(遍历) | `replaceQueryValue` forEach | 后替换覆盖（panel > tab > global） | `usePanelVariableSubstitution.ts:547-666` |
+| URL恢复 | `loadFromUrl` global 级联 | 统一所有作用域同名变量值 | `useVariablesManager.ts:900-924` |
+| 面板刷新 | `currentVariablesDataRef[panelId]` | 面板特定覆盖最高优先级 | `RenderDashboardCharts.vue` |
+
+**核心结论**：两种不同实现（HashMap 和数组遍历）最终都实现了 `panel > tab > global` 的优先级，但实现方式不同——HashMap 依靠 key 覆盖语义，数组遍历依靠后替换覆盖前替换。这两种方式在**绝大多数情况**下结果一致，但在**极端场景**下（如 URL global 级联覆盖后 tab 值被修改）可能产生微妙差异。
