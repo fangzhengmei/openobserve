@@ -1698,3 +1698,389 @@ for (const variable of variablesToResolve) {
 | 面板刷新 | `currentVariablesDataRef[panelId]` | 面板特定覆盖最高优先级 | `RenderDashboardCharts.vue` |
 
 **核心结论**：两种不同实现（HashMap 和数组遍历）最终都实现了 `panel > tab > global` 的优先级，但实现方式不同——HashMap 依靠 key 覆盖语义，数组遍历依靠后替换覆盖前替换。这两种方式在**绝大多数情况**下结果一致，但在**极端场景**下（如 URL global 级联覆盖后 tab 值被修改）可能产生微妙差异。
+
+---
+
+## 14. 深度分析：前缀命名变量的子串错误替换风险
+
+### 14.1 问题本质
+
+当存在前缀命名的变量（如 `host` 和 `hostname`）时，`$var` 语法（无边界的美元符号简写）会产生子串错误替换问题。这是因为 `replaceAll` 使用精确字符串匹配，但 `$host` 是 `$hostname` 的前缀子串。
+
+### 14.2 三种变量语法的安全性对比
+
+| 语法形式 | 示例 | 边界明确性 | 子串替换风险 |
+|---------|------|-----------|------------|
+| `{{var}}` | `{{host}}` | ✅ 明确（双大括号包裹） | ❌ 无风险 |
+| `${var}` | `${host}` | ✅ 明确（大括号包裹） | ❌ 无风险 |
+| `$var` | `$host` | ❌ 不明确（仅前边界） | ⚠️ 高风险 |
+
+### 14.3 风险复现演示
+
+**测试场景**：两个变量 `host=server-01` 和 `hostname=prod-server`，查询中同时引用两者。
+
+#### 场景14.3.1 短名变量在前（风险场景）
+
+变量顺序：`host` → `hostname`
+
+```
+原始查询: SELECT * FROM logs WHERE host = '$host' AND hostname = '$hostname'
+
+步骤1: 替换 $host → 'server-01'
+  结果: SELECT * FROM logs WHERE host = 'server-01' AND hostname = 'server-01name'
+                    $hostname 中的 $host 被错误替换为 'server-01'！ ↑
+
+步骤2: 替换 $hostname → 'prod-server'
+  但此时查询中已不再包含 $hostname，只有被污染的 'server-01name'
+  结果: SELECT * FROM logs WHERE host = 'server-01' AND hostname = 'server-01name'
+                                                              ^^^^^^^^^^^^
+                                                              错误！应为 'prod-server'
+```
+
+#### 场景14.3.2 长名变量在前（规避场景）
+
+变量顺序：`hostname` → `host`
+
+```
+原始查询: SELECT * FROM logs WHERE host = '$host' AND hostname = '$hostname'
+
+步骤1: 替换 $hostname → 'prod-server'
+  结果: SELECT * FROM logs WHERE host = '$host' AND hostname = 'prod-server'
+         $hostname 被完全替换，$host 不受影响
+
+步骤2: 替换 $host → 'server-01'
+  结果: SELECT * FROM logs WHERE host = 'server-01' AND hostname = 'prod-server'
+                                                              ^^^^^^^^^^^^
+                                                              ✓ 正确！
+```
+
+**关键发现**：变量顺序直接影响结果。长名在前时正确，短名在前时错误。
+
+#### 场景14.3.3 使用 `${}` 或 `{{}}` 语法（安全场景）
+
+无论变量顺序如何，`${host}` 和 `{{host}}` 都不会错误匹配 `${hostname}` 或 `{{hostname}}`，因为大括号提供了明确的边界。
+
+```
+变量顺序: host → hostname
+原始查询: SELECT * FROM logs WHERE host = '${host}' AND hostname = '${hostname}'
+
+步骤1: 替换 ${host} → 'server-01'
+  结果: SELECT * FROM logs WHERE host = 'server-01' AND hostname = '${hostname}'
+         只有 ${host} 被替换，${hostname} 不受影响
+
+步骤2: 替换 ${hostname} → 'prod-server'
+  结果: SELECT * FROM logs WHERE host = 'server-01' AND hostname = 'prod-server'
+                                                              ✓ 正确！
+```
+
+### 14.4 风险发生的必要条件
+
+子串错误替换必须同时满足以下所有条件：
+
+1. ✅ 使用 `$var` 语法（无大括号边界）
+2. ✅ 存在两个变量，其中一个变量名是另一个的前缀
+3. ✅ 变量遍历顺序：短名变量在前，长名变量在后
+4. ✅ 查询中同时引用了这两个变量
+
+**缺失任一条件则不会发生错误**。
+
+### 14.5 代码中的替换顺序
+
+**固定变量替换** (`usePanelVariableSubstitution.ts:525-545`):
+```typescript
+fixedVariables?.forEach((variable: any) => {
+  const variableName = `$${variable.name}`;
+  const variableNameWithBrackets = `\${${variable.name}}`;
+  const mustachePlaceholder = `{{${variable.name}}}`;
+  
+  query = query.replaceAll(mustachePlaceholder, variableValue);        // 安全
+  query = query.replaceAll(variableNameWithBrackets, variableValue);  // 安全
+  query = query.replaceAll(variableName, variableValue);              // 危险！
+});
+```
+
+**用户变量替换（数组值）** (`usePanelVariableSubstitution.ts:616-628`):
+```typescript
+possibleVariablesPlaceHolderTypes.forEach((placeHolderObj) => {
+  query = query.replaceAll(placeHolderObj.placeHolder, placeHolderObj.value);
+  // 其中 placeHolder 包括危险的 `$${variable.name}`
+});
+```
+
+**用户变量替换（单值）** (`usePanelVariableSubstitution.ts:652-664`):
+```typescript
+query = query.replaceAll(`{{${variable.name}:csv}}`, variableValue);         // 安全
+query = query.replaceAll(`{{${variable.name}:pipe}}`, variableValue);        // 安全
+query = query.replaceAll(`{{${variable.name}:doublequote}}`, variableValue); // 安全
+query = query.replaceAll(`{{${variable.name}:singlequote}}`, variableValue); // 安全
+query = query.replaceAll(mustachePlaceholder, variableValue);                // 安全
+query = query.replaceAll(variableNameWithBrackets, variableValue);           // 安全
+query = query.replaceAll(variableName, variableValue);                       // 危险！
+```
+
+### 14.6 VariablesValueSelector 中的替换风险
+
+**VariablesValueSelector** 使用正则表达式进行替换，并对变量名做了转义，但仍存在风险：
+
+```typescript
+// 单值替换 (VariablesValueSelector.vue:2107)
+const pattern = new RegExp(`\\$${escapedVarName}`, "g");
+queryContext = queryContext.replace(pattern, replacedValue);
+// 此正则同样没有后边界，会产生前缀匹配问题
+
+// 数组值替换 (VariablesValueSelector.vue:2084-2086)
+const unquotedPattern = new RegExp(`\\$${escapedVarName}(?!')`, "g");
+// 此正则有负向预查 (?!')，但只排除了单引号，无法避免 $hostname 的情况
+```
+
+### 14.7 对查询准确性的影响
+
+| 影响 | 表现 | 严重程度 |
+|------|------|---------|
+| 查询结果错误 | 过滤条件使用错误的值，返回不完整或错误的数据 | 🔴 高危 |
+| SQL 语法错误 | 替换后产生无效的 SQL（如 `'server-01name'` 可能是合法值但语义错误） | 🟡 中危 |
+| 静默失败 | 查询执行成功但结果不正确，难以排查 | 🔴 高危 |
+
+---
+
+## 15. 深度分析：固定变量 `__range` 系列替换顺序的影响
+
+### 15.1 问题本质
+
+固定变量数组中，`__range` 在 `__range_s` 和 `__range_ms` 之前定义。当使用 `$var` 语法时，`$__range` 会先被替换，导致 `$__range_s` 和 `$__range_ms` 中的 `$__range` 前缀被污染。
+
+### 15.2 固定变量定义顺序
+
+**代码** (`usePanelVariableSubstitution.ts:497-522`):
+```typescript
+const fixedVariables = [
+  { name: "__interval_ms", value: "..." },
+  { name: "__interval",    value: "..." },
+  { name: "__rate_interval", value: "..." },
+  { name: "__range",        value: "1h" },      // 🔴 第4位：在 __range_s 和 __range_ms 之前
+  { name: "__range_s",      value: "3600" },    // 第5位
+  { name: "__range_ms",     value: "3600000" }, // 第6位
+];
+```
+
+### 15.3 风险复现演示
+
+**测试场景**：查询中同时使用 `$__range`、`$__range_s`、`$__range_ms`
+
+#### 场景15.3.1 `$var` 语法（风险场景）
+
+```
+原始查询: WHERE timestamp > now() - $__range AND duration > $__range_s AND bytes > $__range_ms
+
+步骤4: 替换 $__range → '1h'
+  结果: WHERE timestamp > now() - 1h AND duration > 1h_s AND bytes > 1h_ms
+                                                         ↑           ↑
+                                              $__range_s 变成 1h_s，$__range_ms 变成 1h_ms
+                                              前缀 $__range 被替换了！
+
+步骤5: 替换 $__range_s → '3600'
+  查询中已不再包含 $__range_s，只有被污染的 1h_s
+  结果: 无变化
+
+步骤6: 替换 $__range_ms → '3600000'
+  查询中已不再包含 $__range_ms，只有被污染的 1h_ms
+  结果: 无变化
+
+最终结果: WHERE timestamp > now() - 1h AND duration > 1h_s AND bytes > 1h_ms
+                                                              ^^^^      ^^^^
+                                                              错误！应为 3600 和 3600000
+```
+
+#### 场景15.3.2 `{{}}` 或 `${}` 语法（安全场景）
+
+```
+原始查询: WHERE timestamp > now() - {{__range}} AND duration > {{__range_s}} AND bytes > {{__range_ms}}
+
+步骤4: 替换 {{__range}} → '1h'
+  结果: WHERE timestamp > now() - 1h AND duration > {{__range_s}} AND bytes > {{__range_ms}}
+         只有 {{__range}} 被替换，其他不受影响
+
+步骤5: 替换 {{__range_s}} → '3600'
+  结果: WHERE timestamp > now() - 1h AND duration > 3600 AND bytes > {{__range_ms}}
+
+步骤6: 替换 {{__range_ms}} → '3600000'
+  结果: WHERE timestamp > now() - 1h AND duration > 3600 AND bytes > 3600000
+                                                              ✓ 完全正确！
+```
+
+### 15.4 风险矩阵
+
+| 变量名 | 可能被污染的变量 | 语法 | 风险 |
+|--------|----------------|------|------|
+| `__range` | `__range_s`, `__range_ms` | `$__range` | 🔴 高风险 |
+| `__range` | `__range_s`, `__range_ms` | `${__range}`, `{{__range}}` | ❌ 无风险 |
+| `__interval` | `__interval_ms` | `$__interval` | 🟡 潜在风险（但 __interval_ms 在前，先被替换，所以实际上安全） |
+| `__interval_ms` | 无 | 任何 | ❌ 无风险 |
+
+**有趣的发现**：`__interval_ms` 在 `__interval` 之前定义，所以当替换 `$__interval` 时，`$__interval_ms` 已经被替换掉了，不会被污染。这是一个"幸运"的顺序巧合。
+
+### 15.5 对查询准确性的影响
+
+| 受影响变量 | 错误表现 | 后果 |
+|-----------|---------|------|
+| `$__range_s` | 被替换为 `1h_s`（1h 是 range 值，_s 是后缀残余） | 时间范围过滤条件完全错误，可能返回超出范围的数据或语法错误 |
+| `$__range_ms` | 被替换为 `1h_ms` | 同上 |
+| PromQL 速率函数 | `rate(metric[$__range])` 变成 `rate(metric[1h])`（正确），但 `$__range_s` 被污染 | PromQL 语法可能无效，查询失败 |
+
+---
+
+## 16. 深度分析：依赖变量匹配正则的短/长名误匹配边界
+
+### 16.1 问题本质
+
+`getDependentVariablesData` 函数使用正则表达式检测查询中引用了哪些变量。该正则没有**单词边界**，导致短变量名的正则会误匹配长变量名的前缀。
+
+### 16.2 正则表达式分析
+
+**代码** (`usePanelVariableSubstitution.ts:91-93`):
+```typescript
+const regexForVariable = new RegExp(
+  `(?:\\$\\{?\\s*${it.name}\\s*(?::\\s*(?:csv|pipe|doublequote|singlequote)\\s*)?\\}?)|(?:\\{\\{\\s*${it.name}\\s*(?::\\s*(?:csv|pipe|doublequote|singlequote)\\s*)?\\}\\})`,
+);
+```
+
+**正则拆解**（以 `host` 为例）：
+```
+第一部分（$ 语法）:
+  (?:
+    \$              # 美元符号
+    \{?             # 可选的左大括号
+    \s*             # 可选空白
+    host            # 变量名（无边界！）
+    \s*             # 可选空白
+    (?::\s*(?:csv|pipe|doublequote|singlequote)\s*)?  # 可选格式化后缀
+    \}?             # 可选的右大括号
+  )
+
+第二部分（{{}} 语法）:
+  (?:
+    \{\{            # 左双大括号
+    \s*             # 可选空白
+    host            # 变量名（无边界！）
+    \s*             # 可选空白
+    (?::\s*(?:csv|pipe|doublequote|singlequote)\s*)?  # 可选格式化后缀
+    \}\}            # 右双大括号
+  )
+```
+
+**关键缺陷**：`$` 语法部分的结尾是 `\}?`（可选右大括号），如果没有大括号，则**没有后边界**。这意味着 `host` 的正则会匹配 `$hostname`、`$host_ip`、`$hostgroup` 等任何以 `host` 开头的变量。
+
+### 16.3 边界情况测试结果
+
+| 测试查询 | 引用的实际变量 | 变量名 `host` 的正则是否匹配 | 正确性 |
+|---------|---------------|----------------------------|--------|
+| `WHERE host = '$host'` | `$host` | ✅ 匹配 | ✓ 正确 |
+| `WHERE hostname = '$hostname'` | `$hostname` | ✅ 匹配 | ❌ 误匹配！ |
+| `WHERE host_ip = '$host_ip'` | `$host_ip` | ✅ 匹配 | ❌ 误匹配！ |
+| `WHERE hostgroup = '${hostgroup}'` | `${hostgroup}` | ✅ 匹配 | ❌ 误匹配！ |
+| `WHERE host = '{{host}}'` | `{{host}}` | ✅ 匹配 | ✓ 正确 |
+| `WHERE hostname = '{{hostname}}'` | `{{hostname}}` | ❌ 不匹配 | ✓ 正确！ |
+| `WHERE host = 'server1'` | 无 | ❌ 不匹配 | ✓ 正确 |
+
+**有趣的不对称性**：`{{hostname}}` 不会被 `host` 的正则误匹配，因为 `}}` 提供了明确的后边界。但 `$hostname` 会被误匹配，因为 `$` 语法没有后边界。
+
+### 16.4 对刷新触发的影响
+
+误匹配导致 `getDependentVariablesData` 返回不必要的变量，进而影响：
+
+#### 16.4.1 不必要的变量加载等待
+
+```typescript
+// waitForTheVariablesToLoad() 会等待所有"依赖"变量就绪
+// 如果 host 正则误匹配了 hostname 查询，面板会错误地等待 host 变量加载
+```
+
+**表现**：面板查询延迟，即使查询实际上不依赖该变量。
+
+#### 16.4.2 不必要的刷新触发
+
+```typescript
+// variablesDataUpdated() 会比较所有"依赖"变量的值
+// 如果 host 变量值变化，即使查询只引用 hostname，也会触发刷新
+```
+
+**表现**：面板过度刷新，产生不必要的 API 请求。
+
+#### 16.4.3 变量快照不准确
+
+```typescript
+// currentDependentVariablesData 存储了误匹配的变量
+// 导致变量变更检测不准确
+```
+
+### 16.5 变量命名规范建议
+
+基于以上分析，建议遵循以下命名规范以规避风险：
+
+| 规范 | 原因 |
+|------|------|
+| ✅ 使用 `${var}` 或 `{{var}}` 语法 | 明确的边界避免子串替换 |
+| ✅ 避免前缀命名（如 `host` 和 `hostname`） | 减少误匹配风险 |
+| ✅ 变量名使用唯一后缀（如 `host_name` 而非 `hostname`） | 下划线分隔的变量名更安全 |
+| ✅ 对于 `__range` 系列，始终使用 `{{__range}}` 或 `${__range}` | 避免顺序导致的污染 |
+| ❌ 避免 `$var` 简写语法 | 无前边界且无后边界，风险最高 |
+
+---
+
+## 17. 综合影响评估与风险分级
+
+### 17.1 问题严重性矩阵
+
+| 问题 | 影响范围 | 发生概率 | 严重程度 | 风险等级 |
+|------|---------|---------|---------|---------|
+| `$var` 前缀子串替换 | 所有使用 `$var` 语法且变量名有前缀关系的查询 | 中（取决于变量命名） | 🔴 高危 | 🔴 P0 |
+| `$__range` 系列顺序污染 | 所有使用 `$__range_s` 或 `$__range_ms` 的查询 | 高（默认模板常用） | 🔴 高危 | 🔴 P0 |
+| 依赖正则短名误匹配 | 所有有前缀命名变量的面板 | 中 | 🟡 中危 | 🟠 P1 |
+
+### 17.2 对查询准确性的影响路径
+
+```
+命名冲突（host vs hostname）
+     ↓
+     ├─→ $host 先替换 → 污染 $hostname → 查询结果错误
+     ├─→ host 正则误匹配 hostname 查询 → 过度刷新
+     └─→ 面板等待 host 变量就绪 → 查询延迟
+
+$__range 顺序问题
+     ↓
+     ├─→ $__range 先替换 → 污染 $__range_s 和 $__range_ms
+     ├─→ 时间范围条件错误 → 返回数据范围不正确
+     └─→ 可能导致 PromQL/SQL 语法错误 → 查询完全失败
+```
+
+### 17.3 对刷新触发的影响路径
+
+```
+依赖正则误匹配
+     ↓
+getDependentVariablesData 返回多余变量
+     ↓
+     ├─→ 面板等待不需要的变量加载 → 首屏延迟
+     ├─→ 快照存储多余变量 → 内存占用增加
+     └─→ variablesDataUpdated 误判值变化 → 不必要的刷新
+          ↓
+          ├─→ 过多 API 请求 → 后端压力增加
+          └─→ 面板频繁重绘 → 用户体验下降
+```
+
+### 17.4 临时规避方案（无需修改代码）
+
+| 场景 | 规避方法 |
+|------|---------|
+| 前缀命名变量 | 始终使用 `${var}` 或 `{{var}}` 语法，避免 `$var` 简写 |
+| `__range` 系列 | 始终使用 `{{__range_s}}` 或 `${__range_s}`，避免 `$__range_s` |
+| 变量命名 | 避免前缀关系，使用下划线分隔（如 `host_name` 而非 `hostname`） |
+| 变量定义顺序 | 如必须用 `$var`，确保长名变量在短名变量之前定义 |
+
+### 17.5 根本修复建议
+
+| 问题 | 修复方案 |
+|------|---------|
+| 子串替换 | 在 `$var` 替换前添加单词边界检查，或完全弃用 `$var` 语法，强制使用 `${var}` |
+| `__range` 顺序 | 调整 `fixedVariables` 数组顺序，将 `__range` 放在 `__range_s` 和 `__range_ms` 之后 |
+| 依赖正则误匹配 | 在 `$` 语法部分添加单词边界（如 `\b` 或负向预查 `(?![a-zA-Z0-9_-])`） |
