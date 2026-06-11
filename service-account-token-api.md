@@ -57,6 +57,11 @@ pub struct OrgUserRecord {
 
 该字段通过数据库迁移 `m20251230_000001_add_allow_static_token_to_org_users` 添加，默认值为 `true` 以保持向后兼容。
 
+**不同创建路径下的默认值差异**：
+- 通过 `POST /{org_id}/service_accounts` 路由（普通创建路径）：走 `post_user()` → `add_user_to_org()`，默认 `allow_static_token=true`，token 长度 16 字符
+- 通过组织设置附带 `service_account` 字段创建（Tenant Admin 路径，[organization.rs#L402-L433](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/service/organization.rs#L402-L433)）：直接调用 `db::org_users::add_with_flags()`，**显式设为 `allow_static_token=false`**，token 长度 32 字符（不会被暴露）
+- 通过 `ensure_sys_rca_agent()` 创建的 SRE Agent：`allow_static_token=true`
+
 ### 1.4 Service Account 请求/响应结构
 
 定义于 [service_account.rs#L19-L40](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/common/meta/service_account.rs#L19-L40)：
@@ -136,22 +141,72 @@ org_users { org_id, email, role, token, rum_token, allow_static_token, created_a
 
 ### 3.3 Token 校验流程
 
-核心校验函数 `validate_credentials()`（[validator.rs#L227-L450](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L227-L450)）：
+核心校验函数 `validate_credentials()`（[validator.rs#L227-L450](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L227-L450)）。
+
+**完整的认证校验调用链路**（从请求到认证结果）：
 
 ```
-请求 → oo_validator_internal() → 解析 Auth 头
-    → Basic Auth: base64 解码为 username:password
-    → validator() → validate_credentials()
+HTTP 请求
+  │
+  ▼
+oo_validator() [L1011-L1019]
+  └─► oo_validator_internal() [L880-L949]
+        │
+        ├─ ① 检查 Session:: 前缀标记 [L886-L895]
+        │     格式: Session::<session_id>::<actual_token>
+        │     → 匹配: is_from_session=true, auth_str=<actual_token>
+        │     → 不匹配: is_from_session=false, auth_str=原字符串
+        │
+        ├─ ② 分支: Basic Auth [L897-L917]
+        │     ├─ base64 解码 → username:password
+        │     ├─ 关键: 设置 modified_auth_info.bypass_check
+        │     │        = is_from_session || auth_info.bypass_check
+        │     │   (bypass_check=true 将跳过 allow_static_token 检查)
+        │     └─► validator() [L138-L201]
+        │           │
+        │           ├─ ③ validate_credentials() [L227-L450]
+        │           │     │
+        │           │     ├─ ④ 服务账户 token 比对 [L326-L367]
+        │           │     │     user.role.is_service_account()
+        │           │     │     && user.token.eq(&user_password)
+        │           │     │     │
+        │           │     │     ├─ 检查 service_account_enabled 全局开关
+        │           │     │     ├─ 检查 allow_static_token (仅当 bypass_check=false)
+        │           │     │     │    条件: !from_session (= !bypass_check 之前传递)
+        │           │     │     │         && db::org_users::get().allow_static_token == false
+        │           │     │     │    → 命中: log warn + 返回 is_valid=false [L350-L364]
+        │           │     │     └─ 通过: build_token_validation_response()
+        │           │     │
+        │           │     └─ (后续普通用户密码校验分支不影响 SA)
+        │           │
+        │           ├─ ⑤ 认证通过后: check_and_create_org() [L166]
+        │           │
+        │           └─ ⑥ check_permissions() 权限校验 [L186-L192]
+        │                 ├─ auth_info.bypass_check=true → 直接通过
+        │                 ├─ Root 角色 → 直接通过
+        │                 ├─ 非 Enterprise → 始终 true
+        │                 └─ Enterprise+OFGA: is_allowed() RBAC 检查
+        │                       → 通过: AuthValidationResult
+        │                       → 失败: AuthError::Forbidden("Unauthorized Access") [L200]
+        │
+        ├─ Bearer token 分支 [L918-L920]
+        │     └─► token_validator() (Dex/JWT 校验)
+        │
+        └─ AuthExt 分支 [L921-L944]  (ingestion/proxy 扩展认证)
 ```
 
-服务账户 token 校验的关键路径（[validator.rs#L326-L367](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L326-L367)）：
+服务账户 token 校验的关键条件（[validator.rs#L326-L367](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L326-L367)）：
 
 ```rust
 if user.role.is_service_account() && user.token.eq(&user_password) {
     // 1. 检查服务账户全局开关
     if !config.auth.service_account_enabled { return invalid; }
 
-    // 2. 检查 allow_static_token（仅非会话请求）
+    // 2. 检查 allow_static_token — 条件是 !from_session
+    //    from_session 参数值 = auth_info.bypass_check（在 validator() 第 4 步传入）
+    //    bypass_check 在 oo_validator_internal 由 Session:: 前缀匹配结果决定
+    //    因此: Session 来源的请求 → from_session=true → 跳过此检查
+    //          直接 Basic Auth 的请求 → from_session=false → 执行此检查
     if !from_session
         && let Ok(org_user) = db::org_users::get(&user.org, &user.email).await
         && !org_user.allow_static_token
@@ -164,17 +219,182 @@ if user.role.is_service_account() && user.token.eq(&user_password) {
 }
 ```
 
-**校验优先级**：服务账户 token 校验在密码校验之前执行，且**不受 native_login_enabled / root_only_login 限制**。
+**校验优先级**：服务账户 token 校验在密码校验之前执行，且**不受 native_login_enabled / root_only_login 限制**（这两个限制仅在密码校验分支 [validator.rs#L390-L414](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L390-L414) 生效）。
 
-### 3.4 Session 标记机制
+### 3.4 静态 Token 禁用的拒绝链路（allow_static_token=false）
 
-从 `assume_service_account` 获取的临时会话 token 在认证系统中以 `Session::` 前缀标记（[auth.rs#L886-L895](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/common/utils/auth.rs#L886-L895)）：
+当服务账户在组织中被设置为 `allow_static_token=false` 时，使用静态 token 直接调用 API 的完整拒绝路径：
+
+```
+客户端请求: Basic base64(sa@example.com:<static_token>)
+  │
+  ▼
+oo_validator_internal()
+  │  Session:: 前缀不匹配 → is_from_session=false
+  ▼
+Basic Auth 解码 → username=sa@example.com, password=<static_token>
+  │  modified_auth_info.bypass_check = false (因为 is_from_session=false)
+  ▼
+validator()
+  ▼
+validate_credentials(user_id=sa@example.com, password=<static_token>, bypass_check=false)
+  │
+  ├─ user.role.is_service_account() → true ✓
+  ├─ user.token.eq(password) → true ✓ (静态 token 匹配)
+  ├─ service_account_enabled → true ✓
+  │
+  ├─ !from_session (= true) → 执行 allow_static_token 检查
+  │   │
+  │   ├─ db::org_users::get(org, email).await
+  │   │    → 返回 OrgUserRecord { allow_static_token: false, ... }
+  │   │
+  │   └─ !org_user.allow_static_token → true
+  │        │
+  │        ├─ log::warn! 记录告警 [L350-L354]
+  │        │   内容: "Service account '{}' in org '{}' attempted direct token
+  │        │          auth but allow_static_token=false. Use assume_service_account
+  │        │          API instead."
+  │        │
+  │        └─ 返回 TokenValidationResponse { is_valid: false, ... }
+  │
+  ▼
+validator() 收到 is_valid=false
+  → res.is_valid 为 false，跳过 check_permissions 等后续步骤
+  ▼
+oo_validator() 收到错误
+  ▼
+最终响应: 401 Unauthorized / 403 Forbidden (取决于 AuthExtractor 错误处理)
+```
+
+**关键洞察**：静态 token 禁用的检查发生在**身份认证阶段**（`validate_credentials`），而不是**权限校验阶段**（`check_permissions`）。这意味着：
+- 失败原因是 "token 认证不合法"（因为静态 token 被禁止），不是 "权限不足"
+- 错误 HTTP 状态码是 401/403 的 Unauthorized 语义，不是 RBAC 的 Forbidden 语义
+- 绕过方式：使用 `assume_service_account` API 获取会话 token，此时 `from_session=true`，`allow_static_token` 检查被跳过
+
+---
+
+## 3.5 系统服务账户（SreAgent）的操作拒绝机制
+
+系统服务账户（`UserRole::SreAgent`，email 匹配 `o2-sre-agent.org-*@openobserve.internal`）在所有修改/删除类操作中受到多层保护，拒绝检查发生在**不同的代码层级**：
+
+### 拒绝层级总览
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ 层级 1: HTTP Handler 层面的检查 (最先执行，性能最优)          │
+│  L update() L215-L224: 角色+email 双重检查 MODIFY 拦截        │
+│  L delete_bulk() L410-L428: HashSet 预过滤 DELETE BULK 拦截  │
+├──────────────────────────────────────────────────────────────┤
+│ 层级 2: Service 层面的检查 (通用删除逻辑的统一守护)            │
+│  L remove_user_from_org() L966-L975: 通用 DELETE SINGLE 拦截 │
+├──────────────────────────────────────────────────────────────┤
+│ 层级 3: 认证校验层面的隐性保护                                 │
+│  rotateToken 走 update() 分支 → 已被层级 1 拦截                │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 1. 修改操作（UPDATE / rotateToken）的拒绝链路
+
+**入口**：`PUT /{org_id}/service_accounts/{email_id}` → `update()`（[service_accounts/mod.rs#L202-L304](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/request/service_accounts/mod.rs#L202-L304)）
+
+```
+请求进入 update()
+  │
+  ▼ [层级 1: Handler L215-L224]
+  优先: db::org_users::get(org_id, email_id) 查询 OrgUserRecord
+    │
+    ├─ 命中且 record.role == UserRole::SreAgent
+    │     → 返回 403 Forbidden "System service accounts cannot be modified" ✓
+    │
+    └─ 查询失败/role 非 SreAgent → Fallback 检查
+         │
+         └─ is_system_service_account(email_id) → true (email 模式匹配)
+              → 返回 403 Forbidden "System service accounts cannot be modified" ✓
+  │
+  ▼ (通过后才进入后续 rotateToken 或 UpdateUser 逻辑)
+```
+
+**设计意图**：采用「角色检查优先 + email 模式兜底」的双重检查策略。优先使用 `org_users.role` 字段判断（因为同 email 在不同组织可能角色不同，比如 A 组织是 SreAgent，B 组织是 ServiceAccount），仅当 DB 查询失败时才退化为 email 模式匹配。
+
+### 2. 单个删除（DELETE SINGLE）的拒绝链路
+
+**入口**：`DELETE /{org_id}/service_accounts/{email_id}` → `delete()` → `remove_user_from_org()`（[users.rs#L924-L1087](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/service/users.rs#L924-L1087)）
+
+```
+remove_user_from_org() 中
+  │
+  ▼ 前置检查（先执行 4 步通用检查，见 4.4 节）
+  │
+  ▼ [层级 2: L966-L975] 系统账户检查 — 在判断组织数量之前
+  │
+  │  user.organizations.iter().any(|o| o.role == SreAgent)
+  │     │
+  │     ├─ true → 意味着该账户在**任何一个组织**中扮演 SreAgent
+  │     │        → 返回 403 "System service accounts cannot be deleted" ✓
+  │     │        ▶ 注意：即使当前删除的 org_id 中角色不是 SreAgent，
+  │     │          只要任意组织中是 SreAgent 就整体禁止删除
+  │     │
+  │     └─ false → 继续执行 fallback 检查
+  │
+  └─ is_system_service_account(&user.email) → true
+       → 返回 403 "System service accounts cannot be deleted" ✓
+```
+
+**关键特性**：删除操作的拒绝检查是**全局跨组织**的 — 只要该 email 在任一组织中拥有 SreAgent 角色（或匹配系统账户 email 模式），则在所有组织中都**无法被删除**。这是与 UPDATE 操作检查（只检查当前 org_id 中的角色）的本质区别。
+
+### 3. 批量删除（DELETE BULK）的拒绝链路
+
+**入口**：`DELETE /{org_id}/service_accounts/bulk` → `delete_bulk()`（[service_accounts/mod.rs#L372-L455](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/request/service_accounts/mod.rs#L372-L455)）
+
+```
+delete_bulk() 中
+  │
+  ▼ [层级 1: L404-L428] Handler 层面批量预过滤
+  │
+  │  Step 1: 一次性 list_users_by_org() 获取该组织所有用户
+  │  Step 2: 构建 sre_agent_emails HashSet
+  │           (SreAgent 角色的 email 集合)
+  │  Step 3: 逐个遍历请求中的 email
+  │           │
+  │           ├─ sre_agent_emails.contains(email)
+  │           │   || is_system_service_account(email)
+  │           │   → true:
+  │           │      ▪ log::warn!("Attempted to delete system SA ...")
+  │           │      ▪ unsuccessful.push(email)
+  │           │      ▪ err = "System service accounts cannot be deleted"
+  │           │      ▪ continue (不调用 remove_user_from_org)
+  │           │
+  │           └─ false:
+  │                  调用 remove_user_from_org()
+  │                  (层级 2 还会再次检查，形成双保险)
+```
+
+### 拒绝机制差异总结表
+
+| 操作 | 检查层级 | 检查范围 | 响应方式 | HTTP 状态 |
+|-----|---------|---------|---------|----------|
+| UPDATE（含 rotateToken） | Handler 层（最先） | 仅当前 org_id 的角色，兜底 email 模式 | 立即返回错误响应 | 403 |
+| DELETE SINGLE | Service 层（通用逻辑） | **全局跨组织**：任一组织中 SreAgent 即拒绝 | 立即返回错误响应 | 403 |
+| DELETE BULK | Handler 层预过滤 + Service 层兜底 | 当前 org HashSet + email 模式 | 标记 unsuccessful，不中断整体流程 | 200（但该条失败） |
+| CREATE | — | — | SreAgent 仅由系统自动创建，无法通过 API 手动创建 | — |
+
+---
+
+## 3.6 Session 标记机制
+
+从 `assume_service_account` 获取的临时会话 token 在认证系统中以 `Session::` 前缀标记（[validator.rs#L886-L895](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L886-L895)）：
 
 ```
 Session::<session_id>::<actual_token>
 ```
 
-此标记使得 `bypass_check = true`，从而绕过 `allow_static_token` 检查（[validator.rs#L909](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L909)），即通过 assume 获取的会话 token 即使原始服务账户设置了 `allow_static_token=false` 也能正常使用。
+此标记在 `oo_validator_internal()` 解析时使得：
+- `is_from_session = true`
+- `modified_auth_info.bypass_check = is_from_session || auth_info.bypass_check = true`
+
+从而在 `validate_credentials()` 中 `from_session=true`，跳过 `allow_static_token` 检查（[validator.rs#L346-L348](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L346-L348)）。即通过 assume 获取的会话 token 即使原始服务账户设置了 `allow_static_token=false` 也能正常使用。
+
+同时，在 `validator()` 末尾的 `check_permissions()` 调用时（[validator.rs#L185-L192](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L185-L192)），`auth_info.bypass_check=true` 也会直接跳过 OpenFGA RBAC 检查。**注意：这意味着 assume 获取的会话 token 在权限校验时也 bypass 了 OpenFGA，其权限完全由创建会话时 enterprise 层验证时的角色决定。**
 
 ---
 
@@ -211,21 +431,73 @@ Session::<session_id>::<actual_token>
 
 ### 4.4 服务账户删除
 
-`DELETE /{org_id}/service_accounts/{email_id}`（[service_accounts/mod.rs#L332-L346](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/request/service_accounts/mod.rs#L332-L346)）：
+`DELETE /{org_id}/service_accounts/{email_id}`（[service_accounts/mod.rs#L332-L346](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/request/service_accounts/mod.rs#L332-L346)）调用 `users::remove_user_from_org()`。
 
-- 调用 `users::remove_user_from_org()`
-- 系统服务账户（SreAgent）**不可删除**（[users.rs#L966-L975](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/service/users.rs#L966-L975)）
-- 删除后 token 立即失效
-- Enterprise：同步删除 OpenFGA 关系（包括 `delete_service_account_from_org`）
+**删除范围取决于该账户属于多少个组织**（[users.rs#L924-L1087](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/service/users.rs#L924-L1087)）：
+
+#### 场景 A：账号仅属于 1 个组织（`orgs.len() == 1`）
+
+**删除整个账号记录**（`db::user::delete(email_id)`），影响范围是**全局全部组织**（虽然此时只有一个组织）：
+
+```
+┌──────────────────────────────────────┐
+│  1. 从 users 表中删除 DBUser 记录      │
+│  2. 从 org_users 表中删除唯一的成员记录  │
+│  3. Enterprise: 从 OpenFGA 删除        │
+│     - delete_user_from_org()          │
+│     - delete_service_account_from_org()│
+│  4. 账号从系统中彻底消失，无法再登录     │
+└──────────────────────────────────────┘
+```
+
+**特例禁止删除**：如果 `is_external=true`（外部用户，如 Dex/LDAP 同步过来的）且仅剩的这个组织中的角色是 `ServiceAccount`，返回 **403 "Not Allowed"**（[users.rs#L994-L995](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/service/users.rs#L994-L995)）。这是为了保护从外部身份源同步过来的服务账户不被误删。
+
+#### 场景 B：账号属于 2 个或更多组织（`orgs.len() > 1`）
+
+**仅从当前指定的 org_id 中移除**，账号本身保留，其他组织的成员关系和 token 均不受影响：
+
+```
+┌──────────────────────────────────────────────┐
+│  1. 遍历 organizations，找到匹配 org_id 的条目  │
+│  2. orgs.retain(|x| !x.name.eq(org_id))       │
+│     （仅从向量中移除目标组织条目）               │
+│  3. db::org_users::remove(org_id, email_id)   │
+│     （从 org_users 表中删除当前组织的成员关系）   │
+│  4. Enterprise: 仅从 OpenFGA 删除当前组织的     │
+│     关系元组，其他组织的 OFGA 关系保持不变        │
+│  5. 其他组织的 token 继续有效，账号可继续使用     │
+└──────────────────────────────────────────────┘
+```
+
+**特例禁止删除**：在遍历组织过程中，如果发现 `is_external=true` 的 ServiceAccount，同样返回 403 "Not Allowed"（[users.rs#L1026-L1027](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/service/users.rs#L1026-L1027)）。
+
+#### 前置拒绝检查（在范围判断之前执行）
+
+在判断是场景 A 还是 B 之前，先执行以下拒绝检查（任一触发即返回）：
+
+1. **调用者无权限**：非 Admin/Root 且无 OpenFGA RBAC → **401 Unauthorized "Not Allowed"**
+2. **删除 Root 用户**：尝试删除 root@example.com → **403 Forbidden "Not Allowed"**
+3. **删除自身**：`initiating_user.email == email_id` → **403 Forbidden "Not Allowed"**
+4. **删除系统服务账户**：任一组织角色是 SreAgent，或 email 匹配系统模式 → **403 Forbidden "System service accounts cannot be deleted"**
+
+#### 批量删除的特殊处理
+
+`DELETE /{org_id}/service_accounts/bulk`（[service_accounts/mod.rs#L372-L455](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/request/service_accounts/mod.rs#L372-L455)）：
+
+- **不会因单个失败而中断**：每个 email 独立处理
+- **系统账户过滤**：构建 `sre_agent_emails` HashSet 后逐个检查，系统账户直接标记为 `unsuccessful`，不调用 `remove_user_from_org()`，错误信息 `err = "System service accounts cannot be deleted"`
+- **Enterprise 预检查**：遍历所有 email 先做 `check_permissions()`，任一不通过即整体返回 403
+- 返回结构 `BulkDeleteResponse { successful, unsuccessful, err }` 区分成功/失败
 
 ### 4.5 吊销路径总结
 
 | 吊销方式 | 影响范围 | 即时性 |
 |---------|---------|-------|
-| Token 轮换 (rotateToken) | 当前组织内的该服务账户 token | 即时 |
-| 删除服务账户 | 所有组织中的该服务账户 | 即时 |
+| Token 轮换 (rotateToken) | **仅当前组织内**的该服务账户 token（其他组织 token 不受影响） | 即时 |
+| 删除服务账户（账号仅属于 1 个组织） | **全局删除整个账号**，连带删除唯一的组织关系 | 即时 |
+| 删除服务账户（账号属于多个组织） | **仅当前组织**的成员关系和 token 被删除，账号和其他组织保留 | 即时 |
 | 会话自然过期 | assume_service_account 的临时会话 | 到期时 |
-| `allow_static_token=false` | 禁止直接使用静态 token | 即时（已存在的会话不受影响） |
+| `allow_static_token=false` | **仅当前组织内**禁止直接使用静态 token | 即时（已存在的会话不受影响） |
 
 ---
 
@@ -434,11 +706,36 @@ AuditMessage {
 ## 10. 关键安全考量
 
 1. **Token 一次性展示**：服务账户创建时 token 仅在响应中返回一次，后续无法再次获取明文
-2. **静态 token 风险**：默认 `allow_static_token=true`，静态 token 无有效期，存在泄露风险
-3. **assume_service_account 安全**：
+2. **静态 token 风险**：普通路径创建的 SA 默认 `allow_static_token=true`，静态 token 无有效期，存在泄露风险；Tenant Admin 路径创建的 SA 默认 `allow_static_token=false`，强制走 assume 流程
+3. **删除范围的危险性**：删除服务账户的影响范围**取决于该账户属于几个组织**：
+   - 仅 1 个组织：**全局完全删除**（users 表记录被删除）
+   - ≥2 个组织：**仅从当前组织移除**，其他组织继续有效
+   - 操作前建议先查询该账户在哪些组织中存在，避免意外全局删除
+4. **外部 SA 的删除保护**：`is_external=true` 的 ServiceAccount 无法被删除（返回 403），用于保护 Dex/LDAP 等身份源同步的服务账户
+5. **assume_service_account 安全**：
    - 仅限 `_meta` 组织调用
    - 会话有最大 24 小时有效期
    - 会话存储在 DB 中，可被主动删除
-4. **系统账户保护**：SreAgent 角色账户不可修改（包括 token 轮换）、不可删除
-5. **Token 脱敏**：列表 API 中 token 显示为 `abcd********` 格式（[users.rs#L60-L71](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/service/users.rs#L60-L71)）
-6. **RBAC 集成**：Enterprise 版本中，服务账户的权限通过 OpenFGA 精细控制，在 OFGA 中映射为 `allowed_user` 并附加额外 service_account 关系
+   - 会话 token 同时 bypass `allow_static_token` 和 OpenFGA RBAC（双重 bypass），会话创建时的角色验证是唯一权限关卡
+6. **系统账户保护的范围差异**：
+   - UPDATE/rotateToken：只检查**当前组织**中的角色 → 精确控制
+   - DELETE SINGLE：检查**任一组织**中是否为 SreAgent → 全局保护，防止从非 SreAgent 组织间接删除系统账户
+   - DELETE BULK：Handler 层预过滤（HashSet，性能最优）+ Service 层双保险
+7. **Token 脱敏**：列表 API 中 token 显示为 `abcd********` 格式（[users.rs#L60-L71](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/service/users.rs#L60-L71)）
+8. **RBAC 集成**：Enterprise 版本中，服务账户的权限通过 OpenFGA 精细控制，在 OFGA 中映射为 `allowed_user` 并附加额外 service_account 关系
+9. **静态 token 禁用的审计日志**：拒绝时会产生 `log::warn!` 日志，包含 org_id、email 和建议操作指引，但该信息写入应用日志而非审计日志（AuditMessage）。若需合规审计需关注应用日志中的此类警告。
+10. **两种创建路径的 token 长度差异**：普通路径 16 字符，Tenant Admin 路径 32 字符，后者的熵更高但因 `allow_static_token=false` 不会暴露给用户。
+
+---
+
+## 11. 本次修正要点摘要
+
+| 修正项 | 之前理解偏差 | 修正后的正确理解 |
+|-------|------------|---------------|
+| **删除范围** | 删除即全局删除所有组织中的账号 | 分两种场景：仅 1 个组织时全局删除 users 表记录；≥2 个组织时仅从当前 org_id 移除成员关系，账号保留，其他组织的 token 继续有效 |
+| **单组织删除特例** | 未考虑 | `is_external=true` 且仅剩 1 个组织且角色为 ServiceAccount 时，返回 403 "Not Allowed"，禁止删除，防止删除外部身份源同步的 SA |
+| **allow_static_token 拒绝链路** | 只说明功能，未追踪链路 | 详细追踪了从 `oo_validator_internal()` → `validator()` → `validate_credentials()` 的完整调用链，明确：<br>① `Session::` 前缀 → `bypass_check=true` → 跳过检查<br>② 检查发生在认证阶段（validate_credentials），不是 RBAC 阶段（check_permissions）<br>③ 失败时返回 TokenValidationResponse{is_valid:false}，产生 warn 级应用日志 |
+| **系统账户 UPDATE 拒绝** | 笼统说不可修改 | 明确是 Handler 层 L215-L224 的「角色优先 + email 兜底」双重检查，只检查**当前 org_id** 内的角色（非全局），返回 403 |
+| **系统账户 DELETE 拒绝** | 笼统说不可删除 | 区分两种删除路径：<br>• 单个删除 → Service 层 L966-L975，**全局跨组织**检查（任一组织有 SreAgent 角色即拒绝）<br>• 批量删除 → Handler 层 HashSet 预过滤，标记 unsuccessful，响应 200 但该条失败<br>两种删除最终都由 Service 层兜底形成双保险 |
+| **创建路径默认值** | 未区分 | 明确三种创建路径的 `allow_static_token` 默认值和 token 长度：<br>• 普通 API 路径：allow_static_token=true，16 字符<br>• Tenant Admin 路径：allow_static_token=false，32 字符<br>• SRE Agent 系统创建：allow_static_token=true |
+| **bypass_check 双重影响** | 只提 allow_static_token | Session 来源的 bypass_check=true 有双重跳过：<br>① 跳过 allow_static_token 检查（认证阶段）<br>② 跳过 check_permissions 的 OpenFGA RBAC（权限阶段）<br>权限完全依赖 assume 时的 enterprise 层验证 |
