@@ -204,9 +204,11 @@ if user.role.is_service_account() && user.token.eq(&user_password) {
 
     // 2. 检查 allow_static_token — 条件是 !from_session
     //    from_session 参数值 = auth_info.bypass_check（在 validator() 第 4 步传入）
-    //    bypass_check 在 oo_validator_internal 由 Session:: 前缀匹配结果决定
-    //    因此: Session 来源的请求 → from_session=true → 跳过此检查
-    //          直接 Basic Auth 的请求 → from_session=false → 执行此检查
+    //    bypass_check 有两个来源:
+    //      ① AuthExtractor 初始化时设置（如摄入端点 POST + INGESTION_EP → bypass_check=true）
+    //      ② oo_validator_internal 中根据 Session:: 前缀匹配结果设置
+    //    因此: 摄入端点 / Session 来源的请求 → from_session=true → 跳过此检查
+    //          普通 REST API 直接 Basic Auth → from_session=false → 执行此检查
     if !from_session
         && let Ok(org_user) = db::org_users::get(&user.org, &user.email).await
         && !org_user.allow_static_token
@@ -738,8 +740,8 @@ AuditMessage {
 | **系统账户 UPDATE 拒绝** | 笼统说不可修改 | 明确是 Handler 层 L215-L224 的「角色优先 + email 兜底」双重检查，只检查**当前 org_id** 内的角色（非全局），返回 403 |
 | **系统账户 DELETE 拒绝** | 笼统说不可删除 | 区分两种删除路径：<br>• 单个删除 → Service 层 L966-L975，**全局跨组织**检查（任一组织有 SreAgent 角色即拒绝）<br>• 批量删除 → Handler 层 HashSet 预过滤，标记 unsuccessful，响应 200 但该条失败<br>两种删除最终都由 Service 层兜底形成双保险 |
 | **创建路径默认值** | 未区分 | 明确三种创建路径的 `allow_static_token` 默认值和 token 长度：<br>• 普通 API 路径：allow_static_token=true，16 字符<br>• Tenant Admin 路径：allow_static_token=false，32 字符<br>• SRE Agent 系统创建：allow_static_token=true |
-| **bypass_check 双重影响** | 只提 allow_static_token | Session 来源的 bypass_check=true 有双重跳过：<br>① 跳过 allow_static_token 检查（认证阶段）<br>② 跳过 check_permissions 的 OpenFGA RBAC（权限阶段）<br>权限完全依赖 assume 时的 enterprise 层验证 |
-| **静态 token 禁用边界** | 完全未涉及 | 见第 12 章：16 类摄入端点通过标准 Basic Auth 路径会检查 allow_static_token，但 RUM 端点（通过 validate_token 而非 validate_credentials）完全不检查；AWS/GCP 云集成端点**会**检查；gRPC 认证路径默认 allow_static_token=true |
+| **bypass_check 双重影响** | 只提 allow_static_token；且认为仅来自 Session:: 前缀 | bypass_check=true 有两个来源：<br>① `AuthExtractor` 阶段设置（摄入端点 POST + INGESTION_EP）<br>② `oo_validator_internal` 中 `Session::` 前缀匹配<br><br>bypass_check=true 有**双重跳过**：<br>① 跳过 `allow_static_token` 检查（认证阶段）<br>② 跳过 `check_permissions` 的 OpenFGA RBAC（权限阶段）<br>摄入端点的 bypass 是设计上的性能优化，而非安全特性 |
+| **静态 token 禁用边界** | 认为摄入端点会检查 allow_static_token | **核心修正**：16 个 HTTP 摄入端点在 `AuthExtractor::from_request_parts()` 阶段就设置了 `bypass_check: true`，该值被当作 `from_session` 传入 `validate_credentials()`，导致 `allow_static_token` 检查被**跳过**。同时也跳过 OpenFGA RBAC 检查。<br>**正确的禁用效果：<br>• ❌ 被封禁：标准 REST API、AWS Firehose（/aws/ 路径）、GCP Pub/Sub（/gcp/ 路径）、Proxy 直连<br>• ✅ 绕过：所有 HTTP 摄入端点（16 个 INGESTION_EP）、RUM 端点、gRPC、assume 会话、Dex/JWT<br>详细机制见第 12 章 |
 | **三类日志覆盖差异** | 完全未涉及 | 见第 13 章：审计中间件在认证中间件**之前**执行，摄入端点/SSE 流式端点完全不进入审计日志；应用 warn/error 日志覆盖安全拒绝事件但不落审计库；UsageData 仅覆盖摄入/搜索/函数事件 |
 
 ---
@@ -773,7 +775,7 @@ handler 执行
 | 接口类别 | 认证中间件 | 核心认证函数 | from_session 参数 | allow_static_token 检查？ | 绕过条件 |
 |---------|-----------|------------|-----------------|------------------------|---------|
 | **1. 标准 REST API**<br>`/api/{org_id}/...` | `auth_middleware` → `oo_validator()` | `validate_credentials()` | `bypass_check` 值（由 Session:: 前缀决定） | ✅ **会检查** | ① 调用来自 assume_session (`Session::` 前缀)<br>② 非服务账户角色 |
-| **2. HTTP 摄入端点**<br>`/api/{org_id}/_bulk` 等 INGESTION_EP（16 个） | 主 `auth_middleware` 链 | `validate_credentials()` | 同上（普通 Basic Auth → false） | ✅ **会检查** | assume_session |
+| **2. HTTP 摄入端点**<br>`/api/{org_id}/_bulk` 等 INGESTION_EP（16 个） | 主 `auth_middleware` 链 | `validate_credentials()` | **恒为 `true`**（AuthExtractor 阶段就设置 bypass_check=true） | ❌ **不检查** | 设计如此：摄入端点在 [auth.rs#L307-L319](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/common/utils/auth.rs#L307-L319) 的 `AuthExtractor::from_request_parts` 中直接设置 `bypass_check: true`，作为 `from_session` 传入 → 跳过 allow_static_token 检查，同时也跳过 OpenFGA RBAC |
 | **3. AWS Kinesis Firehose**<br>`/aws/{org_id}/{stream}/_kinesis_firehose` | 独立 `aws_auth_middleware` → `validator_aws()` | `validate_credentials()` | **硬编码 `false`**（[validator.rs#L749](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L749)） | ✅ **会检查** | **无绕过可能**（from_session 恒为 false） |
 | **4. GCP Pub/Sub**<br>`/gcp/{org_id}/{stream}/_sub` | 独立 `gcp_auth_middleware` → `validator_gcp()` | `validate_credentials()` | **硬编码 `false`**（[validator.rs#L797](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L797)） | ✅ **会检查** | **无绕过可能**（from_session 恒为 false） |
 | **5. RUM 端点**<br>`/rum/v1/{org_id}/rum\|logs\|replay` | 独立 `rum_auth_middleware` → `validator_rum()` | **`validate_token()`**（**NOT** `validate_credentials`） | N/A（无此参数） | ❌ **完全不检查** | 漏洞：RUM 用 rum_token 查询 `USERS_RUM_TOKEN` 反向缓存，不经过 allow_static_token 逻辑 |
@@ -782,7 +784,82 @@ handler 执行
 | **8. Dex/JWT Bearer Token** | `token_validator()`（Dex OAuth 校验） | 基于 JWT 的签名验证 | N/A | 不适用（JWT 有独立 exp 声明） | 非静态 token 路径 |
 | **9. Proxy URL**<br>`/proxy/...` | `proxy_auth_middleware` → `validator_proxy_url()` | `validate_credentials()` | 同标准 REST（由 Session:: 决定） | ✅ **会检查** | assume_session |
 
-### 12.3 INGESTION_EP 16 个端点清单
+### 12.3 关键机制详解：摄入端点为何跳过 allow_static_token 检查
+
+这是本次修正的**核心发现**。之前文档误认为 HTTP 摄入端点走标准认证路径会检查 `allow_static_token`，但实际代码中存在专门的"快速通道"：
+
+#### 触发位置：AuthExtractor::from_request_parts
+
+在 [auth.rs#L307-L319](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/common/utils/auth.rs#L307-L319)：
+
+```rust
+// This is case for ingestion endpoints where we need to check
+// permissions on the stream
+if method.eq("POST") && INGESTION_EP.contains(&path_columns[url_len - 1]) {
+    if let Some(auth_header) = parts.headers.get("Authorization")
+        && let Ok(auth_str) = auth_header.to_str()
+    {
+        return Ok(AuthExtractor {
+            auth: auth_str.to_owned(),
+            method,
+            o2_type: format!("stream:{org_id}"),
+            org_id,
+            bypass_check: true,  // ← 关键：直接设为 true
+            parent_id: folder,
+        });
+    }
+    return Err(AuthExtractorRejection { ... });
+}
+```
+
+**触发条件**：
+- HTTP 方法为 `POST`
+- URL 路径的**最后一段**属于 `INGESTION_EP` 列表（16 项）
+
+#### 完整传递链路
+
+```
+请求: POST /api/{org_id}/{stream}/_bulk
+    │
+    ▼
+AuthExtractor::from_request_parts()
+  → 检测到 POST + 路径末端 ∈ INGESTION_EP
+  → 直接返回 AuthExtractor { bypass_check: true }
+  → （不执行后续的 OFGA object_type 解析逻辑）
+    │
+    ▼
+oo_validator_internal()
+  → 解析 token 是否有 Session:: 前缀 → is_from_session
+  → modified_auth_info.bypass_check
+     = is_from_session || auth_info.bypass_check
+     = is_from_session || true    ← 因为 auth_info.bypass_check 已经是 true
+     = true（恒成立）
+    │
+    ▼
+validator()
+  → 调用 validate_credentials(..., from_session = auth_info.bypass_check = true)
+  → 然后检查权限：
+     if auth_info.bypass_check  (=true) → 直接通过，跳过 check_permissions
+    │
+    ▼
+validate_credentials()
+  → 检测到 service_account + token 匹配
+  → 检查条件: !from_session && !org_user.allow_static_token
+  → 因为 from_session=true，条件不成立 → **跳过检查 ✅**
+  → 返回成功
+```
+
+#### 双重跳过的含义
+
+摄入端点的 `bypass_check=true` 带来**两层跳过**：
+1. **认证层**：跳过 `allow_static_token` 检查（`from_session=true`）
+2. **权限层**：跳过 `check_permissions()` 的 OpenFGA RBAC 检查
+
+也就是说，服务账户只要有一个合法的静态 token，即使 `allow_static_token=false`，也可以**直接调用所有 16 个摄入端点写入数据**，且不受 OpenFGA 细粒度权限控制。
+
+> **设计意图推测**：摄入端点是高吞吐路径，为了性能考虑跳过了 RBAC 权限检查（因为写入权限通常是粗粒度的），但 `bypass_check` 同时影响了 `allow_static_token` 检查，这可能是一个设计上的副作用而非刻意为之。
+
+### 12.4 INGESTION_EP 16 个端点清单
 
 定义于 [ingestion.rs#L149-L166](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/common/meta/ingestion.rs#L149-L166)：
 
@@ -792,9 +869,9 @@ _xpack, _index_template, _data_stream, _sub, logs, metrics, _json_arrow,
 _hec, push
 ```
 
-注意：虽然 `_kinesis_firehose` 和 `_sub` 在此列表中，但 AWS/GCP 集成实际挂载在独立 `/aws` 和 `/gcp` 前缀下，走独立中间件而非主路由。通过主路由访问这两个端点时仍走主中间件链路。
+注意：虽然 `_kinesis_firehose` 和 `_sub` 在此列表中，但 AWS/GCP 集成实际挂载在独立 `/aws` 和 `/gcp` 前缀下，走独立中间件而非主路由。通过主路由访问这两个端点时仍走主中间件链路（即同样会跳过 allow_static_token 检查）。
 
-### 12.4 关键安全发现：RUM 端点不检查 allow_static_token
+### 12.5 关键安全发现：RUM 端点不检查 allow_static_token
 
 这是之前文档中**完全缺失**的关键边界：
 
@@ -820,17 +897,19 @@ validate_token(token, org_id) [L218-L225]
 
 **结果**：即使某个服务账户设置了 `allow_static_token=false`，其 rum_token 仍可**直接用于 RUM 端点摄入**，不会被拒绝。这是设计特性（RUM token 设计上就是给浏览器/客户端 SDK 使用的静态 token），但 DevOps 需要意识到这一点：禁用静态 token 并不等于"全面禁用"，RUM 路径仍然开放。
 
-### 12.5 禁用效果完整边界总结
+### 12.6 禁用效果完整边界总结
 
 如果 DevOps 将某服务账户的 `allow_static_token` 设为 `false`，实际封禁范围：
 
-| 可以继续使用的路径 | 被封禁的路径 |
-|-----------------|-----------|
-| ✅ assume_service_account 获取的临时会话 token | ❌ 所有标准 REST API（直接 Basic Auth） |
-| ✅ RUM 端点（rum_token 绕过检查） | ❌ HTTP 摄入端点（_bulk/_json/_multi/logs/metrics...） |
-| ✅ Dex/JWT Bearer Token（如有 Dex 集成） | ❌ AWS Kinesis Firehose（from_session 硬编码 false） |
-| ✅ gRPC 摄入接口（永久放行） | ❌ GCP Pub/Sub（from_session 硬编码 false） |
-|  | ❌ Proxy URL 直连代理请求（直接 Basic Auth） |
+| 可以继续使用的路径（绕过） | 被封禁的路径（生效） |
+|------------------------|------------------|
+| ✅ assume_service_account 获取的临时会话 token（设计如此） | ❌ 所有标准 REST API（直接 Basic Auth） |
+| ✅ **所有 HTTP 摄入端点**（16 个 INGESTION_EP：_bulk/_json/_multi/logs/metrics/traces/write 等）← **本次修正核心发现** | ❌ AWS Kinesis Firehose（`/aws/...` 独立路径，from_session 硬编码 false） |
+| ✅ RUM 端点（rum_token 绕过检查，走 `validate_token`） | ❌ GCP Pub/Sub（`/gcp/...` 独立路径，from_session 硬编码 false） |
+| ✅ Dex/JWT Bearer Token（如有 Dex 集成，非静态 token 路径） | ❌ Proxy URL 直连代理请求（直接 Basic Auth） |
+| ✅ gRPC 摄入接口（永久放行，手动构造 allow_static_token=true） |  |
+
+> **重要结论**：`allow_static_token=false` **不能有效阻止服务账户写入数据**。所有主 API 路径下的摄入端点（logs/metrics/traces 等）都可以绕过禁用。只有通过 AWS/GCP 云集成路径写入的数据会被真正拦截。如果安全目标是"禁用静态 token 后服务账户完全无法写入"，目前的实现达不到这个效果。
 
 ---
 
@@ -990,10 +1069,16 @@ UsageData {
    - 谁写入了多少数据 → UsageData（_usage_stream）
    - 谁尝试了违规操作（安全拒绝事件） → 应用告警日志（warn/error）
 
-2. **快速发现违规静态 token 使用**：以应用告警日志为主，关键字 `allow_static_token=false`
+2. **快速发现违规静态 token 使用**：以应用告警日志为主，关键字 `allow_static_token=false`。但需注意：**该 warn 日志仅对标准 REST API、AWS/GCP 云集成路径有效**，对于 HTTP 摄入端点、RUM、gRPC 等绕过路径，即使 `allow_static_token=false` 也不会触发任何 warn 日志（因为直接通过了认证，没有拒绝发生）。
 
-3. **服务账户成本分摊与用量统计**：以 UsageData 为主，按 `user_email` 过滤服务账户 email 模式
+3. **服务账户成本分摊与用量统计**：以 UsageData 为主，按 `user_email` 过滤服务账户 email 模式。注意：UsageData 是目前**唯一能覆盖摄入端点服务账户调用的结构化日志**（审计日志完全跳过摄入端点）。
 
 4. **合规盲区注意**：审计日志对 4xx/5xx 的安全拒绝事件完全不记录；如果合规要求记录"所有鉴权失败尝试"，必须额外收集应用 warn 日志。
 
 5. **RUM 端点的盲区**：既不进入审计日志，也不受 allow_static_token 控制 — RUM token 的安全性完全依赖 token 本身的保密性。
+
+6. **摄入端点的安全盲区（本次新增）**：
+   - `allow_static_token=false` **无法阻止**服务账户通过主 API 路径的 16 个摄入端点写入数据
+   - 这些写入操作不会触发任何安全拒绝日志（因为认证通过了）
+   - 只能通过 UsageData 反向推断"哪些服务账户在禁用静态 token 后仍在写入数据"
+   - 如果需要真正的数据写入管控，目前只能依赖：① token 本身的保密性 ② 网络层面的访问控制 ③ 改用 AWS/GCP 云集成路径（这两条路径会严格检查 allow_static_token）
