@@ -739,3 +739,261 @@ AuditMessage {
 | **系统账户 DELETE 拒绝** | 笼统说不可删除 | 区分两种删除路径：<br>• 单个删除 → Service 层 L966-L975，**全局跨组织**检查（任一组织有 SreAgent 角色即拒绝）<br>• 批量删除 → Handler 层 HashSet 预过滤，标记 unsuccessful，响应 200 但该条失败<br>两种删除最终都由 Service 层兜底形成双保险 |
 | **创建路径默认值** | 未区分 | 明确三种创建路径的 `allow_static_token` 默认值和 token 长度：<br>• 普通 API 路径：allow_static_token=true，16 字符<br>• Tenant Admin 路径：allow_static_token=false，32 字符<br>• SRE Agent 系统创建：allow_static_token=true |
 | **bypass_check 双重影响** | 只提 allow_static_token | Session 来源的 bypass_check=true 有双重跳过：<br>① 跳过 allow_static_token 检查（认证阶段）<br>② 跳过 check_permissions 的 OpenFGA RBAC（权限阶段）<br>权限完全依赖 assume 时的 enterprise 层验证 |
+| **静态 token 禁用边界** | 完全未涉及 | 见第 12 章：16 类摄入端点通过标准 Basic Auth 路径会检查 allow_static_token，但 RUM 端点（通过 validate_token 而非 validate_credentials）完全不检查；AWS/GCP 云集成端点**会**检查；gRPC 认证路径默认 allow_static_token=true |
+| **三类日志覆盖差异** | 完全未涉及 | 见第 13 章：审计中间件在认证中间件**之前**执行，摄入端点/SSE 流式端点完全不进入审计日志；应用 warn/error 日志覆盖安全拒绝事件但不落审计库；UsageData 仅覆盖摄入/搜索/函数事件 |
+
+---
+
+## 12. 静态 Token 禁用边界：各接口的 allow_static_token 检查覆盖矩阵
+
+`allow_static_token=false` 的禁用效果并不是全局均匀的。它是否生效取决于**请求走哪一条认证路径**。核心判断标准：认证流程是否最终调用了 `validate_credentials()` 且传入的 `from_session` 参数值。
+
+### 12.1 中间件执行顺序（关键前提）
+
+主路由的中间件栈顺序（[router/mod.rs#L1017-L1042](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/router/mod.rs#L1017-L1042)）：
+
+```
+请求进入
+    ▼
+blocked_orgs_middleware
+    ▼
+audit_middleware       ← 注意：审计在认证**之前**执行！
+    ▼
+auth_middleware        ← oo_validator() → validate_credentials()
+    ▼
+... (decompression / server headers)
+    ▼
+handler 执行
+```
+
+而 other_service_routes（AWS/GCP/RUM）有各自独立的认证中间件，不在主 auth_middleware 链上。
+
+### 12.2 各接口类别的检查覆盖
+
+| 接口类别 | 认证中间件 | 核心认证函数 | from_session 参数 | allow_static_token 检查？ | 绕过条件 |
+|---------|-----------|------------|-----------------|------------------------|---------|
+| **1. 标准 REST API**<br>`/api/{org_id}/...` | `auth_middleware` → `oo_validator()` | `validate_credentials()` | `bypass_check` 值（由 Session:: 前缀决定） | ✅ **会检查** | ① 调用来自 assume_session (`Session::` 前缀)<br>② 非服务账户角色 |
+| **2. HTTP 摄入端点**<br>`/api/{org_id}/_bulk` 等 INGESTION_EP（16 个） | 主 `auth_middleware` 链 | `validate_credentials()` | 同上（普通 Basic Auth → false） | ✅ **会检查** | assume_session |
+| **3. AWS Kinesis Firehose**<br>`/aws/{org_id}/{stream}/_kinesis_firehose` | 独立 `aws_auth_middleware` → `validator_aws()` | `validate_credentials()` | **硬编码 `false`**（[validator.rs#L749](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L749)） | ✅ **会检查** | **无绕过可能**（from_session 恒为 false） |
+| **4. GCP Pub/Sub**<br>`/gcp/{org_id}/{stream}/_sub` | 独立 `gcp_auth_middleware` → `validator_gcp()` | `validate_credentials()` | **硬编码 `false`**（[validator.rs#L797](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L797)） | ✅ **会检查** | **无绕过可能**（from_session 恒为 false） |
+| **5. RUM 端点**<br>`/rum/v1/{org_id}/rum\|logs\|replay` | 独立 `rum_auth_middleware` → `validator_rum()` | **`validate_token()`**（**NOT** `validate_credentials`） | N/A（无此参数） | ❌ **完全不检查** | 漏洞：RUM 用 rum_token 查询 `USERS_RUM_TOKEN` 反向缓存，不经过 allow_static_token 逻辑 |
+| **6. grpc 摄入端点**<br>`grpc/Writer` | `grpc::auth::mod.rs` | 手动构造 OrgUserRecord | 硬编码 `allow_static_token: true`（[grpc/auth/mod.rs#L180](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/grpc/auth/mod.rs#L180)） | N/A（手动构造） | 相当于永久放行，此 flag 永远为 true |
+| **7. assume 会话请求**<br>（携带 session_id 或 Session:: 前缀） | `auth_middleware` | `validate_credentials()` | `true`（Session:: 解析后 bypass） | ❌ **跳过检查** | 设计如此，allow_static_token 不影响会话 token |
+| **8. Dex/JWT Bearer Token** | `token_validator()`（Dex OAuth 校验） | 基于 JWT 的签名验证 | N/A | 不适用（JWT 有独立 exp 声明） | 非静态 token 路径 |
+| **9. Proxy URL**<br>`/proxy/...` | `proxy_auth_middleware` → `validator_proxy_url()` | `validate_credentials()` | 同标准 REST（由 Session:: 决定） | ✅ **会检查** | assume_session |
+
+### 12.3 INGESTION_EP 16 个端点清单
+
+定义于 [ingestion.rs#L149-L166](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/common/meta/ingestion.rs#L149-L166)：
+
+```
+_bulk, _json, _multi, traces, write, _kinesis_firehose, _license,
+_xpack, _index_template, _data_stream, _sub, logs, metrics, _json_arrow,
+_hec, push
+```
+
+注意：虽然 `_kinesis_firehose` 和 `_sub` 在此列表中，但 AWS/GCP 集成实际挂载在独立 `/aws` 和 `/gcp` 前缀下，走独立中间件而非主路由。通过主路由访问这两个端点时仍走主中间件链路。
+
+### 12.4 关键安全发现：RUM 端点不检查 allow_static_token
+
+这是之前文档中**完全缺失**的关键边界：
+
+`validator_rum()`（[validator.rs#L817-L878](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L817-L878)）的认证流程：
+
+```
+请求: /rum/v1/{org_id}/rum?o2-api-key=<token>
+    │
+    ▼
+从 query 参数获取 token（oo-api-key 或 o2-api-key）
+    │
+    ▼
+validate_token(token, org_id) [L218-L225]
+    → 内部调用 users::get_user_by_token(org_id, token)
+    → 仅检查 token 是否存在于 USERS_RUM_TOKEN 反向缓存
+    → 未调用 validate_credentials()
+    → 没有任何 service_account_enabled 检查
+    → 没有任何 allow_static_token 检查 ❗
+    │
+    ▼
+成功则返回 AuthValidationResult（含 email/role）
+```
+
+**结果**：即使某个服务账户设置了 `allow_static_token=false`，其 rum_token 仍可**直接用于 RUM 端点摄入**，不会被拒绝。这是设计特性（RUM token 设计上就是给浏览器/客户端 SDK 使用的静态 token），但 DevOps 需要意识到这一点：禁用静态 token 并不等于"全面禁用"，RUM 路径仍然开放。
+
+### 12.5 禁用效果完整边界总结
+
+如果 DevOps 将某服务账户的 `allow_static_token` 设为 `false`，实际封禁范围：
+
+| 可以继续使用的路径 | 被封禁的路径 |
+|-----------------|-----------|
+| ✅ assume_service_account 获取的临时会话 token | ❌ 所有标准 REST API（直接 Basic Auth） |
+| ✅ RUM 端点（rum_token 绕过检查） | ❌ HTTP 摄入端点（_bulk/_json/_multi/logs/metrics...） |
+| ✅ Dex/JWT Bearer Token（如有 Dex 集成） | ❌ AWS Kinesis Firehose（from_session 硬编码 false） |
+| ✅ gRPC 摄入接口（永久放行） | ❌ GCP Pub/Sub（from_session 硬编码 false） |
+|  | ❌ Proxy URL 直连代理请求（直接 Basic Auth） |
+
+---
+
+## 13. 三类日志覆盖差异：审计日志 / 应用告警日志 / 使用量记录
+
+### 13.1 三类日志的定位与架构位置
+
+```
+                        ┌─────────────────────────────────┐
+                        │         HTTP 请求进入             │
+                        └──────────────┬──────────────────┘
+                                       │
+              ┌────────────────────────┼───────────────────────┐
+              ▼                        ▼                       ▼
+ [审计中间件] audit_middleware   [认证中间件] auth_middleware   其他中间件
+  (先于认证执行)                    validate_credentials()
+       │                               │
+       │ 成功/重定向才写入              ├─ → 安全拒绝 → log::warn!()
+       │ 摄入/流式端点一律跳过          ├─ → 一般错误  → log::error!()
+       ▼                               ▼
+  AuditMessage                    UsageData (仅摄入/搜索/函数)
+  (_audit_stream)                 (_usage_stream)
+```
+
+### 13.2 审计日志（AuditMessage → _audit_stream）
+
+**触发点**：`audit_middleware()`（[router/mod.rs#L294-L385](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/router/mod.rs#L294-L385)），仅 Enterprise 版本 + `audit_enabled=true`。
+
+#### 覆盖范围（会记录 ✅）
+
+所有**满足以下全部条件**的 HTTP 请求：
+1. `audit_enabled` 配置开启
+2. 响应状态是 `is_success()`（2xx）或 `is_redirection()`（3xx）— **失败请求（4xx/5xx）不记录**
+3. **不**命中以下三项排除规则：
+
+#### 排除规则（不记录 ❌）
+
+| 排除条件 | 匹配值 | 覆盖的场景 |
+|---------|--------|----------|
+| ① path_columns[1] 以 `_stream` 结尾 | e.g. `/api/org1/streams/default/_json_stream` | SSE 流式查询、AI 流式输出 |
+| ② path 以 `ai/chat_stream` 结尾 | AI 流式对话接口 | AI Agent 流式响应 |
+| ③ POST 方法 + 路径末尾段 ∈ INGESTION_EP（16 项） | 所有摄入批量/推送接口 | 日志/指标/追踪写入 |
+
+#### 对服务账户的区分能力
+
+审计日志 **本身没有 `is_service_account` 字段**。区分方式完全依赖 `user_email` 字段：
+- 系统服务账户：匹配 email 模式 `o2-sre-agent.org-*@openobserve.internal`
+- 用户创建的服务账户：通过 email 模式无法区分，需要在分析时关联 `org_users` 表的 `role` 字段
+- 审计中间件的 `user_email` 来自**请求 header `user_id`**，而该 header 由 `auth_middleware` 写入。由于 **audit_middleware 在 auth_middleware 之前**顺序执行（L1023-L1025），这里存在一个微妙的时序细节：middleware 层是洋葱结构 — audit 先包一层，认证执行完返回后 audit 再记录，因此 user_id header 已经有值。顺序由 axum 执行模型保证正确性。
+
+#### 明确不进入审计日志的服务账户相关事件
+
+| 事件类型 | 是否进入审计日志 | 原因 |
+|---------|---------------|-----|
+| 服务账户创建/更新/删除 | ✅ 是（2xx 响应） | 非排除路径，成功才记录 |
+| 服务账户创建失败（如邮箱重复） | ❌ 否 | 响应非 2xx/3xx |
+| allow_static_token=false 导致的拒绝（401/403） | ❌ 否 | 响应非 2xx/3xx |
+| SreAgent 修改保护触发（403） | ❌ 否 | 响应非 2xx/3xx |
+| 服务账户调用摄入接口（_bulk/_json 等） | ❌ 否 | 命中排除条件 ③ |
+| 服务账户调用 RUM 摄入接口 | ❌ 否 | 不在主路由中间件链上（无 audit_middleware） |
+| 服务账户调用 AWS/GCP 摄入 | ❌ 否 | other_service_routes，不走主 audit_middleware |
+| 服务账户调用流式查询（_stream 后缀） | ❌ 否 | 命中排除条件 ① |
+| assume_service_account 调用成功 | ✅ 是（200） | 非排除路径，成功记录 |
+| assume_service_account 失败（400/403） | ❌ 否 | 响应非 2xx/3xx |
+
+### 13.3 应用告警日志（log::warn! / log::error! → stderr / 日志文件）
+
+**触发点**：散布在认证/Handler/Service 各处，由 tracing/log crate 配置决定输出位置。
+
+#### 与服务账户相关的已知告警场景汇总
+
+| 场景 | 日志级别 | 代码位置 | 内容关键字 |
+|-----|---------|---------|----------|
+| allow_static_token=false，直接用静态 token | **warn** | [validator.rs#L350-L354](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L350-L354) | "attempted direct token auth but allow_static_token=false. Use assume_service_account API instead." |
+| 批量删除系统 SA | **warn** | [service_accounts/mod.rs#L422-L424](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/request/service_accounts/mod.rs#L422-L424) | "Attempted to delete system service account {org_id}/{email} via bulk delete" |
+| assume_service_account 非 _meta 组织 | **warn** | [assume_service_account.rs#L113-L116](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/request/organization/assume_service_account.rs#L113-L116) | "Assume service account rejected: API must be called on _meta org, got '{org_id}'" |
+| assume_service_account 失败（enterprise 层） | **error** | [assume_service_account.rs#L186](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/request/organization/assume_service_account.rs#L186) | "Assume service account failed: {e}" |
+| 批量删除 SA 失败 | **error** | [service_accounts/mod.rs#L436-L437, L444](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/request/service_accounts/mod.rs#L436-L437) | "error in deleting service account {org_id}/{email} : ..." |
+| 删除 SA 时 DB 操作失败 | **error** | [users.rs#L982-L984, L998-L999, L1067-L1069](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/service/users.rs#L982-L984) | "error deleting invites when deleting user..." / "error deleting user from db..." |
+| RUM 端点认证 token 未找到 | **error** | [validator.rs#L863-L865](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L863-L865) | "validate_token: Token not found for org_id: {}" |
+| RUM 端点缺少 api-key 参数 | **error** | [validator.rs#L871-L873](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/handler/http/auth/validator.rs#L871-L873) | "validate_token: Missing api key for rum endpoint org_id: {}" |
+
+#### 重要特性：安全拒绝事件的日志覆盖
+
+应用告警日志最大的价值是覆盖了**审计日志不记录的安全拒绝事件**：
+
+| 安全拒绝事件 | 审计日志 | 应用告警日志 |
+|------------|---------|----------|
+| allow_static_token=false 的 token 使用尝试 | ❌（401/403 响应） | ✅（warn，含 org、email、建议指引） |
+| SreAgent 被尝试修改 | ❌（403 响应） | ⚠️ 仅有 HTTP 403 响应，无明确 warn/error 日志 |
+| SreAgent 被尝试批量删除 | ❌（200 但 unsuccessful） | ✅（warn，明确记录 attempt） |
+| 删除自身尝试 | ❌（403 响应） | ⚠️ 仅 HTTP 响应，无明确 warn |
+| assume 非 _meta 组织 | ❌（400/403 响应） | ✅（warn/error，双重覆盖） |
+| 非 Admin 尝试 rotate token | ❌（403 响应） | ⚠️ 仅有 HTTP 响应，无明确 warn |
+
+### 13.4 使用量记录（UsageData → _usage_stream）
+
+**触发点**：`report_request_usage_stats()`（[self_reporting/mod.rs#L90-L222](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/service/self_reporting/mod.rs#L90-L222)），由各个摄入 handler、search handler、function 执行器主动调用。
+
+#### UsageData 中的服务账户识别字段
+
+```rust
+UsageData {
+    user_email: String,       // 关键：记录发起者身份
+    org_id: String,           // 操作所在组织
+    event: UsageEvent,        // Ingestion / Search / Functions / ...
+    num_records: i64,         // 记录条数
+    size: f64,                // 大小/计数
+    response_time: i64,       // 响应时长
+    stream_name: String,      // 目标流
+    stream_type: StreamType,  // Logs/Metrics/Traces...
+    // ... 其他资源计量字段
+}
+```
+
+`user_email` 来源：由 `IngestUser::from_user_email(user_email_str)` 构造（[ingestion.rs#L79-L87](file:///d:/fz/0508-3/solo-dogfeeding/code/201-openobserve/src/common/meta/ingestion.rs#L79-L87)），如果 email 为空会变成 `unknown@system.local`。
+
+#### 使用量记录覆盖的事件类型
+
+仅覆盖**有资源消耗可计量**的请求：
+
+| UsageEvent 类型 | 触发场景 | 服务账户是否可能触发 |
+|----------------|---------|------------------|
+| **Ingestion** | 所有数据写入：logs/metrics/traces/rum/enrichment 等 | ✅ 最常触发 |
+| **Search** | SQL/PromQL 查询、dashboard 查询、alert 评估、anomaly detection 等 | ✅ 程序化查询 |
+| **Functions** | VRL/自定义数据转换函数（按调用次数计量） | ✅ 数据处理管道 |
+| **NewIncident / IncidentReAnalysis** | 告警事件相关（按数量计数） | ⚠️ 通常由系统触发而非 SA |
+| **其他**（AI credits 等 cloud 计费项） | Cloud 版本额外功能 | ✅ 取决于调用方 |
+
+#### 明确不进入 UsageData 的事件
+
+- **认证/授权事件**：token 验证通过/失败不会产生 UsageData
+- **用户管理操作**：创建、更新、删除服务账户不会产生 UsageData
+- **组织管理操作**：assume_service_account、创建组织等不会产生 UsageData
+- **后台系统任务**：如 SelfReporting、ServiceGraph 等使用 `SystemJob` 身份（格式为 `{job}@system.local`）单独计量
+
+#### 与审计日志的互补关系
+
+| 维度 | 审计日志（AuditMessage） | 使用量记录（UsageData） |
+|-----|----------------------|-------------------|
+| **主要目的** | 合规审计：谁在什么时候做了什么操作 | 计费计量：用了多少资源 |
+| **成功才记录** | ✅ 仅 2xx/3xx | ✅ 通常在请求完成后记录（无论成功与否取决于 handler） |
+| **服务账户识别** | 仅 user_email 字段，无 role 标记 | 仅 user_email 字段，无 role 标记 |
+| **摄入端点覆盖** | ❌ 完全排除（INGESTION_EP 跳过） | ✅ **最详细**（主要覆盖范围） |
+| **用户管理 API 覆盖** | ✅ 成功时记录 | ❌ 不记录 |
+| **组织管理 API 覆盖** | ✅ 成功时记录 | ❌ 不记录 |
+| **请求体/参数** | ✅ 完整保留 http_body + query_params | ❌ 仅 request_body 字符串（通常是事件名） |
+| **响应时长** | ❌ 无 | ✅ response_time 字段 |
+| **数据量/记录数** | ❌ 无 | ✅ num_records / size / scan_files 等详细字段 |
+
+### 13.5 DevOps 评估建议：三类日志组合使用方案
+
+对于服务账户的完整安全监测，不能依赖单一日志类型：
+
+1. **安全合规审计**：需要三类日志关联查询 —
+   - 谁调用了什么管理操作 → 审计日志（_audit_stream）
+   - 谁写入了多少数据 → UsageData（_usage_stream）
+   - 谁尝试了违规操作（安全拒绝事件） → 应用告警日志（warn/error）
+
+2. **快速发现违规静态 token 使用**：以应用告警日志为主，关键字 `allow_static_token=false`
+
+3. **服务账户成本分摊与用量统计**：以 UsageData 为主，按 `user_email` 过滤服务账户 email 模式
+
+4. **合规盲区注意**：审计日志对 4xx/5xx 的安全拒绝事件完全不记录；如果合规要求记录"所有鉴权失败尝试"，必须额外收集应用 warn 日志。
+
+5. **RUM 端点的盲区**：既不进入审计日志，也不受 allow_static_token 控制 — RUM token 的安全性完全依赖 token 本身的保密性。
